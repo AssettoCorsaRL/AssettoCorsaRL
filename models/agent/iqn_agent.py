@@ -65,7 +65,7 @@ class IQN_Agent:
         self.alpha = 0.9
         self.GAMMA = GAMMA
 
-        self.BATCH_SIZE = BATCH_SIZE * worker
+        self.BATCH_SIZE = BATCH_SIZE
         self.Q_updates = 0
         self.n_step = n_step
         self.worker = worker

@@ -1,3 +1,8 @@
+# Source: https://github.com/BY571/IQN-and-Extensions/tree/master
+# Copyright (c) BY571
+# Licensed under the MIT License
+
+
 import numpy as np
 from collections import deque, namedtuple
 import random

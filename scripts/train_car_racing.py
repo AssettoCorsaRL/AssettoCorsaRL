@@ -13,10 +13,9 @@ if __name__ == "__main__":
     train_gym(
         n_envs=4,
         frame_stack=4,
-        episodes=500,
         render=False,
         network="per noisy",
-        lr=1e-4,
         exploration="linear",
         env_kwargs={"continuous": False},
+        load_path="./iqn_agent_final.pth",
     )

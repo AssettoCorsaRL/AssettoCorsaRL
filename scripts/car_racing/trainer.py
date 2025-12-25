@@ -25,11 +25,9 @@ def train_gym(
     n_envs: Optional[int] = None,
     frame_stack: int = 4,
     max_episode_time: float = 10.0,
-    episodes: Optional[int] = None,
     network: str = "",
     batch_size: Optional[int] = None,
     buffer_size: Optional[int] = None,
-    lr: Optional[float] = None,
     seed: Optional[int] = None,
     device: Optional[str] = None,
     exploration: str = "exp",
@@ -38,15 +36,16 @@ def train_gym(
     wandb_project: str = "car_racing-iqn",
     env_kwargs: Optional[Dict] = None,
     env_factory: Optional[Callable[[int], gym.Env]] = None,
+    load_path: Optional[str] = None,
 ):
     """Train IQN on an environment"""
     if config is None:
         config = Config()
 
-    episodes = episodes if episodes is not None else config.episodes
+    episodes = config.episodes
     batch_size = batch_size if batch_size is not None else config.batch_size
     buffer_size = buffer_size if buffer_size is not None else config.buffer_size
-    lr = lr if lr is not None else config.lr
+    lr = config.lr
     seed = seed if seed is not None else config.seed
     n_envs = n_envs if n_envs is not None else config.n_envs
 
@@ -129,11 +128,43 @@ def train_gym(
         seed=seed,
     )
 
+    # optionally load weights / optimizer / episode number from a checkpoint
+    loaded_episode = 0
+    if load_path:
+        try:
+            if os.path.exists(load_path):
+                ckpt = torch.load(load_path, map_location=device)
+                state_dict = ckpt.get("model_state_dict", ckpt)
+                try:
+                    agent.qnetwork_local.load_state_dict(state_dict)
+                    try:
+                        agent.qnetwork_target.load_state_dict(state_dict)
+                    except Exception:
+                        pass
+                    print(f"Loaded model weights from {load_path}")
+                except Exception as e:
+                    print(f"Failed to load model weights: {e}")
+                if (
+                    "optimizer_state_dict" in ckpt
+                    and hasattr(agent, "optimizer")
+                    and getattr(agent, "optimizer") is not None
+                ):
+                    try:
+                        agent.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                        print("Loaded optimizer state")
+                    except Exception:
+                        pass
+                loaded_episode = int(ckpt.get("episode", 0))
+            else:
+                print(f"Checkpoint not found: {load_path}")
+        except Exception as e:
+            print(f"Error loading checkpoint {load_path}: {e}")
+
     frame_stacks, states, start_times = init_frame_stacks(envs, frame_stack)
 
     scores: List[float] = []
     scores_per_env = [0.0 for _ in range(n_envs)]
-    completed_episodes = 0
+    completed_episodes = loaded_episode
 
     import time
 
@@ -200,14 +231,14 @@ def train_gym(
                 if completed_episodes % log_interval == 1:
                     print()
                     print(
-                        "{:<8} {:>8} {:>10} {:>8} {:>8}".format(
+                        "{:<8} {:>8} {:>10} {:>8}".format(
                             "Episode", "Score", "Avg(10)", "Best10"
                         )
                     )
                     print("-" * 48)
 
                 print(
-                    "{:<8d} {:>8.2f} {:>10.2f} {:>8.2f} {:>8.3f}".format(
+                    "{:<8d} {:>8.2f} {:>10.2f} {:>8.2f}".format(
                         completed_episodes, score, avg10, best10
                     )
                 )
@@ -220,6 +251,26 @@ def train_gym(
                 states[i] = np.concatenate(list(frame_stacks[i]), axis=0)
                 start_times[i] = time.time()
                 scores_per_env[i] = 0.0
+
+                # save checkpoint every 500 episodes
+                if completed_episodes % 500 == 0:
+                    ckpt_path = os.path.join(
+                        os.getcwd(), f"iqn_agent_ep{completed_episodes}.pth"
+                    )
+                    try:
+                        ckpt = {
+                            "episode": completed_episodes,
+                            "model_state_dict": agent.qnetwork_local.state_dict(),
+                        }
+                        opt = getattr(agent, "optimizer", None)
+                        if opt is not None:
+                            ckpt["optimizer_state_dict"] = opt.state_dict()
+                        torch.save(ckpt, ckpt_path)
+                        print(f"Checkpoint saved to {ckpt_path}")
+                    except Exception as e:
+                        print(
+                            f"Failed to save checkpoint at episode {completed_episodes}: {e}"
+                        )
 
     for e in envs:
         e.close()
