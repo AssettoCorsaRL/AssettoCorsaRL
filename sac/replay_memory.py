@@ -115,6 +115,7 @@ class PrioritizedReplayMemory:
         if len(self.buffer) < self.capacity:
             self.buffer.append(None)
         max_prio = self.priorities.max() if self.buffer else 1.0
+        max_prio = max(max_prio, self.eps)
         self.buffer[self.position] = (state, action, reward, next_state, done)
         self.priorities[self.position] = max_prio
         self.position = (self.position + 1) % self.capacity
@@ -125,8 +126,13 @@ class PrioritizedReplayMemory:
             if len(self.buffer) == self.capacity
             else self.priorities[: self.position]
         )
+        prios = np.maximum(prios, self.eps)
         probs = prios**self.alpha
-        probs /= probs.sum()
+        probs_sum = probs.sum()
+        if probs_sum <= 0 or not np.isfinite(probs_sum):
+            probs = np.full_like(probs, 1.0 / len(probs))
+        else:
+            probs /= probs_sum
 
         indices = np.random.choice(len(self.buffer), batch_size, p=probs)
         batch = [self.buffer[i] for i in indices]
@@ -137,6 +143,51 @@ class PrioritizedReplayMemory:
         weights = weights.astype(np.float32)
 
         return state, action, reward, next_state, done, weights, indices
+
+    def save(self, path: str):
+        """Save buffer plus priorities for later resume."""
+        print(f"Saving prioritized replay buffer to {path}.")
+        save_dir = Path("memory/")
+        if not save_dir.exists():
+            save_dir.mkdir()
+        payload = {
+            "buffer": self.buffer,
+            "priorities": self.priorities,
+            "position": self.position,
+            "capacity": self.capacity,
+            "alpha": self.alpha,
+            "eps": self.eps,
+        }
+        with open((save_dir / path).with_suffix(".pkl"), "wb") as fp:
+            pickle.dump(payload, fp)
+
+    def load(self, path: str):
+        """Load buffer plus priorities from disk."""
+        try:
+            with open(path, "rb") as fp:
+                payload = pickle.load(fp)
+        except UnpicklingError:
+            raise TypeError("This file doesn't contain a pickled buffer!")
+
+        buf = payload.get("buffer")
+        prios = payload.get("priorities")
+        pos = payload.get("position", 0)
+
+        if buf is None or prios is None:
+            raise ValueError("Loaded payload missing buffer or priorities")
+        if len(buf) > self.capacity:
+            raise ValueError("Loaded buffer length exceeds capacity")
+
+        self.buffer = buf
+        self.priorities = np.zeros((self.capacity,), dtype=np.float32)
+        copy_len = min(len(prios), self.capacity)
+        self.priorities[:copy_len] = prios[:copy_len]
+        self.position = (
+            pos % self.capacity
+            if len(self.buffer) == self.capacity
+            else len(self.buffer)
+        )
+        print(f"Loaded prioritized replay buffer from {path}.")
 
     def update_priorities(self, indices, priorities):
         for idx, prio in zip(indices, priorities):

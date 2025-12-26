@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Normal
 
-LOG_SIG_MAX = 2
-LOG_SIG_MIN = -20
+LOG_SIG_MAX = 2  # max std ≈ 7.4 (allows more exploration)
+LOG_SIG_MIN = -5  # min std ≈ 0.0067 (prevents near-deterministic collapse)
 epsilon = 1e-6
 
 
@@ -46,8 +46,8 @@ class ValueNetwork(nn.Module):
         self.apply(weights_init_)
 
     def forward(self, state):
-        x = F.relu(self.linear1(state))
-        x = F.relu(self.linear2(x))
+        x = F.leaky_relu(self.linear1(state))
+        x = F.leaky_relu(self.linear2(x))
         x = self.linear3(x)
         return x
 
@@ -71,12 +71,12 @@ class QNetwork(nn.Module):
     def forward(self, state, action):
         xu = torch.cat([state, action], 1)
 
-        x1 = F.relu(self.linear1(xu))
-        x1 = F.relu(self.linear2(x1))
+        x1 = F.leaky_relu(self.linear1(xu))
+        x1 = F.leaky_relu(self.linear2(x1))
         x1 = self.linear3(x1)
 
-        x2 = F.relu(self.linear4(xu))
-        x2 = F.relu(self.linear5(x2))
+        x2 = F.leaky_relu(self.linear4(xu))
+        x2 = F.leaky_relu(self.linear5(x2))
         x2 = self.linear6(x2)
 
         return x1, x2
@@ -95,8 +95,8 @@ class GaussianPolicy(nn.Module):
         self.apply(weights_init_)
 
     def forward(self, state):
-        x = F.relu(self.linear1(state))
-        x = F.relu(self.linear2(x))
+        x = F.leaky_relu(self.linear1(state))
+        x = F.leaky_relu(self.linear2(x))
         mean = self.mean_linear(x)
         log_std = self.log_std_linear(x)
         log_std = torch.clamp(log_std, min=LOG_SIG_MIN, max=LOG_SIG_MAX)
@@ -132,8 +132,8 @@ class DeterministicPolicy(nn.Module):
         self.apply(weights_init_)
 
     def forward(self, state):
-        x = F.relu(self.linear1(state))
-        x = F.relu(self.linear2(x))
+        x = F.leaky_relu(self.linear1(state))
+        x = F.leaky_relu(self.linear2(x))
         mean = torch.tanh(self.mean(x))
         return mean
 

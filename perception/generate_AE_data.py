@@ -1,4 +1,3 @@
-
 import numpy as np
 from numpy import ndarray
 import multiprocessing as mp
@@ -15,14 +14,14 @@ _RENDER = True
 def generate_action(prev_action: ndarray) -> ndarray:
     """
     Generates random actions in the gym environment CarRacer.
-    The actions are biased towards acceleration to induce exploration of the environment.  
-    
-    ## Parameters:  
-    
-    - **prev_action** *(ndarray)*: Array with 3 elements representing the previous action.     
-    
-    ## Output:  
-    
+    The actions are biased towards acceleration to induce exploration of the environment.
+
+    ## Parameters:
+
+    - **prev_action** *(ndarray)*: Array with 3 elements representing the previous action.
+
+    ## Output:
+
     - **action** *(ndarray)*: Array with 3 elements representing the new sampled action.
     """
     if np.random.randint(3) % 3:
@@ -40,16 +39,16 @@ def generate_action(prev_action: ndarray) -> ndarray:
     action[1] = (action[1] + 1) / 2
     action[2] = (action[2] + 1) / 2
 
-    return action*mask
+    return action * mask
 
 
 def simulate_batch(batch_num: int):
     """
-    Generates batches of observations from the Carracer environment.  
-    
-    ## Parameters:  
-    
-    - **batch_num** *(int)*:  Number of the current batch being generated.  
+    Generates batches of observations from the Carracer environment.
+
+    ## Parameters:
+
+    - **batch_num** *(int)*:  Number of the current batch being generated.
     """
     env = CarRacing()
 
@@ -58,9 +57,6 @@ def simulate_batch(batch_num: int):
     action = env.action_space.sample()
     for i_episode in range(_BATCH_SIZE):
         observation = env.reset()
-        # Make the Car start at random positions in the race-track
-        position = np.random.randint(len(env.track))
-        env.car = Car(env.world, *env.track[position][1:4])
 
         obs_sequence = []
 
@@ -75,9 +71,11 @@ def simulate_batch(batch_num: int):
             obs_data.append(observation)
 
     print("Saving dataset for batch {}".format(batch_num))
-    # Change this to an appropriate directory for you
-    np.save('/home/timo/DataSets/carracer_images/obs_data_AE_{}'.format(batch_num), obs_data)
-    
+
+    np.save(
+        "/home/timo/DataSets/carracer_images/obs_data_AE_{}".format(batch_num), obs_data
+    )
+
     env.close()
 
 
