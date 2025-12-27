@@ -63,7 +63,7 @@ class SAC(object):
         action_space,
         policy: str = "Gaussian",
         gamma: float = 0.99,
-        tau: float = 0.005,
+        tau: float = 0.01,
         lr: float = 0.0001,
         alpha: float = 0.2,
         automatic_temperature_tuning: bool = False,
@@ -71,6 +71,7 @@ class SAC(object):
         hidden_size: int = 256,
         target_update_interval: int = 1,
         input_dim: int = 32,
+        in_channels: int = 3,
         device=None,
     ):
         self.device = device or torch.device(
@@ -88,24 +89,29 @@ class SAC(object):
         self.input_dim = input_dim
         self.hidden_size = hidden_size
         self.bs = batch_size
+        self.in_channels = in_channels
 
         # Shared conv encoder
-        self.encoder = ConvEncoder(in_channels=3, latent_dim=input_dim).to(self.device)
-        # Target encoder for stable value estimation (soft-updated like critic_target)
-        self.encoder_target = ConvEncoder(in_channels=3, latent_dim=input_dim).to(
+        self.encoder = ConvEncoder(in_channels=in_channels, latent_dim=input_dim).to(
             self.device
         )
+        # Target encoder for stable value estimation (soft-updated like critic_target)
+        self.encoder_target = ConvEncoder(
+            in_channels=in_channels, latent_dim=input_dim
+        ).to(self.device)
         hard_update(self.encoder_target, self.encoder)
         # Freeze target encoder (only updated via soft_update)
         for param in self.encoder_target.parameters():
             param.requires_grad = False
 
+        # Separate encoder optimizer for more controlled updates
+        self.encoder_optim = Adam(self.encoder.parameters(), lr=self.lr)
+
         self.critic = QNetwork(input_dim, action_space.shape[0], hidden_size).to(
             self.device
         )
-        self.critic_optim = Adam(
-            list(self.critic.parameters()) + list(self.encoder.parameters()), lr=self.lr
-        )
+        # Critic optimizer - only critic params, encoder updated separately
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
 
         self.critic_target = QNetwork(input_dim, action_space.shape[0], hidden_size).to(
             self.device
@@ -114,25 +120,18 @@ class SAC(object):
 
         if self.policy_type == "Gaussian":
             if self.automatic_temperature_tuning:
-                # Use action dimension (not product) for a milder entropy target
                 self.target_entropy = -float(action_space.shape[0])
-                # Initialize log_alpha so initial alpha == provided alpha
                 self.log_alpha = torch.log(
                     torch.tensor(self.alpha, device=self.device)
                 ).detach()
                 self.log_alpha.requires_grad_(True)
                 self.alpha_optim = Adam([self.log_alpha], lr=self.lr)
-                # sync self.alpha to the param value
                 self.alpha = self.log_alpha.exp().item()
 
             self.policy = GaussianPolicy(
                 input_dim, action_space.shape[0], hidden_size
             ).to(self.device)
-            # Include encoder parameters in policy optimizer so policy gradients update encoder
-            self.policy_optim = Adam(
-                list(self.policy.parameters()) + list(self.encoder.parameters()),
-                lr=self.lr,
-            )
+            self.policy_optim = Adam(self.policy.parameters(), lr=self.lr)
 
         else:
             self.alpha = 0
@@ -140,10 +139,7 @@ class SAC(object):
             self.policy = DeterministicPolicy(
                 input_dim, action_space.shape[0], hidden_size
             ).to(self.device)
-            self.policy_optim = Adam(
-                list(self.policy.parameters()) + list(self.encoder.parameters()),
-                lr=self.lr,
-            )
+            self.policy_optim = Adam(self.policy.parameters(), lr=self.lr)
 
         # Print network architectures on init
         print("Encoder:\n", self.encoder)
@@ -180,7 +176,9 @@ class SAC(object):
         self, obs_batch: torch.Tensor, use_target: bool = False
     ) -> torch.Tensor:
         # obs_batch expected (B, H, W, C) or (B, C, H, W)
-        if obs_batch.dim() == 4 and obs_batch.shape[1] != 3:
+        # For frame-stacked grayscale: (B, stack_size, H, W) or (B, H, W, stack_size)
+        if obs_batch.dim() == 4 and obs_batch.shape[1] != self.in_channels:
+            # Assume (B, H, W, C) -> permute to (B, C, H, W)
             obs_batch = obs_batch.permute(0, 3, 1, 2)
         encoder = self.encoder_target if use_target else self.encoder
         return encoder(obs_batch)
@@ -198,6 +196,19 @@ class SAC(object):
             _, _, action = self.policy.sample(z)
         action = action.detach().cpu().numpy()
         return action[0]
+
+    @torch.no_grad()
+    def select_action_batch(self, states, eval=False):
+        """Select actions for multiple states at once (batched inference)."""
+        # states: np.array (B, H, W, C) or (B, C, H, W)
+        if not isinstance(states, torch.Tensor):
+            states = torch.as_tensor(states, dtype=torch.float32)
+        z = self._encode(states.to(self.device))
+        if not eval:
+            actions, _, _ = self.policy.sample(z)
+        else:
+            _, _, actions = self.policy.sample(z)
+        return actions.cpu().numpy()
 
     def update_parameters(
         self,
@@ -226,12 +237,6 @@ class SAC(object):
         next_state_batch_t = torch.as_tensor(
             next_state_batch, dtype=torch.float32, device=self.device
         )
-        # Encode states - encoder trained through critic
-        state_latent = self._encode(state_batch_t)
-        # Use target encoder for next states (more stable value estimates)
-        with torch.no_grad():
-            next_state_latent = self._encode(next_state_batch_t, use_target=True)
-
         action_batch = torch.as_tensor(
             action_batch, dtype=torch.float32, device=self.device
         )
@@ -249,7 +254,12 @@ class SAC(object):
         else:
             weights_t = None
 
+        # === CRITIC UPDATE ===
+        # Encode states for critic (encoder gets gradients from critic loss)
+        state_latent = self._encode(state_batch_t)
+
         with torch.no_grad():
+            next_state_latent = self._encode(next_state_batch_t, use_target=True)
             next_state_action, next_state_log_pi, _ = self.policy.sample(
                 next_state_latent
             )
@@ -260,43 +270,43 @@ class SAC(object):
                 torch.min(qf1_next_target, qf2_next_target)
                 - self.alpha * next_state_log_pi
             )
-            next_q_value = reward_batch + mask_batch * self.gamma * (min_qf_next_target)
+            next_q_value = reward_batch + mask_batch * self.gamma * min_qf_next_target
 
         qf1, qf2 = self.critic(state_latent, action_batch)
-        td_error1 = next_q_value.detach() - qf1
-        td_error2 = next_q_value.detach() - qf2
+        td_error1 = next_q_value - qf1
+        td_error2 = next_q_value - qf2
 
         if weights_t is not None:
             qf1_loss = (weights_t * td_error1.pow(2)).mean()
             qf2_loss = (weights_t * td_error2.pow(2)).mean()
         else:
-            qf1_loss = F.mse_loss(qf1, next_q_value.detach())
-            qf2_loss = F.mse_loss(qf2, next_q_value.detach())
+            qf1_loss = F.mse_loss(qf1, next_q_value)
+            qf2_loss = F.mse_loss(qf2, next_q_value)
 
         critic_loss = qf1_loss + qf2_loss
 
+        # Update critic and encoder together
         self.critic_optim.zero_grad()
+        self.encoder_optim.zero_grad()
         critic_loss.backward()
-        # capture gradient norm for critic+encoder
-        critic_grad_norm = clip_grad_norm_(
-            list(self.critic.parameters()) + list(self.encoder.parameters()), 5.0
-        )
+        critic_grad_norm = clip_grad_norm_(self.critic.parameters(), 5.0)
+        encoder_grad_norm = clip_grad_norm_(self.encoder.parameters(), 5.0)
         self.critic_optim.step()
+        self.encoder_optim.step()
 
-        # Re-encode state for policy (allows encoder to learn from policy gradients too)
-        state_latent_pi = self._encode(state_batch_t)
+        # === POLICY UPDATE ===
+        # Detach encoder for policy update to prevent conflicting gradients
+        with torch.no_grad():
+            state_latent_pi = self._encode(state_batch_t)
+
         pi, log_pi, _ = self.policy.sample(state_latent_pi)
-        # Detach encoder output for critic evaluation to avoid double-backprop through encoder
-        qf1_pi, qf2_pi = self.critic(state_latent_pi.detach(), pi)
+        qf1_pi, qf2_pi = self.critic(state_latent_pi, pi)
         min_qf_pi = torch.min(qf1_pi, qf2_pi)
         policy_loss = ((self.alpha * log_pi) - min_qf_pi).mean()
 
         self.policy_optim.zero_grad()
         policy_loss.backward()
-        # capture gradient norm for policy+encoder
-        policy_grad_norm = clip_grad_norm_(
-            list(self.policy.parameters()) + list(self.encoder.parameters()), 5.0
-        )
+        policy_grad_norm = clip_grad_norm_(self.policy.parameters(), 5.0)
         self.policy_optim.step()
 
         if self.automatic_temperature_tuning:
@@ -308,8 +318,8 @@ class SAC(object):
             alpha_loss.backward()
             self.alpha_optim.step()
 
-            self.alpha = self.log_alpha.exp()
-            alpha_tlogs = self.alpha.clone()
+            self.alpha = self.log_alpha.exp().item()
+            alpha_tlogs = torch.tensor(self.alpha, device=self.device)
         else:
             alpha_loss = torch.tensor(0.0, device=self.device)
             alpha_tlogs = torch.tensor(self.alpha, device=self.device)
@@ -322,21 +332,12 @@ class SAC(object):
             prios = (td_error1.detach().abs() + td_error2.detach().abs()) * 0.5
             prios = prios.squeeze(1).cpu().numpy()
             memory.update_priorities(idxs, prios)
-        # Diagnostics for logging
-        try:
-            mean_log_pi = log_pi.mean().item()
-        except Exception:
-            mean_log_pi = float("nan")
-        try:
-            mean_min_qf_pi = min_qf_pi.mean().item()
-        except Exception:
-            mean_min_qf_pi = float("nan")
-        try:
-            mean_qf1 = qf1.mean().item()
-            mean_qf2 = qf2.mean().item()
-        except Exception:
-            mean_qf1 = float("nan")
-            mean_qf2 = float("nan")
+
+        # Diagnostics
+        mean_log_pi = log_pi.mean().item()
+        mean_min_qf_pi = min_qf_pi.mean().item()
+        mean_qf1 = qf1.mean().item()
+        mean_qf2 = qf2.mean().item()
         td_error_mean = (
             ((td_error1.detach().abs() + td_error2.detach().abs()) * 0.5).mean().item()
         )

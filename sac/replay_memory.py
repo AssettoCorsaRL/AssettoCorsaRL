@@ -3,6 +3,9 @@ import numpy as np
 import pickle
 from pickle import UnpicklingError
 from pathlib import Path
+import torch
+from threading import Thread
+from queue import Queue
 
 
 class ReplayMemory:
@@ -15,10 +18,19 @@ class ReplayMemory:
     - **capacity** *(int)*:  Defines the size of the replay buffer.
     """
 
-    def __init__(self, capacity):
+    def __init__(self, capacity, prefetch_batches: int = 2, device: str = "cuda"):
         self.capacity = capacity
         self.buffer = []
         self.position = 0
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        # Prefetch queue for async data loading
+        self.prefetch_batches = prefetch_batches
+        self.prefetch_queue = (
+            Queue(maxsize=prefetch_batches) if prefetch_batches > 0 else None
+        )
+        self.prefetch_thread = None
+        self._stop_prefetch = False
 
     def push(self, state, action, reward, next_state, done):
         """
@@ -40,6 +52,11 @@ class ReplayMemory:
         self.buffer[self.position] = (state, action, reward, next_state, done)
         self.position = (self.position + 1) % self.capacity
 
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """Push multiple transitions at once (more efficient for vectorized envs)."""
+        for s, a, r, ns, d in zip(states, actions, rewards, next_states, dones):
+            self.push(s, a, r, ns, d)
+
     def sample(self, batch_size):
         """
         Outputs samples contained in the replay buffer.
@@ -56,9 +73,77 @@ class ReplayMemory:
         - **next_state** *(array)*: Contains *batch_size* next_state arrays
         - **done** *(array)*: Contains *batch_size* done values
         """
-        batch = random.sample(self.buffer, batch_size)
+        indices = random.sample(range(len(self.buffer)), batch_size)
+        batch = [self.buffer[i] for i in indices]
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
         return state, action, reward, next_state, done
+
+    def sample_tensors(self, batch_size):
+        """Sample and return GPU tensors directly (faster for training)."""
+        state, action, reward, next_state, done = self.sample(batch_size)
+        # Use pin_memory for faster GPU transfer
+        state_t = (
+            torch.as_tensor(state, dtype=torch.float32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        action_t = (
+            torch.as_tensor(action, dtype=torch.float32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        reward_t = (
+            torch.as_tensor(reward, dtype=torch.float32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        next_state_t = (
+            torch.as_tensor(next_state, dtype=torch.float32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        done_t = (
+            torch.as_tensor(done, dtype=torch.float32)
+            .pin_memory()
+            .to(self.device, non_blocking=True)
+        )
+        return state_t, action_t, reward_t, next_state_t, done_t
+
+    def start_prefetch(self, batch_size):
+        """Start background thread to prefetch batches."""
+        if self.prefetch_queue is None or self.prefetch_thread is not None:
+            return
+        self._stop_prefetch = False
+        self.prefetch_thread = Thread(
+            target=self._prefetch_worker, args=(batch_size,), daemon=True
+        )
+        self.prefetch_thread.start()
+
+    def stop_prefetch(self):
+        """Stop the prefetch thread."""
+        self._stop_prefetch = True
+        if self.prefetch_thread is not None:
+            self.prefetch_thread.join(timeout=1.0)
+            self.prefetch_thread = None
+
+    def _prefetch_worker(self, batch_size):
+        """Background worker that prefetches batches."""
+        while not self._stop_prefetch:
+            if len(self.buffer) >= batch_size:
+                batch = self.sample_tensors(batch_size)
+                try:
+                    self.prefetch_queue.put(batch, timeout=0.1)
+                except:
+                    pass
+
+    def get_prefetched_batch(self, batch_size):
+        """Get a prefetched batch or sample a new one."""
+        if self.prefetch_queue is not None and not self.prefetch_queue.empty():
+            try:
+                return self.prefetch_queue.get_nowait()
+            except:
+                pass
+        return self.sample_tensors(batch_size)
 
     def save(self, path: str):
         """
