@@ -6,6 +6,7 @@ import torch
 from torch import nn, multiprocessing
 from tensordict.nn import TensorDictModule
 from tensordict.nn.distributions import NormalParamExtractor
+from tensordict import TensorDict
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 
@@ -36,6 +37,9 @@ class SACPolicy:
         action_dim = int(env.action_spec.shape[-1])
 
         actor_net = nn.Sequential(
+            nn.Flatten(
+                start_dim=1
+            ),  # ← ADD THIS LINE to flatten [B, C, H, W] → [B, C*H*W]
             nn.LazyLinear(num_cells, device=device),
             nn.Tanh(),
             nn.LazyLinear(num_cells, device=device),
@@ -87,6 +91,7 @@ class SACPolicy:
         )
 
         value_net = nn.Sequential(
+            nn.Flatten(start_dim=1),  # ← ADD THIS LINE
             nn.LazyLinear(num_cells, device=device),
             nn.Tanh(),
             nn.LazyLinear(num_cells, device=device),
@@ -138,7 +143,7 @@ class SACConfig:
     # Replay / training
     batch_size = 256
     replay_size = 100_000
-    start_steps = 10_000
+    start_steps = 1_000
 
     # SAC specific
     gamma = 0.99
