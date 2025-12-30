@@ -25,6 +25,7 @@ from torchrl.envs import (
     RewardSum,
     VecNorm,
     ParallelEnv,
+    SqueezeTransform,
 )
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.envs.utils import check_env_specs, ExplorationType, set_exploration_type
@@ -191,6 +192,26 @@ def get_device():
     return torch.device("cpu")
 
 
+from torchrl.envs.libs.gym import GymWrapper
+
+import numpy as np
+import torch
+
+
+class SqueezedGymWrapper(GymWrapper):
+    """GymWrapper that ensures the action is a 1D numpy array before
+    forwarding it to the underlying gym env."""
+
+    def step(self, tensordict):
+        if "action" in tensordict:
+            action = tensordict["action"]
+            action_np = np.asarray(action).squeeze()
+            if action_np.ndim == 0:
+                action_np = action_np.reshape(1)
+            tensordict["action"] = action_np
+        return super().step(tensordict)
+
+
 class SACEnv:
     """Environment factory and wrapper for SAC training with parallel environments."""
 
@@ -201,25 +222,34 @@ class SACEnv:
         self.num_envs = num_envs
 
         def make_env():
-            base_env = GymEnv(env_name, device=device)
+            import gymnasium as gym  # TODO: stop doing stupid stuff
+
+            base_env = SqueezedGymWrapper(
+                gym.make(env_name),
+                device=device,
+            )
+
             env = TransformedEnv(base_env)
-            env.append_transform(ToTensorImage())
+            env.append_transform(ToTensorImage(in_keys=["pixels"]))
             env.append_transform(GrayScale())
             env.append_transform(Resize(84, 84))
             env.append_transform(CatFrames(N=3, dim=-3))
             env.append_transform(RewardSum())
             env.append_transform(StepCounter())
             env.append_transform(DoubleToFloat())
+
+            env.append_transform(SqueezeTransform(dim=-2, in_keys=["action"]))
+
             return env
+
+        self.make_env = make_env
 
         env = ParallelEnv(
             num_workers=num_envs,
             create_env_fn=make_env,
             serial_for_single=True,
         )
-
         env.append_transform(VecNorm(in_keys=["pixels"]))
-
         self.env = env
 
     def get_env(self) -> TransformedEnv:
@@ -391,12 +421,14 @@ def train_sac(components, total_frames: int = 100_000, updates_per_batch: int = 
     device = sac_policy.device
 
     collector = SyncDataCollector(
-        env_obj.get_env(),
-        sac_policy.actor,
+        create_env_fn=env_obj.make_env,
+        policy=sac_policy.actor,
         frames_per_batch=config.frames_per_batch,
         total_frames=total_frames,
-        split_trajs=False,
+        # split_trajs=False,
+        storing_device=device,
         device=device,
+        reset_at_each_iter=True,
     )
 
     logs = defaultdict(list)
@@ -410,24 +442,103 @@ def train_sac(components, total_frames: int = 100_000, updates_per_batch: int = 
         except Exception:
             use_wandb = False
 
-    iterator = iter(collector)
-    i = 0
-    while True:
-        i += 1
-
-        try:
-            tensordict_data = next(iterator)
-        except Exception as e:
-            print(f"Collector iteration failed: {e}")
-            # Diagnostic: inspect env.reset() output shapes
+    try:
+        for i, tensordict_data in enumerate(collector, start=1):
+            data_view = tensordict_data.reshape(-1)
             try:
-                td_reset = env_obj.get_env().reset()
-                print("Diagnostic: env.reset() batch_size:", td_reset.batch_size)
-                for k, v in td_reset.items():
-                    # Print type and shape; if nested TensorDict, recurse one level
+                replay.extend(data_view.cpu())
+            except Exception as e:
+                print(f"Warning: Could not extend replay buffer: {e}")
+                pass
+
+            if len(replay) >= config.batch_size:
+                for _ in range(updates_per_batch):
+                    batch = replay.sample(config.batch_size)
+                    # TODO: Add actual SAC update logic here
+
+            try:
+                reward = tensordict_data[("next", "reward")].mean().item()
+            except Exception:
+                reward = tensordict_data["next", "reward"].mean().item()
+
+            logs["reward"].append(reward)
+            pbar.update(tensordict_data.numel())
+            if "step_count" in tensordict_data:
+                step_count = tensordict_data["step_count"].max().item()
+            else:
+                step_count = 0
+            logs["step_count"].append(step_count)
+
+            if i % 10 == 0:
+                with set_exploration_type(
+                    ExplorationType.DETERMINISTIC
+                ), torch.no_grad():
+                    try:
+                        eval_rollout = env_obj.get_env().rollout(1000, sac_policy.actor)
+                        eval_reward = eval_rollout["next", "reward"].mean().item()
+                        logs.setdefault("eval reward", []).append(eval_reward)
+                        if use_wandb:
+                            wandb.log({"eval/reward": eval_reward, "step": pbar.n})
+                    except Exception as e:
+                        print(f"Warning: Eval rollout failed: {e}")
+                        pass
+
+            pbar.set_description(f"avg_reward={logs['reward'][-1]:4.4f}")
+            if use_wandb:
+                wandb.log({"train/reward": reward, "train/step": pbar.n})
+
+            if pbar.n >= total_frames:
+                break
+    except Exception as e:
+        print(f"Collector iteration failed: {e}")
+        # Diagnostic: inspect env.reset() output shapes
+        try:
+            td_reset = env_obj.get_env().reset()
+            print("Diagnostic: env.reset() batch_size:", td_reset.batch_size)
+            for k, v in td_reset.items():
+                # Print type and shape; if nested TensorDict, recurse one level
+                if isinstance(v, TensorDict):
+                    print(
+                        f"  reset key {k}: TensorDict, batch_size={v.batch_size}, keys={list(v.keys())}"
+                    )
+                    for nk, nv in v.items():
+                        try:
+                            print(f"    nested {nk}: shape={tuple(nv.shape)}")
+                        except Exception:
+                            print(f"    nested {nk}: type={type(nv)}")
+                else:
+                    try:
+                        print(
+                            f"  reset key {k}: type={type(v)}, shape={tuple(v.shape)}"
+                        )
+                    except Exception:
+                        print(f"  reset key {k}: type={type(v)} (no shape)")
+        except Exception as e2:
+            print("Diagnostic: env.reset() failed:", e2)
+            td_reset = None
+
+        # Try a manual step with a midpoint action to see shapes
+        try:
+            if td_reset is not None:
+                action_spec = env_obj.get_env().action_spec
+                # Build a mid-range action compatible with the spec
+                try:
+                    low = action_spec.space.low.to(device)
+                    high = action_spec.space.high.to(device)
+                    sample_action = ((low + high) / 2).to(device)
+                except Exception:
+                    # Fallback: zeros with correct shape
+                    sample_action = torch.zeros(action_spec.shape, device=device)
+
+                td_in = td_reset.clone()
+                td_in["action"] = sample_action
+                td_out = env_obj.get_env().step(td_in)
+                print("Diagnostic: manual step output keys and shapes:")
+                for k, v in td_out.items():
+                    # If TensorDict, print nested keys and shapes
                     if isinstance(v, TensorDict):
                         print(
-                            f"  reset key {k}: TensorDict, batch_size={v.batch_size}, keys={list(v.keys())}"
+                            f"  step key {k}: TensorDict, batch_size={v.batch_size}, keys={list(v.keys())}"
                         )
                         for nk, nv in v.items():
                             try:
@@ -437,143 +548,60 @@ def train_sac(components, total_frames: int = 100_000, updates_per_batch: int = 
                     else:
                         try:
                             print(
-                                f"  reset key {k}: type={type(v)}, shape={tuple(v.shape)}"
+                                f"  step key {k}: type={type(v)}, shape={tuple(v.shape)}"
                             )
                         except Exception:
-                            print(f"  reset key {k}: type={type(v)} (no shape)")
-            except Exception as e2:
-                print("Diagnostic: env.reset() failed:", e2)
-                td_reset = None
+                            print(f"  step key {k}: type={type(v)} (no shape)")
+        except Exception as e3:
+            print("Diagnostic: manual step failed:", e3)
 
-            # Try a manual step with a midpoint action to see shapes
-            try:
-                if td_reset is not None:
-                    action_spec = env_obj.get_env().action_spec
-                    # Build a mid-range action compatible with the spec
+        # Inspect each worker individually to find the one returning unexpected shapes
+        try:
+            for attr in ("_envs", "envs", "workers"):
+                ws = getattr(env_obj.get_env(), attr, None)
+                if not ws:
+                    continue
+                print(
+                    f"Diagnostic: found worker container '{attr}' with {len(ws)} workers; testing each worker step:"
+                )
+                for idx, w in enumerate(ws):
                     try:
-                        low = action_spec.space.low.to(device)
-                        high = action_spec.space.high.to(device)
-                        sample_action = ((low + high) / 2).to(device)
-                    except Exception:
-                        # Fallback: zeros with correct shape
-                        sample_action = torch.zeros(action_spec.shape, device=device)
-
-                    td_in = td_reset.clone()
-                    td_in["action"] = sample_action
-                    td_out = env_obj.get_env().step(td_in)
-                    print("Diagnostic: manual step output keys and shapes:")
-                    for k, v in td_out.items():
-                        # If TensorDict, print nested keys and shapes
-                        if isinstance(v, TensorDict):
-                            print(
-                                f"  step key {k}: TensorDict, batch_size={v.batch_size}, keys={list(v.keys())}"
-                            )
-                            for nk, nv in v.items():
-                                try:
-                                    print(f"    nested {nk}: shape={tuple(nv.shape)}")
-                                except Exception:
-                                    print(f"    nested {nk}: type={type(nv)}")
-                        else:
+                        w_td = w.reset()
+                        print(f"  worker {idx} reset batch_size: {w_td.batch_size}")
+                        for k, v in w_td.items():
                             try:
-                                print(
-                                    f"  step key {k}: type={type(v)}, shape={tuple(v.shape)}"
-                                )
+                                print(f"    reset {k}: shape={tuple(v.shape)}")
                             except Exception:
-                                print(f"  step key {k}: type={type(v)} (no shape)")
-            except Exception as e3:
-                print("Diagnostic: manual step failed:", e3)
-
-            # Inspect each worker individually to find the one returning unexpected shapes
-            try:
-                for attr in ("_envs", "envs", "workers"):
-                    ws = getattr(env_obj.get_env(), attr, None)
-                    if not ws:
-                        continue
-                    print(
-                        f"Diagnostic: found worker container '{attr}' with {len(ws)} workers; testing each worker step:"
-                    )
-                    for idx, w in enumerate(ws):
+                                print(f"    reset {k}: type={type(v)}")
+                        # build a sample action for this worker
                         try:
-                            w_td = w.reset()
-                            print(f"  worker {idx} reset batch_size: {w_td.batch_size}")
-                            for k, v in w_td.items():
-                                try:
-                                    print(f"    reset {k}: shape={tuple(v.shape)}")
-                                except Exception:
-                                    print(f"    reset {k}: type={type(v)}")
-                            # build a sample action for this worker
+                            a_spec = w.action_spec
+                        except Exception:
+                            a_spec = env_obj.get_env().action_spec
+                        try:
+                            low = a_spec.space.low
+                            high = a_spec.space.high
+                            sample_act = ((low + high) / 2).to(device)
+                        except Exception:
+                            sample_act = torch.zeros(a_spec.shape, device=device)
+
+                        td_w_in = w_td.clone()
+                        td_w_in["action"] = sample_act
+                        w_out = w.step(td_w_in)
+                        print(f"  worker {idx} step output:")
+                        for k, v in w_out.items():
                             try:
-                                a_spec = w.action_spec
+                                print(f"    {k}: shape={tuple(v.shape)}")
                             except Exception:
-                                a_spec = env_obj.get_env().action_spec
-                            try:
-                                low = a_spec.space.low
-                                high = a_spec.space.high
-                                sample_act = ((low + high) / 2).to(device)
-                            except Exception:
-                                sample_act = torch.zeros(a_spec.shape, device=device)
+                                print(f"    {k}: type={type(v)}")
+                    except Exception as we:
+                        print(f"    worker {idx} test failed: {we}")
+                break
+        except Exception as e4:
+            print("Diagnostic: per-worker inspection failed:", e4)
 
-                            td_w_in = w_td.clone()
-                            td_w_in["action"] = sample_act
-                            w_out = w.step(td_w_in)
-                            print(f"  worker {idx} step output:")
-                            for k, v in w_out.items():
-                                try:
-                                    print(f"    {k}: shape={tuple(v.shape)}")
-                                except Exception:
-                                    print(f"    {k}: type={type(v)}")
-                        except Exception as we:
-                            print(f"    worker {idx} test failed: {we}")
-                    break
-            except Exception as e4:
-                print("Diagnostic: per-worker inspection failed:", e4)
-
-            # Re-raise so the original failure is still visible to the caller
-            raise
-
-        data_view = tensordict_data.reshape(-1)
-        try:
-            replay.extend(data_view.cpu())
-        except Exception as e:
-            print(f"Warning: Could not extend replay buffer: {e}")
-            pass
-
-        if len(replay) >= config.batch_size:
-            for _ in range(updates_per_batch):
-                batch = replay.sample(config.batch_size)
-                # TODO: Add actual SAC update logic here
-
-        try:
-            reward = tensordict_data[("next", "reward")].mean().item()
-        except Exception:
-            reward = tensordict_data["next", "reward"].mean().item()
-
-        logs["reward"].append(reward)
-        pbar.update(tensordict_data.numel())
-        if "step_count" in tensordict_data:
-            step_count = tensordict_data["step_count"].max().item()
-        else:
-            step_count = 0
-        logs["step_count"].append(step_count)
-
-        if i % 10 == 0:
-            with set_exploration_type(ExplorationType.DETERMINISTIC), torch.no_grad():
-                try:
-                    eval_rollout = env_obj.get_env().rollout(1000, sac_policy.actor)
-                    eval_reward = eval_rollout["next", "reward"].mean().item()
-                    logs.setdefault("eval reward", []).append(eval_reward)
-                    if use_wandb:
-                        wandb.log({"eval/reward": eval_reward, "step": pbar.n})
-                except Exception as e:
-                    print(f"Warning: Eval rollout failed: {e}")
-                    pass
-
-        pbar.set_description(f"avg_reward={logs['reward'][-1]:4.4f}")
-        if use_wandb:
-            wandb.log({"train/reward": reward, "train/step": pbar.n})
-
-        if pbar.n >= total_frames:
-            break
+        # Re-raise so the original failure is still visible to the caller
+        raise
 
     pbar.close()
     if use_wandb:
