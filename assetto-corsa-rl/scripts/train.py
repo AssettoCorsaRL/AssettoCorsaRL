@@ -2,13 +2,25 @@ import argparse
 import time
 import math
 from collections import deque
+import sys
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from env import create_gym_env
-from ..model.sac import SACPolicy, SACConfig, get_device
+try:
+    from assetto_corsa_rl.env import create_gym_env  # type: ignore
+    from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
+    from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
+except Exception:
+    repo_root = Path(__file__).resolve().parents[1]
+    src_path = str(repo_root / "src")
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    from assetto_corsa_rl.env import create_gym_env  # type: ignore
+    from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
+    from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
 
 # configuration loader
 import yaml
@@ -49,10 +61,12 @@ def load_cfg_from_yaml(root: Path = None):
 
     Model keys override environment keys when names collide. Missing keys are filled
     from `SACConfig` defaults.
+
+    This version preserves integers and only converts string representations to appropriate types.
     """
     if root is None:
         # project root (assetto-corsa-rl)
-        root = Path(__file__).resolve().parents[3]
+        root = Path(__file__).resolve().parents[1]
 
     env_p = root / "configs" / "env_config.yaml"
     model_p = root / "configs" / "model_config.yaml"
@@ -72,17 +86,38 @@ def load_cfg_from_yaml(root: Path = None):
     cfg_dict.update(model)
     cfg_dict.update(env)
 
-    # Fill missing keys from SACConfig defaults
-    defaults = {
-        k: getattr(SACConfig, k)
-        for k in dir(SACConfig)
-        if not k.startswith("__") and not callable(getattr(SACConfig, k))
-    }
-    for k, v in defaults.items():
-        if k not in cfg_dict:
-            cfg_dict[k] = v
+    def _try_convert(x):
+        # preserve booleans and None
+        if x is None or isinstance(x, bool):
+            return x
+        # dict -> recurse
+        if isinstance(x, dict):
+            return {k: _try_convert(v) for k, v in x.items()}
+        # list/tuple -> recurse and return list
+        if isinstance(x, (list, tuple)):
+            return [_try_convert(v) for v in x]
+        # Keep integers as integers, floats as floats
+        if isinstance(x, int):
+            return x  # Don't convert to float!
+        if isinstance(x, float):
+            return x
+        # strings -> try to parse as int first, then float
+        if isinstance(x, str):
+            s = x.strip().replace(",", "").replace("_", "")
+            try:
+                # Try int first (this handles cases like "4" or "1_000_000")
+                if "." not in s and "e" not in s.lower():
+                    return int(s)
+                else:
+                    return float(s)
+            except Exception:
+                return x
+        # fallback: return original
+        return x
 
-    cfg = SimpleNamespace(**cfg_dict)
+    converted = {k: _try_convert(v) for k, v in cfg_dict.items()}
+
+    cfg = SimpleNamespace(**converted)
     print(f"Loaded config from: {env_p}, {model_p}")
     return cfg
 
@@ -130,6 +165,14 @@ def train():
     q1 = modules["q1"]
     q2 = modules["q2"]
 
+    # def init_optimistic(m):
+    #     if isinstance(m, nn.Linear):
+    #         nn.init.constant_(m.bias, 1.0)  # Optimistic bias
+    #         nn.init.xavier_uniform_(m.weight, gain=0.01)  # Small weights
+
+    # q1.apply(init_optimistic)
+    # q2.apply(init_optimistic)
+
     print("Initializing lazy modules...")
     with torch.no_grad():
         sample_pixels = td["pixels"][:1].to(device)  # take first env, single batch
@@ -161,7 +204,8 @@ def train():
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
 
-    target_entropy = -float(env.action_spec.shape[-1])  # -dim(A)
+    # * watch the preformance of / 2
+    target_entropy = -float(env.action_spec.shape[-1]) / 2.0  # -dim(A)
     print(f"Target entropy: {target_entropy}")
 
     print("using PrioritizedReplayBuffer with LazyTensorStorage")
@@ -173,8 +217,6 @@ def train():
         storage=storage,
         batch_size=cfg.batch_size,
     )
-
-    from train_core import run_training_loop
 
     current_td = td
     total_steps = 0

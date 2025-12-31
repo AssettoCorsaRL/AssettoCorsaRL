@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 import wandb
 
-from train_utils import (
+from .train_utils import (
     add_transition,
     extract_reward_and_done,
     expand_actions_for_envs,
@@ -218,6 +218,8 @@ class Trainer:
             if d.item():
                 self.episode_returns.append(self.current_episode_return[i].item())
                 self.current_episode_return[i] = 0.0
+                episode_length = len(self.episode_returns)
+                wandb.log({"episode_length": episode_length}, step=self.total_steps)
 
     def _maybe_reset(self, td_next, dones):
         self.current_td = td_next
@@ -274,13 +276,43 @@ class Trainer:
 
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
 
-        # ===== Critic Update =====
+        # ===== Critic Update ===== TODO: check if this works
         with torch.no_grad():
-            # USE TARGET NETWORK instead of regular value network
-            next_v_raw = self.value_target(next_pixels_b)
-            next_v = reduce_value_to_batch(next_v_raw, next_pixels_b.shape[0])
-            if next_v is None:
-                next_v = torch.zeros_like(rewards_b)
+            next_td = TensorDict(
+                {"pixels": next_pixels_b}, batch_size=next_pixels_b.shape[0]
+            )
+
+            if getattr(self.cfg, "use_noisy", False):
+                for m in self.actor.modules():
+                    if hasattr(m, "sample_noise"):
+                        m.sample_noise()
+
+            next_out = self.actor(next_td)
+            next_actions = fix_action_shape(
+                next_out["action"],
+                next_pixels_b.shape[0],
+                action_dim=self.env.action_spec.shape[-1],
+            )
+            next_log_prob = next_out.get("log_prob")
+            if next_log_prob is not None and next_log_prob.ndim == 1:
+                next_log_prob = next_log_prob.view(-1, 1)
+
+            # use TARGET Q-networks
+            # use regular Q-networks as approximation
+            next_q1 = self.q1(next_pixels_b, next_actions).view(-1, 1)
+            next_q2 = self.q2(next_pixels_b, next_actions).view(-1, 1)
+            next_min_q = torch.min(next_q1, next_q2)
+
+            # SAC target with entropy term
+            if self.log_alpha is not None:
+                alpha = self.log_alpha.exp()
+            else:
+                alpha = self.cfg.alpha
+
+            next_v = next_min_q - alpha * (
+                next_log_prob if next_log_prob is not None else 0.0
+            )
+
             q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
 
         actions_b = fix_action_shape(
@@ -302,11 +334,7 @@ class Trainer:
         self.critic_opt.step()
 
         # ===== Value Update =====
-        # Get current alpha value (learnable or fixed)
-        if self.log_alpha is not None:
-            alpha = self.log_alpha.exp()
-        else:
-            alpha = self.cfg.alpha
+        alpha = self.log_alpha.exp()
 
         td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
         # When using noisy nets, resample actor noise for updates as well
@@ -397,6 +425,13 @@ class Trainer:
                 "mean_q_value": min_q_new.mean().item(),
                 "mean_log_prob": log_prob_new.mean().item(),
                 "policy_entropy": -log_prob_new.mean().item(),
+                "q_target_mean": q_target.mean().item(),
+                "rewards_mean": rewards_b.mean().item(),
+                "next_v_mean": next_v.mean().item(),
+                "actions_std": actions_b.std().item(),  # Should be >0.1
+                "rewards_max": rewards_b.max().item(),
+                "sampled_action_mean": sampled_action.mean().item(),
+                "sampled_action_std": sampled_action.std().item(),
             }
             if alpha_loss is not None:
                 log_dict["alpha_loss"] = alpha_loss.item()

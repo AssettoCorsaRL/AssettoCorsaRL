@@ -11,7 +11,7 @@ from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 
 # Local noisy layers (optional)
-from noisy import NoisyLazyLinear
+from .noisy import NoisyLazyLinear
 
 
 def get_device():

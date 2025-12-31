@@ -2,3 +2,6 @@
 /replay_buffer_init.pt
 /wandb
 /models
+/assetto-corsa-rl/src/assetto_corsa_rl/__pycache__
+/assetto-corsa-rl/src/assetto_corsa_rl/model/__pycache__
+/assetto-corsa-rl/src/assetto_corsa_rl/train/__pycache__

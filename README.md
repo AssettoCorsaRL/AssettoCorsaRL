@@ -16,6 +16,9 @@
 </div>
 </div>
 
+> [!TIP]
+> Check out the wandb for the latest runs:
+
 ---
 <div id="user-content-toc">
   <ul align="center" style="list-style: none;">
