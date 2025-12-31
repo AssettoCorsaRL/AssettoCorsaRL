@@ -8,7 +8,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from env import create_gym_env
-from sac import SACPolicy, SACConfig, get_device
+from ..model.sac import SACPolicy, SACConfig, get_device
+
+# configuration loader
+import yaml
+from types import SimpleNamespace
+from pathlib import Path
 
 from torchrl.data.replay_buffers import (
     PrioritizedReplayBuffer,
@@ -39,6 +44,49 @@ def init_weights(m):
             nn.init.zeros_(m.bias)
 
 
+def load_cfg_from_yaml(root: Path = None):
+    """Load `configs/env_config.yaml` and `configs/model_config.yaml` and merge them.
+
+    Model keys override environment keys when names collide. Missing keys are filled
+    from `SACConfig` defaults.
+    """
+    if root is None:
+        # project root (assetto-corsa-rl)
+        root = Path(__file__).resolve().parents[3]
+
+    env_p = root / "configs" / "env_config.yaml"
+    model_p = root / "configs" / "model_config.yaml"
+
+    def _read(p):
+        try:
+            with open(p, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"Warning: could not read config {p}: {e}")
+            return {}
+
+    env = _read(env_p).get("environment", {})
+    model = _read(model_p).get("model", {})
+
+    cfg_dict = {}
+    cfg_dict.update(model)
+    cfg_dict.update(env)
+
+    # Fill missing keys from SACConfig defaults
+    defaults = {
+        k: getattr(SACConfig, k)
+        for k in dir(SACConfig)
+        if not k.startswith("__") and not callable(getattr(SACConfig, k))
+    }
+    for k, v in defaults.items():
+        if k not in cfg_dict:
+            cfg_dict[k] = v
+
+    cfg = SimpleNamespace(**cfg_dict)
+    print(f"Loaded config from: {env_p}, {model_p}")
+    return cfg
+
+
 def train():
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -46,7 +94,8 @@ def train():
     device = get_device() if args.device is None else torch.device(args.device)
     print("Using device:", device)
 
-    cfg = SACConfig()
+    # Load configuration from YAML files (env + model) and fall back to SACConfig defaults
+    cfg = load_cfg_from_yaml()
 
     import wandb
 

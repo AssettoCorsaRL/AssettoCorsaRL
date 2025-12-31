@@ -22,42 +22,6 @@ def get_device():
     return torch.device("cpu")
 
 
-class SACConfig:
-    """Configuration for SAC training"""
-
-    # network / optimizer
-    num_cells = 256
-    lr = 3e-4
-    max_grad_norm = 1.0
-
-    # replay / training
-    batch_size = 512
-    replay_size = 600_000
-    start_steps = 1_000
-
-    gamma = 0.99
-    tau = 0.005
-    alpha = 0.05  # initial value
-    alpha_lr = 3e-4  # learning rate for alpha
-
-    frames_per_batch = 1000
-    num_envs = 4
-
-    load_initial = True
-
-    # exploration / noisy-net options (moved from CLI args to config)
-    # * if noisy = true, we WILL NOT use epsilon-greedy exploration
-    explore_start = 1.0
-    explore_end = 0.03
-    explore_steps = 100_000
-
-    use_noisy = True
-    noise_sigma = 0.5
-
-    per_alpha = 0.6
-    per_beta = 0.6
-
-
 class SACPolicy:
     """Soft Actor-Critic policy + value + twin critics built from nn modules.
 

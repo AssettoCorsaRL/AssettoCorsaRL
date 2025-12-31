@@ -1,0 +1,8 @@
+environment:
+  num_envs: 4
+  frames_per_batch: 1000
+
+  # exploration
+  explore_start: 1.0
+  explore_end: 0.03
+  explore_steps: 100000

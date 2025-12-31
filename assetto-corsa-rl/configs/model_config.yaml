@@ -1,0 +1,27 @@
+model:
+  # network / optimizer
+  num_cells: 256
+  lr: 3e-4
+  max_grad_norm: 1.0
+
+  gamma: 0.99
+  tau: 0.005
+
+  # entropy
+  alpha: 0.05
+  alpha_lr: 3e-4
+
+  # replay / training
+  batch_size: 512
+  replay_size: 600000
+  start_steps: 1000
+
+  load_initial: true
+
+  # noisy nets
+  use_noisy: true
+  noise_sigma: 0.5
+
+  # PER
+  per_alpha: 0.6
+  per_beta: 0.6
