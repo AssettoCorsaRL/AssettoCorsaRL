@@ -9,17 +9,13 @@ def reduce_value_to_batch(x, batch_size):
     See original docstring in the repo.
     """
     try:
-        if isinstance(x, dict) or hasattr(x, "get"):
-            v = x["value"] if "value" in x else x.get("value")
-        else:
-            v = x
-        if not isinstance(v, torch.Tensor):
-            return None
+        v = x.get("value") if hasattr(x, "get") else x
+
         if v.shape[0] == batch_size:
             if v.ndim == 1:
                 return v.view(-1, 1)
             return v.flatten(1).mean(dim=1, keepdim=True)
-        # try to reshape
+
         return v.view(batch_size, -1).mean(dim=1, keepdim=True)
     except Exception:
         return None
@@ -63,22 +59,16 @@ def extract_reward_and_done(td, num_envs, device):
         rewards = td["rewards"].view(num_envs).to(device)
     else:
         raise KeyError(f"Unexpected TensorDict structure. Keys: {td.keys()}")
+
     dones = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    if "done" in td.keys():
-        dones |= td["done"].view(num_envs).to(device).to(torch.bool)
-    if "terminated" in td.keys():
-        dones |= td["terminated"].view(num_envs).to(device).to(torch.bool)
-    if "truncated" in td.keys():
-        dones |= td["truncated"].view(num_envs).to(device).to(torch.bool)
+    dones |= td["done"].view(num_envs).to(device).to(torch.bool)
+    dones |= td["terminated"].view(num_envs).to(device).to(torch.bool)
+    dones |= td["truncated"].view(num_envs).to(device).to(torch.bool)
     return rewards, dones
 
 
 def expand_actions_for_envs(actions, target_batch):
     if isinstance(target_batch, (tuple, list, torch.Size)) and len(target_batch) > 1:
-        if actions.shape[0] != target_batch[0]:
-            raise ValueError(
-                f"Action batch size ({actions.shape[0]}) does not match env batch ({target_batch[0]})"
-            )
         extra = target_batch[1:]
         new_shape = (actions.shape[0],) + (1,) * len(extra) + (actions.shape[1],)
         expand_shape = (actions.shape[0],) + tuple(extra) + (actions.shape[1],)

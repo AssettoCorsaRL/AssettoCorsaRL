@@ -16,7 +16,7 @@ from tensordict import TensorDict
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--total-steps", type=int, default=200_000)
+    p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--log-interval", type=int, default=1_000)
     p.add_argument("--save-interval", type=int, default=50_000)
     p.add_argument("--seed", type=int, default=42)
@@ -27,6 +27,30 @@ def parse_args():
         default="replay_buffer_init.pt",
         help="path to a saved LazyTensorStorage state dict (torch.save output) to load",
     )
+    p.add_argument("--wandb-project", type=str, default="AssetoCorsaRL-CarRacing")
+    p.add_argument("--wandb-entity", type=str, default=None)
+    p.add_argument("--wandb-name", type=str, default=None, help="WandB run name")
+
+    # exploration schedule (linear annealing from start to end over N steps)
+    p.add_argument(
+        "--explore-start",
+        type=float,
+        default=1.0,
+        help="Starting probability of taking a random action",
+    )
+    p.add_argument(
+        "--explore-end",
+        type=float,
+        default=0.0,
+        help="Final probability of taking a random action",
+    )
+    p.add_argument(
+        "--explore-steps",
+        type=int,
+        default=100_000,
+        help="Number of steps over which to linearly anneal exploration",
+    )
+
     return p.parse_args()
 
 
@@ -46,6 +70,19 @@ def train():
 
     cfg = SACConfig()
 
+    try:
+        import wandb
+
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_name,
+            config={"seed": args.seed, "total_steps": args.total_steps},
+        )
+        print("WandB initialized:", getattr(wandb.run, "name", None))
+    except Exception as e:
+        print("Warning: could not initialize WandB:", e)
+
     env = create_gym_env(device=device, num_envs=cfg.num_envs)
     td = env.reset()
 
@@ -55,6 +92,7 @@ def train():
 
     actor = modules["actor"]
     value = modules["value"]
+    value_target = modules["value_target"]
     q1 = modules["q1"]
     q2 = modules["q2"]
 
@@ -72,6 +110,10 @@ def train():
         q2(sample_pixels, sample_action)
 
     print("Lazy modules initialized")
+
+    modules["value_target"].load_state_dict(modules["value"].state_dict())
+
+    print("Target network initialized")
 
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
@@ -113,6 +155,7 @@ def train():
         current_td,
         actor,
         value,
+        value_target,
         q1,
         q2,
         actor_opt,
@@ -126,6 +169,16 @@ def train():
         episode_returns=episode_returns,
         current_episode_return=current_episode_return,
     )
+
+    # Finish WandB run if active
+    if args.wandb:
+        try:
+            import wandb
+
+            wandb.finish()
+            print("WandB finished")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

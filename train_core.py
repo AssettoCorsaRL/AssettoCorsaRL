@@ -10,6 +10,14 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
+try:
+    import wandb
+
+    WANDB_AVAILABLE = True
+except Exception:
+    wandb = None
+    WANDB_AVAILABLE = False
+
 from train_utils import (
     add_transition,
     extract_reward_and_done,
@@ -33,13 +41,14 @@ class Trainer:
         td,
         actor,
         value,
+        value_target,
         q1,
         q2,
         actor_opt,
         critic_opt,
         value_opt,
         device,
-        args,
+        args=None,
         storage=None,
     ):
         self.env = env
@@ -48,11 +57,13 @@ class Trainer:
         self.current_td = td
         self.actor = actor
         self.value = value
+        self.value_target = value_target
         self.q1 = q1
         self.q2 = q2
         self.actor_opt = actor_opt
         self.critic_opt = critic_opt
         self.value_opt = value_opt
+
         self.device = device
         self.args = args
         self.storage = storage
@@ -96,6 +107,18 @@ class Trainer:
         self._handle_episode_end(rewards, dones)
         self._maybe_reset(td_next, dones)
 
+    def _exploration_epsilon(self):
+        """Linearly annealed exploration epsilon between start and end over explore_steps."""
+        if not self.args:
+            return 0.0
+        start = float(getattr(self.args, "explore_start", 1.0))
+        end = float(getattr(self.args, "explore_end", 0.0))
+        steps = int(getattr(self.args, "explore_steps", 100_000))
+        if steps <= 0:
+            return float(end)
+        frac = min(1.0, float(self.total_steps) / float(steps))
+        return float(start + (end - start) * frac)
+
     # ===== Main loop =====
     def run(self, total_steps=0):
         self.total_steps = total_steps
@@ -115,13 +138,28 @@ class Trainer:
                 {"pixels": pixels_only}, batch_size=[pixels_only.shape[0]]
             )
             actor_output = self.actor(actor_input)
-            if (
+            has_actor_action = (
                 "action" in actor_output.keys()
-                and actor_output["action"].shape[-1] == 3
-            ):
-                actions = actor_output["action"]
+                and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
+            )
+            actor_action = actor_output["action"] if has_actor_action else None
+
+            eps = self._exploration_epsilon()
+
+            if eps > 0.0:
+                # per-env mask deciding whether to use random action
+                mask = torch.rand(self.cfg.num_envs, device=self.device) < eps
+                rand_actions = sample_random_action(self.cfg.num_envs, dev=self.device)
+                if actor_action is None:
+                    actions = rand_actions
+                else:
+                    rand_actions = rand_actions.to(actor_action.device)
+                    actions = torch.where(mask.view(-1, 1), rand_actions, actor_action)
             else:
-                actions = sample_random_action(self.cfg.num_envs, dev=self.device)
+                if actor_action is None:
+                    actions = sample_random_action(self.cfg.num_envs, dev=self.device)
+                else:
+                    actions = actor_action
 
         actions_step = expand_actions_for_envs(actions, target_batch)
         action_td = TensorDict({"action": actions_step}, batch_size=target_batch)
@@ -168,6 +206,9 @@ class Trainer:
                     print(f"{key}:", td_next[key])
 
     def _handle_episode_end(self, rewards, dones):
+        # Ensure tensors are on the same device as current_episode_return
+        rewards = rewards.to(self.current_episode_return.device)
+        dones = dones.to(self.current_episode_return.device)
         self.current_episode_return += rewards
         for i, d in enumerate(dones):
             if d.item():
@@ -192,7 +233,8 @@ class Trainer:
             except Exception:
                 self.current_td = self.env.reset()
             try:
-                self.current_episode_return[dones] = 0.0
+                idx = dones.to(self.current_episode_return.device)
+                self.current_episode_return[idx] = 0.0
             except Exception:
                 self.current_episode_return = torch.zeros_like(
                     self.current_episode_return
@@ -229,7 +271,8 @@ class Trainer:
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
 
         with torch.no_grad():
-            next_v_raw = self.value(next_pixels_b)
+            # USE TARGET NETWORK instead of regular value network
+            next_v_raw = self.value_target(next_pixels_b)  # ← FIXED!
             next_v = reduce_value_to_batch(next_v_raw, next_pixels_b.shape[0])
             if next_v is None:
                 next_v = torch.zeros_like(rewards_b)
@@ -303,6 +346,30 @@ class Trainer:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.actor_opt.step()
 
+        self._soft_update_target()
+
+        # Log losses to WandB if enabled
+        if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
+            try:
+                wandb.log(
+                    {
+                        "critic_loss": critic_loss.item(),
+                        "value_loss": value_loss.item(),
+                        "actor_loss": actor_loss.item(),
+                    },
+                    step=self.total_steps,
+                )
+            except Exception:
+                pass
+
+    def _soft_update_target(self):
+        """Soft update of target network: θ_target = τ*θ + (1-τ)*θ_target"""
+        tau = self.cfg.tau
+        for param, target_param in zip(
+            self.value.parameters(), self.value_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
     def _maybe_log_and_save(self):
         if self.total_steps % self.args.log_interval < self.cfg.num_envs:
             elapsed = time.time() - self.start_time
@@ -311,9 +378,53 @@ class Trainer:
                 avg_return = sum(last) / len(last)
             else:
                 avg_return = float(self.current_episode_return.mean().item())
+            eps = self._exploration_epsilon()
             print(
-                f"Steps: {self.total_steps}, AvgReturn(100): {avg_return:.2f}, Buffer: {len(self.rb)}, Time: {elapsed:.1f}s"
+                f"Steps: {self.total_steps}, AvgReturn(100): {avg_return:.2f}, Buffer: {len(self.rb)}, Time: {elapsed:.1f}s, Eps: {eps:.3f}"
             )
+
+            # Log to WandB if enabled
+            if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
+                try:
+                    wandb.log(
+                        {
+                            "steps": self.total_steps,
+                            "avg_return": avg_return,
+                            "buffer": len(self.rb),
+                            "time": elapsed,
+                            "epsilon": eps,
+                        },
+                        step=self.total_steps,
+                    )
+                except Exception:
+                    pass
+
+        if self.total_steps % self.args.save_interval < self.cfg.num_envs:
+            torch.save(
+                {
+                    "actor_state": self.actor.state_dict(),
+                    "q1_state": self.q1.state_dict(),
+                    "q2_state": self.q2.state_dict(),
+                    "value_state": self.value.state_dict(),
+                    "actor_opt": self.actor_opt.state_dict(),
+                    "critic_opt": self.critic_opt.state_dict(),
+                    "value_opt": self.value_opt.state_dict(),
+                    "steps": self.total_steps,
+                },
+                f"sac_checkpoint_{self.total_steps}.pt",
+            )
+            print(f"Saved checkpoint at step {self.total_steps}")
+
+            # Upload checkpoint to WandB if enabled
+            if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
+                try:
+                    wandb.save(f"sac_checkpoint_{self.total_steps}.pt")
+                    wandb.log(
+                        {"checkpoint": f"sac_checkpoint_{self.total_steps}.pt"},
+                        step=self.total_steps,
+                    )
+                except Exception:
+                    pass
 
         if self.total_steps % self.args.save_interval < self.cfg.num_envs:
             torch.save(
@@ -347,6 +458,7 @@ def run_training_loop(
     current_td,
     actor,
     value,
+    value_target,
     q1,
     q2,
     actor_opt,
@@ -367,6 +479,7 @@ def run_training_loop(
         current_td,
         actor,
         value,
+        value_target,
         q1,
         q2,
         actor_opt,

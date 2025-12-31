@@ -103,6 +103,18 @@ class SACPolicy:
 
         self.value = ValueOperator(module=value_net, in_keys=["pixels"])
 
+        value_net_target = nn.Sequential(
+            nn.Flatten(start_dim=1),
+            nn.LazyLinear(num_cells, device=device),
+            nn.Tanh(),
+            nn.LazyLinear(num_cells, device=device),
+            nn.Tanh(),
+            nn.LazyLinear(num_cells, device=device),
+            nn.Tanh(),
+            nn.LazyLinear(1, device=device),
+        )
+        self.value_target = ValueOperator(module=value_net_target, in_keys=["pixels"])
+
         class CriticNet(nn.Module):
             def __init__(self, hidden: int, device):
                 super().__init__()
@@ -129,7 +141,13 @@ class SACPolicy:
         self.q2 = ValueOperator(module=q2_net, in_keys=["pixels", "action"])
 
     def modules(self):
-        return {"actor": self.actor, "value": self.value, "q1": self.q1, "q2": self.q2}
+        return {
+            "actor": self.actor,
+            "value": self.value,
+            "value_target": self.value_target,
+            "q1": self.q1,
+            "q2": self.q2,
+        }
 
 
 class SACConfig:
@@ -148,7 +166,8 @@ class SACConfig:
     # SAC specific
     gamma = 0.99
     tau = 0.005
-    alpha = 0.2
+    alpha = 0.2  # initial value
+    alpha_lr = 3e-4  # learning rate for alpha
 
     frames_per_batch = 1000
     # Use a single env by default to avoid a shared-TensorDict shape mismatch
