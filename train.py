@@ -19,7 +19,7 @@ def parse_args():
     p.add_argument("--total-steps", type=int, default=1_000_000)
     p.add_argument("--log-interval", type=int, default=1_000)
     p.add_argument("--save-interval", type=int, default=50_000)
-    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--seed", type=int, default=67_41)
     p.add_argument("--device", type=str, default=None)
     p.add_argument(
         "--load-replay",
@@ -51,6 +51,26 @@ def parse_args():
         help="Number of steps over which to linearly anneal exploration",
     )
 
+    # noisy-network exploration options
+    p.add_argument(
+        "--use-noisy",
+        action="store_true",
+        default=False,
+        help="Replace hidden linear layers with factorised Noisy layers for exploration",
+    )
+    p.add_argument(
+        "--noise-sigma",
+        type=float,
+        default=0.5,
+        help="Initial sigma for factorised noisy layers",
+    )
+    p.add_argument(
+        "--noisy-exploration",
+        action="store_true",
+        default=False,
+        help="When set, disable epsilon-greedy annealing and rely on noisy-network exploration",
+    )
+
     return p.parse_args()
 
 
@@ -70,25 +90,47 @@ def train():
 
     cfg = SACConfig()
 
-    try:
-        import wandb
+    for k in (
+        "explore_start",
+        "explore_end",
+        "explore_steps",
+        "use_noisy",
+        "noise_sigma",
+        "noisy_exploration",
+    ):
+        if hasattr(args, k):
+            val = getattr(args, k)
+            if val is not None:
+                setattr(cfg, k, val)
 
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=args.wandb_name,
-            config={"seed": args.seed, "total_steps": args.total_steps},
-        )
-        print("WandB initialized:", getattr(wandb.run, "name", None))
-    except Exception as e:
-        print("Warning: could not initialize WandB:", e)
+    import wandb
+
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        name=args.wandb_name,
+        config={"seed": args.seed, "total_steps": args.total_steps},
+    )
+    print("WandB initialized:", getattr(wandb.run, "name", None))
+    args.wandb = True
 
     env = create_gym_env(device=device, num_envs=cfg.num_envs)
     td = env.reset()
 
     # ===== Agent =====
-    agent = SACPolicy(env=env, num_cells=cfg.num_cells, device=device)
+    agent = SACPolicy(
+        env=env,
+        num_cells=cfg.num_cells,
+        device=device,
+        use_noisy=cfg.use_noisy,
+        noise_sigma=cfg.noise_sigma,
+    )
     modules = agent.modules()
+
+    if cfg.use_noisy:
+        print(f"Using noisy networks for exploration (sigma={cfg.noise_sigma})")
+    if cfg.noisy_exploration:
+        print("Noisy-network exploration enabled (epsilon-greedy will be disabled)")
 
     actor = modules["actor"]
     value = modules["value"]
@@ -121,6 +163,12 @@ def train():
         list(q1.parameters()) + list(q2.parameters()), lr=cfg.lr
     )
     value_opt = torch.optim.Adam(value.parameters(), lr=cfg.lr)
+
+    log_alpha = torch.tensor(math.log(cfg.alpha), requires_grad=True, device=device)
+    alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
+
+    target_entropy = -float(env.action_spec.shape[-1])  # -dim(A)
+    print(f"Target entropy: {target_entropy}")
 
     print("using ReplayBuffer with LazyTensorStorage")
     storage = LazyTensorStorage(max_size=cfg.replay_size, device="cpu")
@@ -161,6 +209,9 @@ def train():
         actor_opt,
         critic_opt,
         value_opt,
+        log_alpha,
+        alpha_opt,
+        target_entropy,
         device,
         args,
         storage=storage,
@@ -171,14 +222,14 @@ def train():
     )
 
     # Finish WandB run if active
-    if args.wandb:
+    if getattr(args, "wandb", False):
         try:
             import wandb
 
             wandb.finish()
             print("WandB finished")
-        except Exception:
-            pass
+        except Exception as e:
+            print("Warning: could not finish WandB run:", e)
 
 
 if __name__ == "__main__":

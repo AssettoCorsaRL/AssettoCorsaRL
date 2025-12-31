@@ -10,6 +10,9 @@ from tensordict import TensorDict
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 
+# Local noisy layers (optional)
+from noisy import NoisyLazyLinear
+
 
 def get_device():
     """Determine the appropriate device for training"""
@@ -17,6 +20,37 @@ def get_device():
     if torch.cuda.is_available() and not is_fork:
         return torch.device(0)
     return torch.device("cpu")
+
+
+class SACConfig:
+    """Configuration for SAC training"""
+
+    # network / optimizer
+    num_cells = 256
+    lr = 3e-4
+    max_grad_norm = 1.0
+
+    # replay / training
+    batch_size = 512
+    replay_size = 100_000
+    start_steps = 1_000
+
+    gamma = 0.99
+    tau = 0.005
+    alpha = 0.05  # initial value
+    alpha_lr = 3e-4  # learning rate for alpha
+
+    frames_per_batch = 1000
+    num_envs = 4
+
+    # exploration / noisy-net options (moved from CLI args to config)
+    explore_start = 1.0
+    explore_end = 0.0
+    explore_steps = 100_000
+
+    use_noisy = True
+    noise_sigma = 0.5
+    noisy_exploration = False
 
 
 class SACPolicy:
@@ -29,22 +63,35 @@ class SACPolicy:
         q2: ValueOperator (Q2)
     """
 
-    def __init__(self, env: GymEnv, num_cells: int = 256, device=None):
+    def __init__(
+        self,
+        env: GymEnv,
+        num_cells: int = 256,
+        device=None,
+        use_noisy: bool = False,
+        noise_sigma: float = 0.5,
+    ):
         if device is None:
             device = get_device()
         self.device = device
+        self.use_noisy = use_noisy
+        self.noise_sigma = noise_sigma
 
         action_dim = int(env.action_spec.shape[-1])
 
+        # helper to pick noisy vs lazy linear layers
+        def _lin(out):
+            if use_noisy:
+                return NoisyLazyLinear(out, sigma=noise_sigma, device=device)
+            return nn.LazyLinear(out, device=device)
+
         actor_net = nn.Sequential(
-            nn.Flatten(
-                start_dim=1
-            ),  # ← ADD THIS LINE to flatten [B, C, H, W] → [B, C*H*W]
-            nn.LazyLinear(num_cells, device=device),
+            nn.Flatten(start_dim=1),  # flatten [B, C, H, W] → [B, C*H*W]
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
             nn.LazyLinear(2 * action_dim, device=device),
             NormalParamExtractor(),
@@ -91,12 +138,12 @@ class SACPolicy:
         )
 
         value_net = nn.Sequential(
-            nn.Flatten(start_dim=1),  # ← ADD THIS LINE
-            nn.LazyLinear(num_cells, device=device),
+            nn.Flatten(start_dim=1),
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
             nn.LazyLinear(1, device=device),
         )
@@ -105,11 +152,11 @@ class SACPolicy:
 
         value_net_target = nn.Sequential(
             nn.Flatten(start_dim=1),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
-            nn.LazyLinear(num_cells, device=device),
+            _lin(num_cells),
             nn.Tanh(),
             nn.LazyLinear(1, device=device),
         )
@@ -119,11 +166,11 @@ class SACPolicy:
             def __init__(self, hidden: int, device):
                 super().__init__()
                 self.net = nn.Sequential(
-                    nn.LazyLinear(hidden, device=device),
+                    _lin(hidden),
                     nn.Tanh(),
-                    nn.LazyLinear(hidden, device=device),
+                    _lin(hidden),
                     nn.Tanh(),
-                    nn.LazyLinear(hidden, device=device),
+                    _lin(hidden),
                     nn.Tanh(),
                     nn.LazyLinear(1, device=device),
                 )
@@ -148,29 +195,3 @@ class SACPolicy:
             "q1": self.q1,
             "q2": self.q2,
         }
-
-
-class SACConfig:
-    """Configuration for SAC training"""
-
-    # Network / optimizer
-    num_cells = 256
-    lr = 3e-4
-    max_grad_norm = 1.0
-
-    # Replay / training
-    batch_size = 256
-    replay_size = 100_000
-    start_steps = 1_000
-
-    # SAC specific
-    gamma = 0.99
-    tau = 0.005
-    alpha = 0.2  # initial value
-    alpha_lr = 3e-4  # learning rate for alpha
-
-    frames_per_batch = 1000
-    # Use a single env by default to avoid a shared-TensorDict shape mismatch
-    # observed when using ParallelEnv + SyncDataCollector in this workspace.
-    # Set to >1 if you confirm your torchrl version/ParallelEnv behavior is compatible.
-    num_envs = 1  # Number of parallel environments (set to 1 as a safe default)

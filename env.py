@@ -8,6 +8,7 @@ from torchrl.envs.transforms import (
     GrayScale,
     VecNorm,
     CatFrames,
+    ObservationNorm,
 )
 from torchrl.envs import ParallelEnv, TransformedEnv, GymEnv
 
@@ -37,7 +38,7 @@ def create_gym_env(
         GrayScale(),
         # catframes BEFORE normalization to stack grayscale frames properly
         CatFrames(N=4, in_keys=["pixels"], dim=-3),
-        VecNorm(in_keys=["pixels"]),
+        # VecNorm(in_keys=["pixels"]), # * env already normalized [0,1]
     )
 
     transformed_env = TransformedEnv(base_env, transform)

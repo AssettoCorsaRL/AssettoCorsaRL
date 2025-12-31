@@ -22,15 +22,30 @@ def reduce_value_to_batch(x, batch_size):
 
 
 def pack_pixels(x):
+    """Pack pixel tensors to a compact integer format.
+
+    - If input values are in [0, 1], pack to `torch.uint8` in [0, 255].
+    """
     if not isinstance(x, torch.Tensor):
         return x
-    return (x.clamp(-1.0, 1.0) * 127.0).round().to(torch.int8).cpu()
+    return (x.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu()
 
 
 def unpack_pixels(x):
+    """Inverse of `pack_pixels`.
+
+    Converts integer-packed pixels back to floating-point in [0,1] (uint8) or [-1,1] (int8).
+    """
     if not isinstance(x, torch.Tensor):
         return x
-    return x.to(torch.float32) / 127.0
+
+    if x.dtype == torch.uint8:
+        return x.to(torch.float32) / 255.0
+    if x.dtype == torch.int8:
+        return x.to(torch.float32) / 127.0
+
+    # Default: convert to float32 assuming already in [0,1]
+    return x.to(torch.float32)
 
 
 def sample_random_actions(num_envs, device=None):

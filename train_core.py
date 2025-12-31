@@ -9,14 +9,7 @@ import time
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
-
-try:
-    import wandb
-
-    WANDB_AVAILABLE = True
-except Exception:
-    wandb = None
-    WANDB_AVAILABLE = False
+import wandb
 
 from train_utils import (
     add_transition,
@@ -47,6 +40,9 @@ class Trainer:
         actor_opt,
         critic_opt,
         value_opt,
+        log_alpha,
+        alpha_opt,
+        target_entropy,
         device,
         args=None,
         storage=None,
@@ -72,6 +68,23 @@ class Trainer:
         self.episode_returns = []
         self.current_episode_return = torch.zeros(cfg.num_envs, device=device)
         self.start_time = time.time()
+
+        self.log_alpha = log_alpha
+        self.alpha_opt = alpha_opt
+        self.target_entropy = target_entropy if target_entropy is not None else -3.0
+
+    def _get_alpha_value(self):
+        """Return current alpha value (prefer model parameter if present)."""
+        if hasattr(self, "log_alpha"):
+            la = getattr(self, "log_alpha")
+            if isinstance(la, (torch.nn.Parameter, torch.Tensor)):
+                return float(la.exp().item())
+            return float(torch.exp(torch.tensor(la)).item())
+        if hasattr(self, "alpha"):
+            a = getattr(self, "alpha")
+            if isinstance(a, (torch.nn.Parameter, torch.Tensor)):
+                return float(a.item())
+            return float(a)
 
     # ===== Collection =====
     def collect_initial_data(self):
@@ -108,12 +121,17 @@ class Trainer:
         self._maybe_reset(td_next, dones)
 
     def _exploration_epsilon(self):
-        """Linearly annealed exploration epsilon between start and end over explore_steps."""
-        if not self.args:
+        """Linearly annealed exploration epsilon between start and end over explore_steps.
+
+        Uses `cfg` values (source of truth). If noisy-network exploration is enabled in the
+        config, epsilon-greedy is disabled (returns 0.0).
+        """
+        # If using noisy-network exploration, we do not use epsilon-greedy
+        if getattr(self.cfg, "noisy_exploration", False):
             return 0.0
-        start = float(getattr(self.args, "explore_start", 1.0))
-        end = float(getattr(self.args, "explore_end", 0.0))
-        steps = int(getattr(self.args, "explore_steps", 100_000))
+        start = float(getattr(self.cfg, "explore_start", 1.0))
+        end = float(getattr(self.cfg, "explore_end", 0.0))
+        steps = int(getattr(self.cfg, "explore_steps", 100_000))
         if steps <= 0:
             return float(end)
         frac = min(1.0, float(self.total_steps) / float(steps))
@@ -137,6 +155,14 @@ class Trainer:
             actor_input = TensorDict(
                 {"pixels": pixels_only}, batch_size=[pixels_only.shape[0]]
             )
+            # If using noisy-net exploration, resample actor noise each step
+            if getattr(self.cfg, "use_noisy", False):
+                try:
+                    for m in self.actor.modules():
+                        if hasattr(m, "sample_noise"):
+                            m.sample_noise()
+                except Exception:
+                    pass
             actor_output = self.actor(actor_input)
             has_actor_action = (
                 "action" in actor_output.keys()
@@ -251,7 +277,8 @@ class Trainer:
     def _do_update(self):
         batch = self.rb.sample(self.cfg.batch_size)
         pixels_b = batch["pixels"]
-        if isinstance(pixels_b, torch.Tensor) and pixels_b.dtype == torch.int8:
+        # Accept either packed integer pixels (uint8/int8) or floating tensors
+        if isinstance(pixels_b, torch.Tensor) and not torch.is_floating_point(pixels_b):
             pixels_b = unpack_pixels(pixels_b).to(self.device)
         else:
             pixels_b = pixels_b.to(self.device)
@@ -260,9 +287,8 @@ class Trainer:
         rewards_b = batch["reward"].to(self.device).view(-1, 1)
 
         next_pixels_b = batch["next_pixels"]
-        if (
-            isinstance(next_pixels_b, torch.Tensor)
-            and next_pixels_b.dtype == torch.int8
+        if isinstance(next_pixels_b, torch.Tensor) and not torch.is_floating_point(
+            next_pixels_b
         ):
             next_pixels_b = unpack_pixels(next_pixels_b).to(self.device)
         else:
@@ -270,9 +296,10 @@ class Trainer:
 
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
 
+        # ===== Critic Update =====
         with torch.no_grad():
             # USE TARGET NETWORK instead of regular value network
-            next_v_raw = self.value_target(next_pixels_b)  # ← FIXED!
+            next_v_raw = self.value_target(next_pixels_b)
             next_v = reduce_value_to_batch(next_v_raw, next_pixels_b.shape[0])
             if next_v is None:
                 next_v = torch.zeros_like(rewards_b)
@@ -296,7 +323,22 @@ class Trainer:
         )
         self.critic_opt.step()
 
+        # ===== Value Update =====
+        # Get current alpha value (learnable or fixed)
+        if self.log_alpha is not None:
+            alpha = self.log_alpha.exp()
+        else:
+            alpha = self.cfg.alpha
+
         td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
+        # When using noisy nets, resample actor noise for updates as well
+        if getattr(self.cfg, "use_noisy", False):
+            try:
+                for m in self.actor.modules():
+                    if hasattr(m, "sample_noise"):
+                        m.sample_noise()
+            except Exception:
+                pass
         out = self.actor(td_in)
         sampled_action = out["action"]
         sampled_action = fix_action_shape(
@@ -304,6 +346,8 @@ class Trainer:
         )
 
         log_prob = out.get("log_prob", None)
+        if log_prob is not None and log_prob.ndim == 1:
+            log_prob = log_prob.view(-1, 1)
 
         q1_for_v = self.q1(pixels_b, sampled_action).view(-1, 1)
         q2_for_v = self.q2(pixels_b, sampled_action).view(-1, 1)
@@ -314,12 +358,7 @@ class Trainer:
         if value_pred is None:
             value_pred = torch.zeros_like(min_q)
 
-        if log_prob is not None and log_prob.ndim == 1:
-            log_prob = log_prob.view(-1, 1)
-
-        value_target = min_q - self.cfg.alpha * (
-            log_prob if log_prob is not None else 0.0
-        )
+        value_target = min_q - alpha * (log_prob if log_prob is not None else 0.0)
         value_loss = F.mse_loss(value_pred, value_target.detach())
 
         self.value_opt.zero_grad()
@@ -327,6 +366,7 @@ class Trainer:
         torch.nn.utils.clip_grad_norm_(self.value.parameters(), self.cfg.max_grad_norm)
         self.value_opt.step()
 
+        # ===== Actor Update =====
         out = self.actor(td_in)
         new_actions = fix_action_shape(
             out["action"], pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
@@ -334,33 +374,58 @@ class Trainer:
         log_prob_new = out.get("log_prob")
         if log_prob_new is None:
             log_prob_new = torch.zeros((new_actions.shape[0], 1), device=self.device)
+        if log_prob_new.ndim == 1:
+            log_prob_new = log_prob_new.view(-1, 1)
 
         q1_new = self.q1(pixels_b, new_actions).view(-1, 1)
         q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
         min_q_new = torch.min(q1_new, q2_new)
 
-        actor_loss = (self.cfg.alpha * log_prob_new - min_q_new).mean()
+        actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
         self.actor_opt.step()
 
+        # ===== Alpha (Temperature) Update =====
+        alpha_loss = None
+        if self.log_alpha is not None and self.alpha_opt is not None:
+            # Alpha loss: tune alpha to maintain target entropy
+            # We want: E[-log π(a|s)] ≈ target_entropy
+            # Loss = -log(alpha) * (log_prob + target_entropy)
+            alpha_loss = -(
+                self.log_alpha * (log_prob_new.detach() + self.target_entropy)
+            ).mean()
+
+            self.alpha_opt.zero_grad()
+            alpha_loss.backward()
+            self.alpha_opt.step()
+
+        # ===== Soft Update Target Network =====
         self._soft_update_target()
 
-        # Log losses to WandB if enabled
-        if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
-            try:
-                wandb.log(
-                    {
-                        "critic_loss": critic_loss.item(),
-                        "value_loss": value_loss.item(),
-                        "actor_loss": actor_loss.item(),
-                    },
-                    step=self.total_steps,
-                )
-            except Exception:
-                pass
+        # ===== Logging =====
+        try:
+            log_dict = {
+                "critic_loss": critic_loss.item(),
+                "q1_loss": q1_loss.item(),
+                "q2_loss": q2_loss.item(),
+                "value_loss": value_loss.item(),
+                "actor_loss": actor_loss.item(),
+                "alpha": (
+                    alpha.item() if isinstance(alpha, torch.Tensor) else float(alpha)
+                ),
+                "mean_q_value": min_q_new.mean().item(),
+                "mean_log_prob": log_prob_new.mean().item(),
+                "policy_entropy": -log_prob_new.mean().item(),
+            }
+            if alpha_loss is not None:
+                log_dict["alpha_loss"] = alpha_loss.item()
+
+            wandb.log(log_dict, step=self.total_steps)
+        except Exception as e:
+            print("Warning: wandb logging failed (updates):", e)
 
     def _soft_update_target(self):
         """Soft update of target network: θ_target = τ*θ + (1-τ)*θ_target"""
@@ -383,21 +448,25 @@ class Trainer:
                 f"Steps: {self.total_steps}, AvgReturn(100): {avg_return:.2f}, Buffer: {len(self.rb)}, Time: {elapsed:.1f}s, Eps: {eps:.3f}"
             )
 
-            # Log to WandB if enabled
-            if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
-                try:
-                    wandb.log(
-                        {
-                            "steps": self.total_steps,
-                            "avg_return": avg_return,
-                            "buffer": len(self.rb),
-                            "time": elapsed,
-                            "epsilon": eps,
-                        },
-                        step=self.total_steps,
-                    )
-                except Exception:
-                    pass
+            try:
+                alpha_val = self._get_alpha_value()
+                wandb.log(
+                    {
+                        "steps": self.total_steps,
+                        "avg_return": avg_return,
+                        "buffer": len(self.rb),
+                        "time": elapsed,
+                        "epsilon": eps,
+                        "alpha": (
+                            alpha_val
+                            if alpha_val is not None
+                            else float(self.cfg.alpha)
+                        ),
+                    },
+                    step=self.total_steps,
+                )
+            except Exception as e:
+                print("Warning: wandb logging failed (_maybe_log_and_save):", e)
 
         if self.total_steps % self.args.save_interval < self.cfg.num_envs:
             torch.save(
@@ -411,42 +480,42 @@ class Trainer:
                     "value_opt": self.value_opt.state_dict(),
                     "steps": self.total_steps,
                 },
-                f"sac_checkpoint_{self.total_steps}.pt",
+                f".\\models\\sac_checkpoint_{self.total_steps}.pt",
             )
             print(f"Saved checkpoint at step {self.total_steps}")
 
-            # Upload checkpoint to WandB if enabled
-            if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
-                try:
-                    wandb.save(f"sac_checkpoint_{self.total_steps}.pt")
-                    wandb.log(
-                        {"checkpoint": f"sac_checkpoint_{self.total_steps}.pt"},
-                        step=self.total_steps,
-                    )
-                except Exception:
-                    pass
-
-        if self.total_steps % self.args.save_interval < self.cfg.num_envs:
-            torch.save(
-                {
-                    "actor_state": self.actor.state_dict(),
-                    "q1_state": self.q1.state_dict(),
-                    "q2_state": self.q2.state_dict(),
-                    "value_state": self.value.state_dict(),
-                    "actor_opt": self.actor_opt.state_dict(),
-                    "critic_opt": self.critic_opt.state_dict(),
-                    "value_opt": self.value_opt.state_dict(),
-                    "steps": self.total_steps,
-                },
-                f"sac_checkpoint_{self.total_steps}.pt",
-            )
-            print(f"Saved checkpoint at step {self.total_steps}")
+            # * i dont have enough wandb storage to do this sooo
+            # if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
+            #     try:
+            #         wandb.save(f".\\models\\sac_checkpoint_{self.total_steps}.pt")
+            #         wandb.log(
+            #             {
+            #                 "checkpoint": f".\\models\\sac_checkpoint_{self.total_steps}.pt"
+            #             },
+            #             step=self.total_steps,
+            #         )
+            #     except Exception:
+            #         pass
 
 
-# Backwards-compatible wrappers
 def collect_initial_data(env, rb, cfg, current_td, device):
     t = Trainer(
-        env, rb, cfg, current_td, None, None, None, None, None, None, None, device, None
+        env,
+        rb,
+        cfg,
+        current_td,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        device,
+        None,
     )
     return t.collect_initial_data()
 
@@ -464,6 +533,9 @@ def run_training_loop(
     actor_opt,
     critic_opt,
     value_opt,
+    log_alpha,
+    alpha_opt,
+    target_entropy,
     device,
     args,
     storage=None,
@@ -485,6 +557,9 @@ def run_training_loop(
         actor_opt,
         critic_opt,
         value_opt,
+        log_alpha,
+        alpha_opt,
+        target_entropy,
         device,
         args,
         storage,
