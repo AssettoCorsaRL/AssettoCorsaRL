@@ -20,14 +20,15 @@
 <div id="user-content-toc">
   <ul align="center" style="list-style: none;">
     <summary>
-        <h2>🚀 Features</h2>   
+        <h2>🚀 Roadmap</h2>   
     </summary>
   </ul>
 </div>
-- Train SAC agents with configurable environments and models
-- Config-driven experiments using YAML files (`configs/env_config.yaml`, `configs/model_config.yaml`)
-- Logging & tracking with Weights & Biases (wandb)
-- Reproducible experiments and model checkpoints (see `models/`)
+
+
+1. Train a Soft Actor-Critic (SAC) agent on a simplified 2D environment: OpenAI’s CarRacing-v3.
+2. Adapt and port the trained agent to the Assetto Corsa racing simulator.
+3. Implement full race simulations using AI-driven race strategies.
 
 ---
 
@@ -38,10 +39,23 @@
     </summary>
   </ul>
 </div>
+
 - `configs/env_config.yaml` — environment hyperparameters (observation size, frame stacking, num envs, etc.)
 - `configs/model_config.yaml` — model and training hyperparameters (learning rates, replay buffer size, etc.)
+`configs/model_config.yaml` — model and training hyperparameters (learning rates, replay buffer size, etc.)
 
 Training code merges values from both files and fills missing keys from `SACConfig` defaults.
+
+---
+<div id="user-content-toc">
+  <ul align="center" style="list-style: none;">
+    <summary>
+        <h2>🛠️ Installation</h2>
+    </summary>
+  </ul>
+</div>
+
+- Coming soon.
 
 ---
 <div id="user-content-toc">
