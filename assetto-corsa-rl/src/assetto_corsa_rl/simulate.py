@@ -3,7 +3,7 @@ import torch
 from tensordict import TensorDict
 
 from env import create_gym_env
-from train_utils import (
+from .train.train_utils import (
     sample_random_action,
     expand_actions_for_envs,
     get_inner,
