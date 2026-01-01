@@ -90,12 +90,12 @@ class SACPolicy:
                 )
                 low_t = -torch.ones_like(low_t)
                 high_t = torch.ones_like(high_t)
-            dist_kwargs = {"low": low_t, "high": high_t}
+            dist_kwargs = {"low": low_t, "high": high_t}  # ← Remove min_scale/max_scale
         except Exception as _e:
             print(
                 f"Warning: could not validate action bounds ({_e}); using raw spec values."
             )
-            dist_kwargs = {"low": low, "high": high}
+            dist_kwargs = {"low": low, "high": high}  # ← Remove min_scale/max_scale
 
         self.actor = ProbabilisticActor(
             module=policy_module,
@@ -153,8 +153,21 @@ class SACPolicy:
         q1_net = CriticNet(num_cells, device)
         q2_net = CriticNet(num_cells, device)
 
+        q1_net_target = CriticNet(num_cells, device)
+        q2_net_target = CriticNet(num_cells, device)
+
         self.q1 = ValueOperator(module=q1_net, in_keys=["pixels", "action"])
         self.q2 = ValueOperator(module=q2_net, in_keys=["pixels", "action"])
+
+        self.q1_target = ValueOperator(
+            module=q1_net_target, in_keys=["pixels", "action"]
+        )
+        self.q2_target = ValueOperator(
+            module=q2_net_target, in_keys=["pixels", "action"]
+        )
+
+        self.q1_target.load_state_dict(self.q1.state_dict())
+        self.q2_target.load_state_dict(self.q2.state_dict())
 
     def modules(self):
         return {
@@ -163,4 +176,6 @@ class SACPolicy:
             "value_target": self.value_target,
             "q1": self.q1,
             "q2": self.q2,
+            "q1_target": self.q1_target,
+            "q2_target": self.q2_target,
         }

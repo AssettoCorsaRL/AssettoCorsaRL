@@ -1,0 +1,17 @@
+train:
+  total_steps: 5000000
+  log_interval: 1000 # how often (in steps) to print/log training stats
+  save_interval: 50000 # how often (in steps) to save model checkpoints
+
+  seed: 6741
+  device: null # set to a CUDA device string (e.g. "cuda:0") to force device, or null to auto-select
+
+  wandb:
+    enabled: true
+    project: "AssetoCorsaRL-CarRacing"
+    entity: null
+    name: null
+
+  checkpoint_dir: "models" # relative path to save checkpoints
+
+  num_eval_episodes: 10

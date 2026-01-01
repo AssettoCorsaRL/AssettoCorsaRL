@@ -1,4 +1,3 @@
-import argparse
 import time
 import math
 from collections import deque
@@ -35,20 +34,6 @@ from torchrl.data.replay_buffers import (
 from tensordict import TensorDict
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--total-steps", type=int, default=1_000_000)
-    p.add_argument("--log-interval", type=int, default=1_000)
-    p.add_argument("--save-interval", type=int, default=50_000)
-    p.add_argument("--seed", type=int, default=67_41)
-    p.add_argument("--device", type=str, default=None)
-    p.add_argument("--wandb-project", type=str, default="AssetoCorsaRL-CarRacing")
-    p.add_argument("--wandb-entity", type=str, default=None)
-    p.add_argument("--wandb-name", type=str, default=None, help="WandB run name")
-
-    return p.parse_args()
-
-
 def init_weights(m):
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)
@@ -70,6 +55,7 @@ def load_cfg_from_yaml(root: Path = None):
 
     env_p = root / "configs" / "env_config.yaml"
     model_p = root / "configs" / "model_config.yaml"
+    train_p = root / "configs" / "train_config.yaml"
 
     def _read(p):
         try:
@@ -81,10 +67,17 @@ def load_cfg_from_yaml(root: Path = None):
 
     env = _read(env_p).get("environment", {})
     model = _read(model_p).get("model", {})
+    train_raw = _read(train_p)
+    # Support both keys 'train' and 'training' to be robust to config variants
+    if isinstance(train_raw, dict):
+        train = {**train_raw.get("train", {}), **train_raw.get("training", {})}
+    else:
+        train = {}
 
     cfg_dict = {}
     cfg_dict.update(model)
     cfg_dict.update(env)
+    cfg_dict.update(train)
 
     def _try_convert(x):
         # preserve booleans and None
@@ -117,31 +110,40 @@ def load_cfg_from_yaml(root: Path = None):
 
     converted = {k: _try_convert(v) for k, v in cfg_dict.items()}
 
+    # If train config contains a nested `wandb` dict, flatten it to top-level
+    # keys with prefix `wandb_` so downstream code can access `cfg.wandb_project` etc.
+    if isinstance(converted.get("wandb"), dict):
+        wandb_dict = converted.pop("wandb")
+        for k, v in wandb_dict.items():
+            converted[f"wandb_{k}"] = v
+
+    # Ensure common top-level wandb keys exist (default to None)
+    for k in ("wandb_project", "wandb_entity", "wandb_name", "wandb_enabled"):
+        converted.setdefault(k, None)
+
     cfg = SimpleNamespace(**converted)
-    print(f"Loaded config from: {env_p}, {model_p}")
+    print(f"Loaded config from: {env_p}, {model_p}, {train_p}")
     return cfg
 
 
 def train():
-    args = parse_args()
-    torch.manual_seed(args.seed)
 
-    device = get_device() if args.device is None else torch.device(args.device)
-    print("Using device:", device)
-
-    # Load configuration from YAML files (env + model) and fall back to SACConfig defaults
     cfg = load_cfg_from_yaml()
+
+    torch.manual_seed(cfg.seed)
+
+    device = get_device() if cfg.device is None else torch.device(cfg.device)
+    print("Using device:", device)
 
     import wandb
 
     wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=args.wandb_name,
-        config={"seed": args.seed, "total_steps": args.total_steps},
+        project=cfg.wandb_project,
+        entity=cfg.wandb_entity,
+        name=cfg.wandb_name,
+        config={"seed": cfg.seed, "total_steps": cfg.total_steps},
     )
     print("WandB initialized:", getattr(wandb.run, "name", None))
-    args.wandb = True
 
     env = create_gym_env(device=device, num_envs=cfg.num_envs)
     td = env.reset()
@@ -164,6 +166,13 @@ def train():
     value_target = modules["value_target"]
     q1 = modules["q1"]
     q2 = modules["q2"]
+
+    q1_target = modules["q1_target"]
+    q2_target = modules["q2_target"]
+
+    # Network summary will be printed after lazy initialization so that
+    # LazyModule parameters are initialized before we attempt to count them.
+    # (See later in this function where we print the networks.)
 
     # def init_optimistic(m):
     #     if isinstance(m, nn.Linear):
@@ -194,6 +203,22 @@ def train():
 
     print("Target network initialized")
 
+    # Now that LazyModules have been initialized, print the network summaries
+    print("Networks:")
+    for name, net in modules.items():
+        print("=" * 40)
+        print(f"{name}:")
+        print(net)
+        num_fn = getattr(net, "num_parameters", None)
+        if callable(num_fn):
+            nparams = num_fn()
+        else:
+            try:
+                nparams = sum(p.numel() for p in net.parameters())
+            except Exception:
+                nparams = "uninitialized (LazyModule)"
+        print(f"Number of parameters: {nparams}")
+
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
     critic_opt = torch.optim.Adam(
@@ -204,8 +229,7 @@ def train():
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
 
-    # * watch the preformance of / 2
-    target_entropy = -float(env.action_spec.shape[-1]) / 2.0  # -dim(A)
+    target_entropy = -float(env.action_spec.shape[-1])  # -dim(A)
     print(f"Target entropy: {target_entropy}")
 
     print("using PrioritizedReplayBuffer with LazyTensorStorage")
@@ -235,6 +259,8 @@ def train():
         value_target,
         q1,
         q2,
+        q1_target,
+        q2_target,
         actor_opt,
         critic_opt,
         value_opt,
@@ -242,7 +268,6 @@ def train():
         alpha_opt,
         target_entropy,
         device,
-        args,
         storage=storage,
         start_time=start_time,
         total_steps=total_steps,
@@ -250,15 +275,11 @@ def train():
         current_episode_return=current_episode_return,
     )
 
-    # Finish WandB run if active
-    if getattr(args, "wandb", False):
-        try:
-            import wandb
-
-            wandb.finish()
-            print("WandB finished")
-        except Exception as e:
-            print("Warning: could not finish WandB run:", e)
+    try:
+        wandb.finish()
+        print("WandB finished")
+    except Exception as e:
+        print("Warning: could not finish WandB run:", e)
 
 
 if __name__ == "__main__":

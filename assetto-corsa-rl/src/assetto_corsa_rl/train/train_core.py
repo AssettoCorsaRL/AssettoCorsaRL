@@ -37,6 +37,8 @@ class Trainer:
         value_target,
         q1,
         q2,
+        q1_target,
+        q2_target,
         actor_opt,
         critic_opt,
         value_opt,
@@ -44,7 +46,6 @@ class Trainer:
         alpha_opt,
         target_entropy,
         device,
-        args=None,
         storage=None,
     ):
         self.env = env
@@ -56,12 +57,13 @@ class Trainer:
         self.value_target = value_target
         self.q1 = q1
         self.q2 = q2
+        self.q1_target = q1_target
+        self.q2_target = q2_target
         self.actor_opt = actor_opt
         self.critic_opt = critic_opt
         self.value_opt = value_opt
 
         self.device = device
-        self.args = args
         self.storage = storage
 
         self.total_steps = 0
@@ -118,7 +120,7 @@ class Trainer:
     # ===== Main loop =====
     def run(self, total_steps=0):
         self.total_steps = total_steps
-        while self.total_steps < self.args.total_steps:
+        while self.total_steps < self.cfg.total_steps:
             for _ in range(self.cfg.frames_per_batch):
                 self._step_and_store()
             self._perform_updates()
@@ -133,14 +135,14 @@ class Trainer:
             actor_input = TensorDict(
                 {"pixels": pixels_only}, batch_size=[pixels_only.shape[0]]
             )
+            use_noisy = getattr(self.cfg, "use_noisy", False)
+
             # if using noisy-net exploration, resample actor noise each step
-            if getattr(self.cfg, "use_noisy", False):
-                try:
-                    for m in self.actor.modules():
-                        if hasattr(m, "sample_noise"):
-                            m.sample_noise()
-                except Exception:
-                    pass
+            if use_noisy:
+                for m in self.actor.modules():
+                    if hasattr(m, "sample_noise"):
+                        m.sample_noise()
+
             actor_output = self.actor(actor_input)
             has_actor_action = (
                 "action" in actor_output.keys()
@@ -148,7 +150,24 @@ class Trainer:
             )
             actor_action = actor_output["action"] if has_actor_action else None
 
-            eps = self._exploration_epsilon()
+            # If using noisy nets, disable epsilon-greedy entirely.
+            # Also try one more actor call (resample noise) if no action was returned.
+            if use_noisy:
+                eps = 0.0
+                if actor_action is None:
+                    # try once more after resampling noise to obtain a policy action
+                    for m in self.actor.modules():
+                        if hasattr(m, "sample_noise"):
+                            m.sample_noise()
+                    actor_output = self.actor(actor_input)
+                    has_actor_action = (
+                        "action" in actor_output.keys()
+                        and actor_output["action"].shape[-1]
+                        == self.env.action_spec.shape[-1]
+                    )
+                    actor_action = actor_output["action"] if has_actor_action else None
+            else:
+                eps = self._exploration_epsilon()
 
             if eps > 0.0:
                 # per-env mask deciding whether to use random action
@@ -255,9 +274,19 @@ class Trainer:
             self._do_update()
 
     def _do_update(self):
-        batch = self.rb.sample(self.cfg.batch_size)
+        # Sample with return_info=True to get indices for priority updates
+        batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
+
+        # Extract indices from info dict
+        batch_indices = info.get("index", None)
+
         pixels_b = batch["pixels"]
-        # Accept either packed integer pixels (uint8/int8) or floating tensors
+
+        if self.cfg.use_noisy:
+            for m in self.actor.modules():
+                if hasattr(m, "sample_noise"):
+                    m.sample_noise()
+
         if isinstance(pixels_b, torch.Tensor) and not torch.is_floating_point(pixels_b):
             pixels_b = unpack_pixels(pixels_b).to(self.device)
         else:
@@ -276,17 +305,12 @@ class Trainer:
 
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
 
-        # ===== Critic Update ===== TODO: check if this works
+        # ===== Critic Update =====
         with torch.no_grad():
+            # Sample actions from current policy for next states
             next_td = TensorDict(
                 {"pixels": next_pixels_b}, batch_size=next_pixels_b.shape[0]
             )
-
-            if getattr(self.cfg, "use_noisy", False):
-                for m in self.actor.modules():
-                    if hasattr(m, "sample_noise"):
-                        m.sample_noise()
-
             next_out = self.actor(next_td)
             next_actions = fix_action_shape(
                 next_out["action"],
@@ -297,30 +321,52 @@ class Trainer:
             if next_log_prob is not None and next_log_prob.ndim == 1:
                 next_log_prob = next_log_prob.view(-1, 1)
 
-            # use TARGET Q-networks
-            # use regular Q-networks as approximation
-            next_q1 = self.q1(next_pixels_b, next_actions).view(-1, 1)
-            next_q2 = self.q2(next_pixels_b, next_actions).view(-1, 1)
+            # Compute target Q-values using target networks (clipped double-Q)
+            next_q1 = self.q1_target(next_pixels_b, next_actions).view(-1, 1)
+            next_q2 = self.q2_target(next_pixels_b, next_actions).view(-1, 1)
             next_min_q = torch.min(next_q1, next_q2)
 
-            # SAC target with entropy term
+            # SAC target with entropy regularization
             if self.log_alpha is not None:
                 alpha = self.log_alpha.exp()
             else:
                 alpha = self.cfg.alpha
 
+            # V(s') = min_i Q_i(s', a') - α * log π(a'|s')
             next_v = next_min_q - alpha * (
                 next_log_prob if next_log_prob is not None else 0.0
             )
 
+            # Bellman backup: Q(s,a) = r + γ * (1 - done) * V(s')
             q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
 
+        # Compute current Q-values
         actions_b = fix_action_shape(
             actions_b, pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
         )
         q1_pred = self.q1(pixels_b, actions_b).view(-1, 1)
         q2_pred = self.q2(pixels_b, actions_b).view(-1, 1)
 
+        # Compute TD errors for PER priority updates
+        with torch.no_grad():
+            td_error_1 = torch.abs(q1_pred - q_target)
+            td_error_2 = torch.abs(q2_pred - q_target)
+            td_errors = torch.max(td_error_1, td_error_2).squeeze(-1)
+
+            # Update priorities in PER
+            if batch_indices is not None:
+                # Convert to numpy if needed
+                priorities = td_errors.cpu().numpy()
+                self.rb.update_priority(batch_indices, priorities)
+
+        beta = min(
+            1.0,
+            self.cfg.per_beta
+            + (1.0 - self.cfg.per_beta) * (self.total_steps / self.cfg.total_steps),
+        )
+        self.rb.beta = beta
+
+        # Critic loss: MSE between predicted and target Q-values
         q1_loss = F.mse_loss(q1_pred, q_target)
         q2_loss = F.mse_loss(q2_pred, q_target)
         critic_loss = q1_loss + q2_loss
@@ -333,46 +379,9 @@ class Trainer:
         )
         self.critic_opt.step()
 
-        # ===== Value Update =====
-        alpha = self.log_alpha.exp()
-
-        td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
-        # When using noisy nets, resample actor noise for updates as well
-        if getattr(self.cfg, "use_noisy", False):
-            try:
-                for m in self.actor.modules():
-                    if hasattr(m, "sample_noise"):
-                        m.sample_noise()
-            except Exception:
-                pass
-        out = self.actor(td_in)
-        sampled_action = out["action"]
-        sampled_action = fix_action_shape(
-            sampled_action, pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
-        )
-
-        log_prob = out.get("log_prob", None)
-        if log_prob is not None and log_prob.ndim == 1:
-            log_prob = log_prob.view(-1, 1)
-
-        q1_for_v = self.q1(pixels_b, sampled_action).view(-1, 1)
-        q2_for_v = self.q2(pixels_b, sampled_action).view(-1, 1)
-        min_q = torch.min(q1_for_v, q2_for_v)
-
-        value_pred_raw = self.value(pixels_b)
-        value_pred = reduce_value_to_batch(value_pred_raw, pixels_b.shape[0])
-        if value_pred is None:
-            value_pred = torch.zeros_like(min_q)
-
-        value_target = min_q - alpha * (log_prob if log_prob is not None else 0.0)
-        value_loss = F.mse_loss(value_pred, value_target.detach())
-
-        self.value_opt.zero_grad()
-        value_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.value.parameters(), self.cfg.max_grad_norm)
-        self.value_opt.step()
-
         # ===== Actor Update =====
+        # Sample actions from current policy
+        td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
         out = self.actor(td_in)
         new_actions = fix_action_shape(
             out["action"], pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
@@ -383,10 +392,23 @@ class Trainer:
         if log_prob_new.ndim == 1:
             log_prob_new = log_prob_new.view(-1, 1)
 
+        wandb.log(
+            {
+                "actor/loc_mean": out["loc"].mean().item(),
+                "actor/loc_std": out["loc"].std().item(),
+                "actor/loc_max": out["loc"].max().item(),
+                "actor/scale_mean": out["scale"].mean().item(),
+            },
+            step=self.total_steps,
+        )
+
+        # Compute Q-values for new actions (clipped double-Q)
         q1_new = self.q1(pixels_b, new_actions).view(-1, 1)
         q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
         min_q_new = torch.min(q1_new, q2_new)
 
+        # Actor loss: maximize Q(s,a) - α * log π(a|s)
+        # Equivalently: minimize α * log π(a|s) - Q(s,a)
         actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
 
         self.actor_opt.zero_grad()
@@ -397,9 +419,8 @@ class Trainer:
         # ===== Alpha (Temperature) Update =====
         alpha_loss = None
         if self.log_alpha is not None and self.alpha_opt is not None:
-            # Alpha loss: tune alpha to maintain target entropy
+            # Tune alpha to maintain target entropy
             # We want: E[-log π(a|s)] ≈ target_entropy
-            # Loss = -log(alpha) * (log_prob + target_entropy)
             alpha_loss = -(
                 self.log_alpha * (log_prob_new.detach() + self.target_entropy)
             ).mean()
@@ -408,30 +429,37 @@ class Trainer:
             alpha_loss.backward()
             self.alpha_opt.step()
 
-        # ===== Soft Update Target Network =====
+        # ===== Soft Update Target Networks =====
         self._soft_update_target()
 
         # ===== Logging =====
         try:
             log_dict = {
-                "critic_loss": critic_loss.item(),
-                "q1_loss": q1_loss.item(),
-                "q2_loss": q2_loss.item(),
-                "value_loss": value_loss.item(),
-                "actor_loss": actor_loss.item(),
-                "alpha": (
-                    alpha.item() if isinstance(alpha, torch.Tensor) else float(alpha)
-                ),
-                "mean_q_value": min_q_new.mean().item(),
-                "mean_log_prob": log_prob_new.mean().item(),
-                "policy_entropy": -log_prob_new.mean().item(),
-                "q_target_mean": q_target.mean().item(),
-                "rewards_mean": rewards_b.mean().item(),
-                "next_v_mean": next_v.mean().item(),
-                "actions_std": actions_b.std().item(),  # Should be >0.1
-                "rewards_max": rewards_b.max().item(),
-                "sampled_action_mean": sampled_action.mean().item(),
-                "sampled_action_std": sampled_action.std().item(),
+                "loss/critic_loss": critic_loss.item(),
+                "loss/q1_loss": q1_loss.item(),
+                "loss/q2_loss": q2_loss.item(),
+                "loss/actor_loss": actor_loss.item(),
+                #
+                "critic/mean_q_value": min_q_new.mean().item(),
+                "critic/q_target_mean": q_target.mean().item(),
+                "critic/next_v_mean": next_v.mean().item(),
+                #
+                "actor/mean_log_prob": log_prob_new.mean().item(),
+                "actor/entropy": -log_prob_new.mean().item(),
+                "actor/alpha": alpha.item(),
+                #
+                "reward/rewards_per_step_mean": rewards_b.mean().item(),
+                "reward/rewards_per_step_max": rewards_b.max().item(),
+                "reward/rewards_per_step_min": rewards_b.min().item(),
+                #
+                "actions/actions_std": actions_b.std().item(),
+                "actions/sampled_action_mean": new_actions.mean().item(),
+                "actions/sampled_action_std": new_actions.std().item(),
+                #
+                "per/td_error_mean": td_errors.mean().item(),
+                "per/td_error_max": td_errors.max().item(),
+                "per/td_error_min": td_errors.min().item(),
+                "per/beta": beta,
             }
             if alpha_loss is not None:
                 log_dict["alpha_loss"] = alpha_loss.item()
@@ -443,13 +471,27 @@ class Trainer:
     def _soft_update_target(self):
         """Soft update of target network: θ_target = τ*θ + (1-τ)*θ_target"""
         tau = self.cfg.tau
+
+        # update value target
         for param, target_param in zip(
             self.value.parameters(), self.value_target.parameters()
         ):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
+        # update Q1 target
+        for param, target_param in zip(
+            self.q1.parameters(), self.q1_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
+        # update Q2 target
+        for param, target_param in zip(
+            self.q2.parameters(), self.q2_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+
     def _maybe_log_and_save(self):
-        if self.total_steps % self.args.log_interval < self.cfg.num_envs:
+        if self.total_steps % self.cfg.log_interval < self.cfg.num_envs:
             elapsed = time.time() - self.start_time
             last = self.episode_returns[-100:]
             if len(last) > 0:
@@ -466,7 +508,7 @@ class Trainer:
                 wandb.log(
                     {
                         "steps": self.total_steps,
-                        "avg_return": avg_return,
+                        "reward/rewards_per_environment_mean": avg_return,
                         "buffer": len(self.rb),
                         "time": elapsed,
                         "epsilon": eps,
@@ -481,7 +523,7 @@ class Trainer:
             except Exception as e:
                 print("Warning: wandb logging failed (_maybe_log_and_save):", e)
 
-        if self.total_steps % self.args.save_interval < self.cfg.num_envs:
+        if self.total_steps % self.cfg.save_interval < self.cfg.num_envs:
             torch.save(
                 {
                     "actor_state": self.actor.state_dict(),
@@ -498,7 +540,7 @@ class Trainer:
             print(f"Saved checkpoint at step {self.total_steps}")
 
             # * i dont have enough wandb storage to do this sooo
-            # if self.args and getattr(self.args, "wandb", False) and WANDB_AVAILABLE:
+            # if self.cfg and getattr(self.cfg, "wandb", False) and WANDB_AVAILABLE:
             #     try:
             #         wandb.save(f".\\models\\sac_checkpoint_{self.total_steps}.pt")
             #         wandb.log(
@@ -527,6 +569,7 @@ def collect_initial_data(env, rb, cfg, current_td, device):
         None,
         None,
         None,
+        None,
         device,
         None,
     )
@@ -543,6 +586,8 @@ def run_training_loop(
     value_target,
     q1,
     q2,
+    q1_target,
+    q2_target,
     actor_opt,
     critic_opt,
     value_opt,
@@ -550,7 +595,6 @@ def run_training_loop(
     alpha_opt,
     target_entropy,
     device,
-    args,
     storage=None,
     start_time=None,
     total_steps=0,
@@ -567,6 +611,8 @@ def run_training_loop(
         value_target,
         q1,
         q2,
+        q1_target,
+        q2_target,
         actor_opt,
         critic_opt,
         value_opt,
@@ -574,7 +620,6 @@ def run_training_loop(
         alpha_opt,
         target_entropy,
         device,
-        args,
         storage,
     )
     # restore passed-in state when available
