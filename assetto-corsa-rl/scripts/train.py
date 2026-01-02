@@ -149,7 +149,11 @@ def train():
     wandb.init(**wandb_kwargs)
     print("WandB initialized:", getattr(wandb.run, "name", None))
 
-    env = create_gym_env(device=device, num_envs=cfg.num_envs)
+    env = create_gym_env(
+        device=device,
+        num_envs=cfg.num_envs,
+        fixed_track_seed=cfg.seed,
+    )
     td = env.reset()
 
     # ===== Agent =====

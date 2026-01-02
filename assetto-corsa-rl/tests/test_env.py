@@ -5,7 +5,6 @@ import pytest
 import torch
 from pathlib import Path
 
-# Ensure the package in src/ is importable when running tests from the repo root
 _repo_root = Path(__file__).resolve().parents[1]
 _src_path = str((_repo_root / "src").resolve())
 if _src_path not in sys.path:
@@ -38,7 +37,6 @@ def test_manual_play_interactive():
             "pygame is not installed; install pygame to run this interactive test"
         )
 
-    # Initialize pygame so we can capture key events
     pygame.init()
 
     try:
@@ -50,14 +48,12 @@ def test_manual_play_interactive():
         "Interactive controls: Arrow keys or WASD to steer/gas/brake. ESC to quit. R to restart."
     )
     td = env.reset()
-    inner = td["next"] if "next" in td.keys() else td
 
     max_steps = 2000
     step = 0
     quit_flag = False
     restart_flag = False
 
-    # Give the env time to create the window and tell the user to focus it
     try:
         env.render()
     except Exception:
@@ -80,7 +76,6 @@ def test_manual_play_interactive():
             "No keypress detected; make sure the game window has focus — proceeding anyway."
         )
 
-    # Detect joystick if present (useful for controllers)
     joystick = None
     if pygame is not None:
         try:
@@ -104,10 +99,8 @@ def test_manual_play_interactive():
         reset_req = False
 
         if pygame is not None:
-            # Pump events to keep window responsive and update key state
             pygame.event.pump()
 
-            # Handle queued events for quit/reset and joystick buttons
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     quit_req = True
@@ -117,17 +110,15 @@ def test_manual_play_interactive():
                     elif event.key == pygame.K_SPACE:
                         reset_req = True
 
-            # Joystick (if available)
+            # ===== PS4/PS5 controller support =====
             if joystick is not None and getattr(joystick, "get_init", lambda: False)():
                 try:
                     axes = [joystick.get_axis(i) for i in range(joystick.get_numaxes())]
                     if len(axes) > 0:
-                        # steering usually on axis 0
                         steer = float(axes[0])
                         if abs(steer) > 0.05:
                             steering = float(max(-1.0, min(1.0, steer)))
 
-                    # PS4-like triggers (map [-1,1] to [0,1])
                     def axis_to_trigger(v):
                         return (
                             max(0.0, min(1.0, (v + 1.0) / 2.0))
@@ -151,7 +142,6 @@ def test_manual_play_interactive():
                 except Exception:
                     pass
             else:
-                # Keyboard polling (works when window has focus)
                 keys = pygame.key.get_pressed()
                 if keys[pygame.K_q]:
                     quit_req = True
@@ -166,7 +156,6 @@ def test_manual_play_interactive():
                 if keys[pygame.K_DOWN] or keys[pygame.K_s]:
                     brake = 0.8
         else:
-            # Fallback to console keyboard polling (Windows)
             try:
                 import msvcrt
 
@@ -204,7 +193,6 @@ def test_manual_play_interactive():
             next_td = env.step(action_td)
             inner_next = next_td["next"] if "next" in next_td.keys() else next_td
 
-            # print occasional status and debug inputs
             if step % 10 == 0:
                 reward = float(
                     inner_next.get(
@@ -218,7 +206,6 @@ def test_manual_play_interactive():
             step += 1
             inner = inner_next
 
-            # render and small delay
             try:
                 env.render()
             except Exception:

@@ -1,10 +1,10 @@
 """Load a pretrained SAC model and run episodes to evaluate/visualize it.
 
 Usage:
-    # Play 5 episodes with rendering (human window):
+    Play 5 episodes with rendering (human window):
     python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 5 --render
 
-    # Play 3 episodes on CPU without render:
+    Play 3 episodes on CPU without render:
     python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 3 --device cpu
 
 Options:
@@ -18,7 +18,6 @@ from pathlib import Path
 import torch
 from tensordict import TensorDict
 
-# Local imports (try relative src if package imports fail)
 try:
     from assetto_corsa_rl.env import create_gym_env  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
@@ -46,10 +45,9 @@ def deterministic_action_from_actor(actor, pixels):
     """
     td_in = TensorDict({"pixels": pixels}, batch_size=pixels.shape[0])
     params = actor.module(td_in)
-    loc = params["loc"]  # shape [B, action_dim]
+    loc = params["loc"]  #  [B, action_dim]
     raw = torch.tanh(loc)
 
-    # Try to map to low/high if available
     try:
         dist_kwargs = getattr(actor, "distribution_kwargs", None)
         if dist_kwargs is None:
@@ -61,7 +59,7 @@ def deterministic_action_from_actor(actor, pixels):
             high = torch.as_tensor(
                 dist_kwargs["high"], device=raw.device, dtype=raw.dtype
             )
-            # Broadcast to batch
+
             low = low.unsqueeze(0).expand_as(raw)
             high = high.unsqueeze(0).expand_as(raw)
             action = low + (raw + 1.0) * 0.5 * (high - low)
@@ -84,11 +82,9 @@ def play(
     device = torch.device(device) if device else get_device()
     print(f"Using device: {device}")
 
-    # Create env with human render if requested
     render_mode = "human" if render else None
     env = create_gym_env(device=device, num_envs=1, render_mode=render_mode)
 
-    # Instantiate policy
     policy = SACPolicy(env=env, device=device)
     modules = policy.modules()
     actor = modules["actor"]
@@ -96,15 +92,12 @@ def play(
     q1 = modules["q1"]
     q2 = modules["q2"]
 
-    # Initialize lazy modules by calling with a guaranteed-shaped sample (lazy layers require shape)
     with torch.no_grad():
         td = env.reset()
         sample_pixels = td["pixels"][:1].to(device)
-        # Ensure pixel tensor is channel-first [B, C, H, W] and has 4 channels; if not, create a dummy of shape [1,4,84,84]
         if sample_pixels.ndim == 3:
             sample_pixels = sample_pixels.unsqueeze(0)
         if sample_pixels.shape[1] != 4:
-            # Some envs may return different channel order/size; use a synthetic tensor to initialize lazy modules
             print("Using dummy pixels tensor (1,4,84,84) to initialize lazy layers")
             sample_pixels = torch.zeros(
                 1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
@@ -112,7 +105,6 @@ def play(
 
         sample_action = torch.zeros(1, env.action_spec.shape[-1], device=device)
 
-        # Helper to detect uninitialized parameters (numel==0 is a good heuristic)
         def _has_uninitialized_params(mod):
             for p in mod.parameters():
                 try:
@@ -122,7 +114,6 @@ def play(
                     return True
             return False
 
-        # Run typical forwards
         try:
             actor(TensorDict({"pixels": sample_pixels}, batch_size=1))
         except Exception as e:
@@ -140,7 +131,6 @@ def play(
         except Exception as e:
             print("q2 forward failed during init:", e)
 
-        # Retry initialization for any modules that still have uninitialized params
         retries = 3
         for i in range(retries):
             needs = []
@@ -150,7 +140,6 @@ def play(
                     "Actor has uninitialized params; running alternative module forward"
                 )
                 try:
-                    # Try calling the underlying module directly
                     actor.module(TensorDict({"pixels": sample_pixels}, batch_size=1))
                 except Exception as e:
                     print("actor.module forward failed:", e)
@@ -161,7 +150,6 @@ def play(
                     value(sample_pixels)
                 except Exception as e:
                     print("Value forward retry failed:", e)
-                # Also try the underlying module directly (nn.Sequential etc.)
                 try:
                     if hasattr(value, "module"):
                         value.module(sample_pixels)
@@ -174,10 +162,8 @@ def play(
                     q1(sample_pixels, sample_action)
                 except Exception as e:
                     print("Q1 forward retry failed:", e)
-                # Try underlying critic network directly
                 try:
                     if hasattr(q1, "module"):
-                        # q1.module expects (pixels, action)
                         q1.module(sample_pixels, sample_action)
                 except Exception as e:
                     print("q1.module forward failed:", e)
@@ -197,7 +183,6 @@ def play(
             if not needs:
                 break
 
-            # If still failing, try a random (non-zero) tensor to trigger initialization
             sample_pixels = torch.randn(
                 1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
             )
@@ -212,7 +197,6 @@ def play(
                 "Warning: Some lazy parameters remain uninitialized after retries; load_state_dict may fail."
             )
 
-    # Load checkpoint
     checkpoint = load_checkpoint(model_path, device)
     try:
         if "actor_state" in checkpoint:
@@ -255,13 +239,10 @@ def play(
                 else:
                     actor_td = TensorDict({"pixels": pixels}, batch_size=1)
                     out = actor(actor_td)
-                    # default to 'action' key
                     action = out.get("action")
                     if action is None:
-                        # fallback to deterministic if sampling not available
                         action = deterministic_action_from_actor(actor, pixels)
 
-            # Ensure action shape [1, action_dim]
             if action.ndim == 1:
                 action = action.unsqueeze(0)
 
@@ -273,7 +254,6 @@ def play(
             next_td = env.step(action_td)
             inner_next = next_td["next"] if "next" in next_td.keys() else next_td
 
-            # read reward
             r = 0.0
             if "reward" in inner_next.keys():
                 r = float(inner_next["reward"].item())
