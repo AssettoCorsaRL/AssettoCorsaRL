@@ -5,3 +5,5 @@
 /assetto-corsa-rl/src/assetto_corsa_rl/__pycache__
 /assetto-corsa-rl/src/assetto_corsa_rl/model/__pycache__
 /assetto-corsa-rl/src/assetto_corsa_rl/train/__pycache__
+/pretrained_model.pt
+/temp_demonstrations.pt

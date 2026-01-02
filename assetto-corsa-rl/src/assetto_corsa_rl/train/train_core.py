@@ -76,6 +76,18 @@ class Trainer:
         self.alpha_opt = alpha_opt
         self.target_entropy = target_entropy if target_entropy is not None else -3.0
 
+        # Track last steps when logging and saving to ensure we log/save
+        # at least every `log_interval` / `save_interval` regardless of batch increments.
+        self._last_log_steps = 0
+        self._last_save_steps = 0
+
+        # Track update frequency for interleaved updates
+        self._steps_since_update = 0
+        # How many env steps between gradient updates (lower = more frequent updates)
+        self._update_every = getattr(
+            cfg, "update_every", cfg.num_envs
+        )  # Default: update after each batch from all envs
+
     def _get_alpha_value(self):
         """Return current alpha value (prefer model parameter if present)."""
         return float(self.log_alpha.exp().item())
@@ -121,10 +133,22 @@ class Trainer:
     # ===== Main loop =====
     def run(self, total_steps=0):
         self.total_steps = total_steps
+
         while self.total_steps < self.cfg.total_steps:
+            # Interleaved approach: spread updates throughout data collection
             for _ in range(self.cfg.frames_per_batch):
                 self._step_and_store()
-            self._perform_updates()
+
+                # Perform update after collecting update_every steps
+                self._steps_since_update += self.cfg.num_envs
+                if self._steps_since_update >= self._update_every:
+                    # Do one or more gradient updates
+                    num_updates = max(1, self._steps_since_update // self._update_every)
+                    for _ in range(num_updates):
+                        if len(self.rb) >= self.cfg.batch_size:
+                            self._do_update()
+                    self._steps_since_update = 0
+
             self._maybe_log_and_save()
         print("Training finished")
 
@@ -267,13 +291,6 @@ class Trainer:
                 )
 
     # ===== Updates =====
-    def _perform_updates(self):
-        updates_per_batch = max(1, self.cfg.frames_per_batch // self.cfg.batch_size)
-        for _ in range(updates_per_batch):
-            if len(self.rb) < self.cfg.batch_size:
-                continue
-            self._do_update()
-
     def _do_update(self):
         # Sample with return_info=True to get indices for priority updates
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
@@ -409,6 +426,8 @@ class Trainer:
                 "actor/loc_std": out["loc"].std().item(),
                 "actor/loc_max": out["loc"].max().item(),
                 "actor/scale_mean": out["scale"].mean().item(),
+                "actor/scale_min": out["scale"].min().item(),
+                "actor/scale_max": out["scale"].max().item(),
             },
             step=self.total_steps,
         )
@@ -512,7 +531,11 @@ class Trainer:
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
     def _maybe_log_and_save(self):
-        if self.total_steps % self.cfg.log_interval < self.cfg.num_envs:
+        # Log if we've advanced at least `log_interval` steps since last log.
+        if (
+            self.total_steps - getattr(self, "_last_log_steps", 0)
+            >= self.cfg.log_interval
+        ):
             elapsed = time.time() - self.start_time
             last = self.episode_returns[-100:]
             if len(last) > 0:
@@ -525,7 +548,6 @@ class Trainer:
             )
 
             try:
-                alpha_val = self._get_alpha_value()
                 wandb.log(
                     {
                         "steps": self.total_steps,
@@ -544,7 +566,14 @@ class Trainer:
             except Exception as e:
                 print("Warning: wandb logging failed (_maybe_log_and_save):", e)
 
-        if self.total_steps % self.cfg.save_interval < self.cfg.num_envs:
+            # record last log
+            self._last_log_steps = self.total_steps
+
+        # Save if we've advanced at least `save_interval` steps since last save.
+        if (
+            self.total_steps - getattr(self, "_last_save_steps", 0)
+            >= self.cfg.save_interval
+        ):
             torch.save(
                 {
                     "actor_state": self.actor.state_dict(),
@@ -559,6 +588,9 @@ class Trainer:
                 f".\\models\\sac_checkpoint_{self.total_steps}.pt",
             )
             print(f"Saved checkpoint at step {self.total_steps}")
+
+            # record last save
+            self._last_save_steps = self.total_steps
 
             # * i dont have enough wandb storage to do this sooo
             # if self.cfg and getattr(self.cfg, "wandb", False) and WANDB_AVAILABLE:

@@ -1,20 +1,27 @@
-import argparse
-import glob
-import os
-import re
-from pathlib import Path
-import sys
+"""Load a pretrained SAC model and run episodes to evaluate/visualize it.
 
+Usage:
+    # Play 5 episodes with rendering (human window):
+    python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 5 --render
+
+    # Play 3 episodes on CPU without render:
+    python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 3 --device cpu
+
+Options:
+    --deterministic  Use the actor mean (deterministic) instead of sampling actions
+"""
+
+import argparse
+import sys
+import os
+from pathlib import Path
 import torch
 from tensordict import TensorDict
 
-# Allow running this file directly (not as a package).
-# When executed as a script, the project `src` directory may not be on sys.path,
-# so insert it if necessary and import the package normally.
+# Local imports (try relative src if package imports fail)
 try:
     from assetto_corsa_rl.env import create_gym_env  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
-    from assetto_corsa_rl.train.train_utils import fix_action_shape  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[1]
     src_path = str(repo_root / "src")
@@ -22,256 +29,327 @@ except Exception:
         sys.path.insert(0, src_path)
     from assetto_corsa_rl.env import create_gym_env  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
-    from assetto_corsa_rl.train.train_utils import fix_action_shape  # type: ignore
 
 
-def find_latest_checkpoint(models_dir: str = "models") -> str:
-    pattern = os.path.join(models_dir, "sac_checkpoint_*.pt")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No checkpoints found in {models_dir}")
-
-    def extract_step(p):
-        m = re.search(r"sac_checkpoint_(\d+)\.pt", p)
-        if m:
-            return int(m.group(1))
-        return 0
-
-    files_sorted = sorted(files, key=lambda p: extract_step(p), reverse=True)
-    return files_sorted[0]
-
-
-def load_checkpoint(path: str, device: torch.device = None):
-    map_loc = device if device is not None else torch.device("cpu")
-    ckpt = torch.load(path, map_location=map_loc)
+def load_checkpoint(checkpoint_path, device):
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     return ckpt
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=str, default=None, help="Path to checkpoint")
-    p.add_argument("--episodes", type=int, default=5, help="Number of episodes to run")
-    p.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device to use (e.g., cpu, cuda:0). If omitted, `get_device()` is used.",
-    )
-    p.add_argument("--render", action="store_true", help="Render the environment")
-    p.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Use deterministic policy actions when possible",
-    )
-    p.add_argument(
-        "--models-dir",
-        type=str,
-        default="models",
-        help="Directory containing checkpoints",
-    )
-    return p.parse_args()
+def deterministic_action_from_actor(actor, pixels):
+    """Compute a deterministic action from the actor by using the mean (loc).
+
+    We use tanh(loc) and map to action bounds if available in actor.distribution_kwargs.
+    Falls back to tanh(loc) if bounds aren't present.
+    """
+    td_in = TensorDict({"pixels": pixels}, batch_size=pixels.shape[0])
+    params = actor.module(td_in)
+    loc = params["loc"]  # shape [B, action_dim]
+    raw = torch.tanh(loc)
+
+    # Try to map to low/high if available
+    try:
+        dist_kwargs = getattr(actor, "distribution_kwargs", None)
+        if dist_kwargs is None:
+            dist_kwargs = getattr(actor, "_distribution_kwargs", None)
+        if dist_kwargs is not None and "low" in dist_kwargs and "high" in dist_kwargs:
+            low = torch.as_tensor(
+                dist_kwargs["low"], device=raw.device, dtype=raw.dtype
+            )
+            high = torch.as_tensor(
+                dist_kwargs["high"], device=raw.device, dtype=raw.dtype
+            )
+            # Broadcast to batch
+            low = low.unsqueeze(0).expand_as(raw)
+            high = high.unsqueeze(0).expand_as(raw)
+            action = low + (raw + 1.0) * 0.5 * (high - low)
+            return action
+    except Exception:
+        pass
+
+    return raw
 
 
-def build_env(device, render: bool = False):
-    mode = "human" if render else None
-    # single env for evaluation
-    env = create_gym_env(device=device, num_envs=1, render_mode=mode)
-    return env
+def play(
+    model_path,
+    device=None,
+    episodes=5,
+    max_steps=1000,
+    render=False,
+    deterministic=False,
+    seed=None,
+):
+    device = torch.device(device) if device else get_device()
+    print(f"Using device: {device}")
 
+    # Create env with human render if requested
+    render_mode = "human" if render else None
+    env = create_gym_env(device=device, num_envs=1, render_mode=render_mode)
 
-def main():
-    args = parse_args()
-
-    # device
-    device = torch.device(args.device) if args.device else get_device()
-    print("Using device:", device)
-
-    # checkpoint
-    ckpt_path = args.checkpoint
-    if ckpt_path is None:
-        try:
-            ckpt_path = find_latest_checkpoint(args.models_dir)
-            print("Found latest checkpoint:", ckpt_path)
-        except FileNotFoundError as e:
-            print(e)
-            return
-
-    ckpt = load_checkpoint(ckpt_path, device=device)
-
-    # Build env
-    env = build_env(device, render=args.render)
-
-    # Extract minimal model cfg from checkpoint if present
-    # Fallback values chosen to match the training defaults used in this repo
-    num_cells = ckpt.get("num_cells", 256)
-    use_noisy = ckpt.get("use_noisy", True)
-    noise_sigma = ckpt.get("noise_sigma", 0.5)
-
-    # Build policy
-    print("Constructing policy...")
-    policy = SACPolicy(
-        env=env,
-        num_cells=num_cells,
-        device=device,
-        use_noisy=use_noisy,
-        noise_sigma=noise_sigma,
-    )
-
+    # Instantiate policy
+    policy = SACPolicy(env=env, device=device)
     modules = policy.modules()
+    actor = modules["actor"]
+    value = modules["value"]
+    q1 = modules["q1"]
+    q2 = modules["q2"]
 
-    def _load_if_present(mod, key):
-        if key in ckpt and hasattr(mod, "load_state_dict") and mod is not None:
-            state = ckpt[key]
-            # Try to load non-strictly first to tolerate missing/unexpected keys
-            try:
-                res = mod.load_state_dict(state, strict=False)
-                mk = getattr(res, "missing_keys", None)
-                uk = getattr(res, "unexpected_keys", None)
-                if uk:
-                    print(f"Warning: unexpected keys when loading {key}: {uk}")
-                if mk:
-                    print(f"Warning: missing keys when loading {key}: {mk}")
-                print(f"Loaded {key} into module (strict=False)")
-                return
-            except Exception:
-                pass
+    # Initialize lazy modules by calling with a guaranteed-shaped sample (lazy layers require shape)
+    with torch.no_grad():
+        td = env.reset()
+        sample_pixels = td["pixels"][:1].to(device)
+        # Ensure pixel tensor is channel-first [B, C, H, W] and has 4 channels; if not, create a dummy of shape [1,4,84,84]
+        if sample_pixels.ndim == 3:
+            sample_pixels = sample_pixels.unsqueeze(0)
+        if sample_pixels.shape[1] != 4:
+            # Some envs may return different channel order/size; use a synthetic tensor to initialize lazy modules
+            print("Using dummy pixels tensor (1,4,84,84) to initialize lazy layers")
+            sample_pixels = torch.zeros(
+                1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
+            )
 
-            # If the above fails, try stripping a leading "module." prefix from each key and retry
-            if isinstance(state, dict):
-                stripped = {re.sub(r"^module\.", "", k): v for k, v in state.items()}
+        sample_action = torch.zeros(1, env.action_spec.shape[-1], device=device)
+
+        # Helper to detect uninitialized parameters (numel==0 is a good heuristic)
+        def _has_uninitialized_params(mod):
+            for p in mod.parameters():
                 try:
-                    res = mod.load_state_dict(stripped, strict=False)
-                    mk = getattr(res, "missing_keys", None)
-                    uk = getattr(res, "unexpected_keys", None)
-                    if uk:
-                        print(
-                            f"Warning: unexpected keys when loading {key} after stripping prefix: {uk}"
-                        )
-                    if mk:
-                        print(
-                            f"Warning: missing keys when loading {key} after stripping prefix: {mk}"
-                        )
-                    print(
-                        f"Loaded {key} into module after stripping 'module.' prefix (strict=False)"
-                    )
-                    return
-                except Exception as e2:
-                    print(f"Warning: failed to load {key}: {e2}")
-            else:
-                print(f"Warning: failed to load {key}: state dict is not a mapping")
+                    if p.numel() == 0:
+                        return True
+                except Exception:
+                    return True
+            return False
 
-    _load_if_present(modules.get("actor"), "actor_state")
-    _load_if_present(modules.get("q1"), "q1_state")
-    _load_if_present(modules.get("q2"), "q2_state")
-    _load_if_present(modules.get("value"), "value_state")
-
-    for m in modules.values():
+        # Run typical forwards
         try:
-            m.to(device)
-        except Exception:
-            pass
+            actor(TensorDict({"pixels": sample_pixels}, batch_size=1))
+        except Exception as e:
+            print("actor forward (probabilistic wrapper) failed during init:", e)
         try:
-            m.eval()
-        except Exception:
-            pass
+            value(sample_pixels)
+        except Exception as e:
+            print("value forward failed during init:", e)
+        try:
+            q1(sample_pixels, sample_action)
+        except Exception as e:
+            print("q1 forward failed during init:", e)
+        try:
+            q2(sample_pixels, sample_action)
+        except Exception as e:
+            print("q2 forward failed during init:", e)
 
-    # run episodes
-    episodes = int(args.episodes)
-    returns = []
+        # Retry initialization for any modules that still have uninitialized params
+        retries = 3
+        for i in range(retries):
+            needs = []
+            if _has_uninitialized_params(actor):
+                needs.append("actor")
+                print(
+                    "Actor has uninitialized params; running alternative module forward"
+                )
+                try:
+                    # Try calling the underlying module directly
+                    actor.module(TensorDict({"pixels": sample_pixels}, batch_size=1))
+                except Exception as e:
+                    print("actor.module forward failed:", e)
+            if _has_uninitialized_params(value):
+                needs.append("value")
+                print("Value has uninitialized params; running value forward")
+                try:
+                    value(sample_pixels)
+                except Exception as e:
+                    print("Value forward retry failed:", e)
+                # Also try the underlying module directly (nn.Sequential etc.)
+                try:
+                    if hasattr(value, "module"):
+                        value.module(sample_pixels)
+                except Exception as e:
+                    print("value.module forward failed:", e)
+            if _has_uninitialized_params(q1):
+                needs.append("q1")
+                print("Q1 has uninitialized params; running q1 forward")
+                try:
+                    q1(sample_pixels, sample_action)
+                except Exception as e:
+                    print("Q1 forward retry failed:", e)
+                # Try underlying critic network directly
+                try:
+                    if hasattr(q1, "module"):
+                        # q1.module expects (pixels, action)
+                        q1.module(sample_pixels, sample_action)
+                except Exception as e:
+                    print("q1.module forward failed:", e)
+            if _has_uninitialized_params(q2):
+                needs.append("q2")
+                print("Q2 has uninitialized params; running q2 forward")
+                try:
+                    q2(sample_pixels, sample_action)
+                except Exception as e:
+                    print("Q2 forward retry failed:", e)
+                try:
+                    if hasattr(q2, "module"):
+                        q2.module(sample_pixels, sample_action)
+                except Exception as e:
+                    print("q2.module forward failed:", e)
+
+            if not needs:
+                break
+
+            # If still failing, try a random (non-zero) tensor to trigger initialization
+            sample_pixels = torch.randn(
+                1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
+            )
+
+        if (
+            _has_uninitialized_params(actor)
+            or _has_uninitialized_params(value)
+            or _has_uninitialized_params(q1)
+            or _has_uninitialized_params(q2)
+        ):
+            print(
+                "Warning: Some lazy parameters remain uninitialized after retries; load_state_dict may fail."
+            )
+
+    # Load checkpoint
+    checkpoint = load_checkpoint(model_path, device)
+    try:
+        if "actor_state" in checkpoint:
+            actor.load_state_dict(checkpoint["actor_state"])
+            print("Loaded actor state")
+        if "q1_state" in checkpoint:
+            q1.load_state_dict(checkpoint["q1_state"])
+            print("Loaded q1 state")
+        if "q2_state" in checkpoint:
+            q2.load_state_dict(checkpoint["q2_state"])
+            print("Loaded q2 state")
+        if "value_state" in checkpoint:
+            value.load_state_dict(checkpoint["value_state"])
+            print("Loaded value state")
+    except Exception as e:
+        print(f"Warning: failed to load some states: {e}")
+
+    actor.eval()
+    value.eval()
+    q1.eval()
+    q2.eval()
+
+    if seed is not None:
+        torch.manual_seed(seed)
+
+    episode_returns = []
 
     for ep in range(episodes):
         td = env.reset()
         inner = td["next"] if "next" in td.keys() else td
-        pixels = inner["pixels"].to(device)
-
-        done = torch.zeros(1, dtype=torch.bool)
         total_reward = 0.0
+        steps = 0
 
-        step = 0
-        while not done.item():
-            # Build actor input
-            actor_td = TensorDict({"pixels": pixels}, batch_size=[1])
+        while steps < max_steps:
+            pixels = inner["pixels"][:1].to(device)
 
-            # If noisy nets used, resample noise per step for exploration-like behaviour
-            if use_noisy:
+            with torch.no_grad():
+                if deterministic:
+                    action = deterministic_action_from_actor(actor, pixels)
+                else:
+                    actor_td = TensorDict({"pixels": pixels}, batch_size=1)
+                    out = actor(actor_td)
+                    # default to 'action' key
+                    action = out.get("action")
+                    if action is None:
+                        # fallback to deterministic if sampling not available
+                        action = deterministic_action_from_actor(actor, pixels)
+
+            # Ensure action shape [1, action_dim]
+            if action.ndim == 1:
+                action = action.unsqueeze(0)
+
+            action = action.to(device).float()
+
+            action_td = TensorDict({"action": action}, batch_size=[1])
+            print(f"Step {steps}: action = {action.cpu().numpy().flatten()}")
+
+            next_td = env.step(action_td)
+            inner_next = next_td["next"] if "next" in next_td.keys() else next_td
+
+            # read reward
+            r = 0.0
+            if "reward" in inner_next.keys():
+                r = float(inner_next["reward"].item())
+            elif "rewards" in inner_next.keys():
+                r = float(inner_next["rewards"].item())
+
+            total_reward += r
+            steps += 1
+
+            inner = inner_next
+
+            if render:
                 try:
-                    for m in modules["actor"].modules():
-                        if hasattr(m, "sample_noise"):
-                            m.sample_noise()
+                    env.render()
                 except Exception:
                     pass
 
-            # Try deterministic if requested
-            action = None
-            try:
-                if args.deterministic:
-                    out = modules["actor"](actor_td, deterministic=True)
-                else:
-                    out = modules["actor"](actor_td)
-            except TypeError:
-                out = modules["actor"](actor_td)
-
-            # Prefer explicit 'action' key
-            if "action" in out.keys():
-                action = out["action"]
-            elif "loc" in out.keys():
-                # use mean (loc) if available
-                action = out["loc"]
-            else:
-                # last resort: try to sample using module's call
-                try:
-                    action = out
-                except Exception:
-                    raise RuntimeError(
-                        "Actor output did not contain an action or loc key"
-                    )
-
-            action = fix_action_shape(
-                action, batch_size=1, action_dim=env.action_spec.shape[-1]
-            )
-            # Ensure action on correct device
-            if isinstance(action, torch.Tensor):
-                action = action.to(device)
-
-            action_step = action
-            # Expand to env step shape expected by environment
-            action_td = TensorDict({"action": action_step}, batch_size=[1])
-
-            td_next = env.step(action_td)
-            inner_next = td_next["next"] if "next" in td_next.keys() else td_next
-
-            # gather reward & done info
-            r = 0.0
-            if "reward" in inner_next.keys():
-                r = float(inner_next["reward"].view(-1).sum().item())
-            elif "rewards" in inner_next.keys():
-                r = float(inner_next["rewards"].view(-1).sum().item())
-
-            total_reward += r
-
-            # update for next step
-            pixels = inner_next["pixels"].to(device)
-
-            # assemble done
-            done = torch.zeros(1, dtype=torch.bool)
+            done = False
             for key in ("done", "terminated", "truncated"):
-                if key in inner_next.keys():
-                    try:
-                        done |= inner_next[key].view(1).to(torch.bool)
-                    except Exception:
-                        pass
+                if key in inner.keys():
+                    done = done or bool(inner[key].item())
+            if done:
+                break
 
-            step += 1
-            if step % 100 == 0:
-                print(f"Episode {ep+1}, step {step}, reward so far {total_reward:.2f}")
-
-        print(f"Episode {ep+1} finished in {step} steps, return: {total_reward:.2f}")
-        returns.append(total_reward)
-
-    if len(returns) > 0:
+        episode_returns.append(total_reward)
         print(
-            f"Average return over {len(returns)} episodes: {sum(returns)/len(returns):.2f}"
+            f"Episode {ep+1}/{episodes} finished: steps={steps}, reward={total_reward:.2f}"
         )
+
+    print(
+        f"Average reward over {len(episode_returns)} episodes: {sum(episode_returns)/len(episode_returns):.2f}"
+    )
+
+    try:
+        env.close()
+    except Exception:
+        pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Load a pretrained SAC model and play episodes"
+    )
+    parser.add_argument(
+        "--model", type=str, required=True, help="Path to pretrained model (.pt)"
+    )
+    parser.add_argument(
+        "--device", type=str, default=None, help="Device to use (e.g., cuda:0, cpu)"
+    )
+    parser.add_argument(
+        "--episodes", type=int, default=5, help="Number of episodes to play"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=1000, help="Max steps per episode"
+    )
+    parser.add_argument(
+        "--render", action="store_true", help="Render environment to screen"
+    )
+    parser.add_argument(
+        "--deterministic", action="store_true", help="Use deterministic (mean) actions"
+    )
+    parser.add_argument("--seed", type=int, default=None, help="Optional random seed")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    play(
+        model_path=args.model,
+        device=args.device,
+        episodes=args.episodes,
+        max_steps=args.max_steps,
+        render=args.render,
+        deterministic=args.deterministic,
+        seed=args.seed,
+    )
 
 
 if __name__ == "__main__":

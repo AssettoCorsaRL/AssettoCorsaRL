@@ -174,54 +174,65 @@ def train():
     q1_target = modules["q1_target"]
     q2_target = modules["q2_target"]
 
-    # Network summary will be printed after lazy initialization so that
-    # LazyModule parameters are initialized before we attempt to count them.
-    # (See later in this function where we print the networks.)
-
+    # Optional: Apply custom initialization
     # def init_optimistic(m):
     #     if isinstance(m, nn.Linear):
     #         nn.init.constant_(m.bias, 1.0)  # Optimistic bias
     #         nn.init.xavier_uniform_(m.weight, gain=0.01)  # Small weights
-
     # q1.apply(init_optimistic)
     # q2.apply(init_optimistic)
 
-    print("Initializing lazy modules...")
-    with torch.no_grad():
-        sample_pixels = td["pixels"][:1].to(device)  # take first env, single batch
-        sample_action = torch.zeros(1, env.action_spec.shape[-1], device=device)
+    print("Networks initialized with explicit dimensions")
 
-        actor_input = TensorDict({"pixels": sample_pixels}, batch_size=1)
-        actor(actor_input)
+    # Load pretrained model if specified
+    pretrained_path = getattr(cfg, "pretrained_model", None)
+    if pretrained_path is not None and pretrained_path:
+        print(f"Loading pretrained model from {pretrained_path}...")
+        try:
+            checkpoint = torch.load(pretrained_path, map_location=device)
 
-        value(sample_pixels)
-        # Ensure the target network's lazy layers are initialized before loading state
-        value_target(sample_pixels)
+            # Load actor state
+            if "actor_state" in checkpoint:
+                actor.load_state_dict(checkpoint["actor_state"])
+                print("Loaded actor state from pretrained model")
 
-        q1(sample_pixels, sample_action)
-        q2(sample_pixels, sample_action)
+            # Load critic states
+            if "q1_state" in checkpoint:
+                q1.load_state_dict(checkpoint["q1_state"])
+                print("Loaded Q1 state from pretrained model")
+            if "q2_state" in checkpoint:
+                q2.load_state_dict(checkpoint["q2_state"])
+                print("Loaded Q2 state from pretrained model")
 
-    print("Lazy modules initialized")
+            # Load value state
+            if "value_state" in checkpoint:
+                value.load_state_dict(checkpoint["value_state"])
+                print("Loaded value state from pretrained model")
 
-    modules["value_target"].load_state_dict(modules["value"].state_dict())
+            # Copy to target networks
+            value_target.load_state_dict(value.state_dict())
+            q1_target.load_state_dict(q1.state_dict())
+            q2_target.load_state_dict(q2.state_dict())
+            print("Copied states to target networks")
+
+            print(f"Successfully loaded pretrained model from {pretrained_path}")
+        except Exception as e:
+            print(f"Warning: Failed to load pretrained model: {e}")
+            print("Continuing with randomly initialized networks")
+            modules["value_target"].load_state_dict(modules["value"].state_dict())
+    else:
+        modules["value_target"].load_state_dict(modules["value"].state_dict())
 
     print("Target network initialized")
 
-    # Now that LazyModules have been initialized, print the network summaries
+    # Now print the network summaries
     print("Networks:")
     for name, net in modules.items():
         print("=" * 40)
         print(f"{name}:")
         print(net)
-        num_fn = getattr(net, "num_parameters", None)
-        if callable(num_fn):
-            nparams = num_fn()
-        else:
-            try:
-                nparams = sum(p.numel() for p in net.parameters())
-            except Exception:
-                nparams = "uninitialized (LazyModule)"
-        print(f"Number of parameters: {nparams}")
+        num_params = sum(p.numel() for p in net.parameters())
+        print(f"Number of parameters: {num_params}")
 
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
@@ -233,7 +244,9 @@ def train():
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
 
-    target_entropy = -0.5 * float(env.action_spec.shape[-1])
+    # More moderate target entropy for bounded action spaces
+    # Standard SAC uses -action_dim, but -0.5 * action_dim works better for bounded actions
+    target_entropy = -0.5 * float(env.action_spec.shape[-1])  # -1.5 for 3D action space
     print(f"Target entropy: {target_entropy}")
 
     print("using PrioritizedReplayBuffer with LazyTensorStorage")

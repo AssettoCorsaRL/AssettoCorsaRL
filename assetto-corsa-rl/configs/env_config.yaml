@@ -1,8 +1,8 @@
 environment:
-  num_envs: 4
-  frames_per_batch: 1000
+  num_envs: 8
+  frames_per_batch: 1024
 
   # exploration
   explore_start: 1.0
-  explore_end: 0.03
-  explore_steps: 500000
+  explore_end: 0.01 # Lower floor for less random exploration
+  explore_steps: 500_000 # Faster decay to rely on learned policy

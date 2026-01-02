@@ -50,11 +50,8 @@ class SACPolicy:
 
         in_channels = 4  # TODO: remove this hardcoding later
 
-        # helper to pick noisy vs lazy linear layers
-        def _lin(out):
-            if use_noisy:
-                return NoisyLazyLinear(out, sigma=noise_sigma, device=device)
-            return nn.LazyLinear(out, device=device)
+        # CNN output size for 84x84 input: 64 * 7 * 7 = 3136
+        cnn_output_size = 3136
 
         # CNN feature extractor for image inputs
         # Input: [B, C, H, W] - e.g., [B, in_channels, 84, 84] (CarRacing frames stacked)
@@ -73,14 +70,30 @@ class SACPolicy:
             nn.Flatten(start_dim=1),  # → [B, 64*7*7] = [B, 3136]
         )
 
+        class BoundedNormalParams(nn.Module):
+            def __init__(self, min_scale=0.1, max_scale=1.0):
+                super().__init__()
+                self.min_scale = min_scale
+                self.max_scale = max_scale
+                self.scale_range = max_scale - min_scale
+
+            def forward(self, x):
+                # x shape: [batch, 2*action_dim]
+                loc, scale_raw = x.chunk(2, dim=-1)
+                # Use sigmoid to bound between [min_scale, max_scale]
+                scale = self.min_scale + torch.sigmoid(scale_raw) * self.scale_range
+                return {"loc": loc, "scale": scale}
+
         actor_net = nn.Sequential(
             cnn_features,
-            _lin(num_cells),
+            nn.Linear(cnn_output_size, num_cells, device=device),
             nn.Tanh(),
-            _lin(num_cells),
+            nn.Linear(num_cells, num_cells, device=device),
             nn.Tanh(),
-            nn.LazyLinear(2 * action_dim, device=device),
-            NormalParamExtractor(),
+            nn.Linear(num_cells, 2 * action_dim, device=device),
+            BoundedNormalParams(
+                min_scale=0.1, max_scale=1.0
+            ),  # Clamp scale to prevent excessive exploration
         )
 
         policy_module = TensorDictModule(
@@ -143,11 +156,11 @@ class SACPolicy:
 
         value_net = nn.Sequential(
             value_cnn,
-            _lin(num_cells),
+            nn.Linear(cnn_output_size, num_cells, device=device),
             nn.Tanh(),
-            _lin(num_cells),
+            nn.Linear(num_cells, num_cells, device=device),
             nn.Tanh(),
-            nn.LazyLinear(1, device=device),
+            nn.Linear(num_cells, 1, device=device),
         )
 
         self.value = ValueOperator(module=value_net, in_keys=["pixels"])
@@ -167,11 +180,11 @@ class SACPolicy:
 
         value_net_target = nn.Sequential(
             value_cnn_target,
-            _lin(num_cells),
+            nn.Linear(cnn_output_size, num_cells, device=device),
             nn.Tanh(),
-            _lin(num_cells),
+            nn.Linear(num_cells, num_cells, device=device),
             nn.Tanh(),
-            nn.LazyLinear(1, device=device),
+            nn.Linear(num_cells, 1, device=device),
         )
         self.value_target = ValueOperator(module=value_net_target, in_keys=["pixels"])
 
@@ -199,12 +212,14 @@ class SACPolicy:
                     nn.Flatten(start_dim=1),
                 )
 
+                # Critic input: CNN features (3136) + action (3) = 3139
+                critic_input_size = cnn_output_size + action_dim
                 self.fc = nn.Sequential(
-                    _lin(hidden),
+                    nn.Linear(critic_input_size, hidden, device=device),
                     nn.Tanh(),
-                    _lin(hidden),
+                    nn.Linear(hidden, hidden, device=device),
                     nn.Tanh(),
-                    nn.LazyLinear(1, device=device),
+                    nn.Linear(hidden, 1, device=device),
                 )
 
             def forward(self, pixels, action):

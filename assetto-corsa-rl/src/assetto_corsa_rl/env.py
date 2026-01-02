@@ -1,14 +1,11 @@
 import torch
-import numpy as np
-import matplotlib.pyplot as plt
+from typing import Optional
 from torchrl.envs.transforms import (
     Compose,
     Resize,
     ToTensorImage,
     GrayScale,
-    VecNorm,
     CatFrames,
-    ObservationNorm,
 )
 from torchrl.envs import ParallelEnv, TransformedEnv, GymEnv
 
@@ -20,14 +17,36 @@ def create_gym_env(
     device="cuda",
     num_envs: int = 1,
     render_mode: str = None,
+    domain_randomize=False,
+    fixed_track_seed: Optional[int] = None,
+    frame_skip: int = 4,
 ) -> ParallelEnv:
+    class FixedSeedGymEnv(GymEnv):
+        def __init__(self, *args, fixed_seed: Optional[int] = None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._fixed_seed = fixed_seed
+
+        def reset(self, *args, **kwargs):
+            if self._fixed_seed is not None:
+                kwargs.setdefault("seed", self._fixed_seed)
+                try:
+                    return super().reset(*args, **kwargs)
+                except TypeError:
+                    if hasattr(self, "seed"):
+                        self.seed(self._fixed_seed)
+                    return super().reset(*args, **kwargs)
+            return super().reset(*args, **kwargs)
+
     def _make_env():
-        return GymEnv(
+        return FixedSeedGymEnv(
             env_name,
             from_pixels=True,
             pixels_only=True,
             device=device,
             render_mode=render_mode,
+            domain_randomize=domain_randomize,
+            fixed_seed=fixed_track_seed,
+            frame_skip=frame_skip,  # ADD THIS
         )
 
     base_env = ParallelEnv(num_workers=num_envs, create_env_fn=_make_env, device=device)
@@ -36,9 +55,7 @@ def create_gym_env(
         ToTensorImage(from_int=True),
         Resize(h=height, w=width),
         GrayScale(),
-        # catframes BEFORE normalization to stack grayscale frames properly
         CatFrames(N=4, in_keys=["pixels"], dim=-3),
-        # VecNorm(in_keys=["pixels"]), # * env already normalized [0,1]
     )
 
     transformed_env = TransformedEnv(base_env, transform)
@@ -50,16 +67,10 @@ if __name__ == "__main__":
     print("Using device:", DEVICE)
 
     num_envs = 4
-    env = create_gym_env(device=DEVICE, num_envs=num_envs)
+    env = create_gym_env(device=DEVICE, num_envs=num_envs, fixed_track_seed=42)
     td = env.reset()
     print("Initial time step:", td)
 
-    pixels = td["pixels"]
-    print("Pixels shape (batch, channels, height, width):", pixels.shape)
-    print("Pixels dtype:", pixels.dtype)
-    print("Pixels min/max (across batch):", pixels.min().item(), pixels.max().item())
-
-    per_env_min = pixels.view(num_envs, -1).min(dim=1).values
-    per_env_max = pixels.view(num_envs, -1).max(dim=1).values
-    print("Per-env min:", per_env_min)
-    print("Per-env max:", per_env_max)
+    # multiple resets will now use the same track (seed=42)
+    td2 = env.reset()
+    print("Reset again; track should be identical:", td2)

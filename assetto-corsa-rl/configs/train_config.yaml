@@ -1,10 +1,13 @@
 train:
-  total_steps: 5000000
+  total_steps: 10_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
-  save_interval: 50000 # how often (in steps) to save model checkpoints
+  save_interval: 250_000 # how often (in steps) to save model checkpoints
 
   seed: 6741
   device: null # set to a CUDA device string (e.g. "cuda:0") to force device, or null to auto-select
+
+  # Pretrained model loading
+  pretrained_model: null # path to pretrained model checkpoint (e.g., "pretrained_model.pt"), or null to train from scratch
 
   wandb:
     enabled: true
@@ -14,4 +17,5 @@ train:
 
   checkpoint_dir: "models" # relative path to save checkpoints
 
-  num_eval_episodes: 10
+
+  # num_eval_episodes: 10

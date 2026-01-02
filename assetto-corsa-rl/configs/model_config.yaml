@@ -7,15 +7,15 @@ model:
   gamma: 0.99 # more long-term rewards
   tau: 0.005 # prevent q-value collapse maybe
 
-  # entropy
-  alpha: 0.2
-  alpha_lr: 3e-4
+  alpha: 0.1
+  alpha_lr: 3e-4 # Slower alpha learning rate
   alpha_min: 0.01
 
   # replay / training
   batch_size: 512
-  replay_size: 600000
-  # start_steps: 1000
+  replay_size: 1_000_000
+
+  update_every: 32 # Perform update after every 32 env steps (num_envs default)
 
   load_initial: true
 
@@ -25,4 +25,4 @@ model:
 
   # PER
   per_alpha: 0.6
-  per_beta: 0.6
+  per_beta: 0.4 # Start lower, anneal to 1.0
