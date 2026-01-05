@@ -394,6 +394,12 @@ class Trainer:
         q2_loss = F.mse_loss(q2_pred, q_target)
         critic_loss = q1_loss + q2_loss
 
+        # Compute explained variance for Q-functions
+        with torch.no_grad():
+            q_var = torch.var(q_target)
+            q1_explained_var = 1 - torch.var(q_target - q1_pred) / (q_var + 1e-8)
+            q2_explained_var = 1 - torch.var(q_target - q2_pred) / (q_var + 1e-8)
+
         self.critic_opt.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(
@@ -403,6 +409,13 @@ class Trainer:
         self.critic_opt.step()
 
         # ===== Actor Update =====
+        # Store old policy for KL penalty
+        with torch.no_grad():
+            td_in_old = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
+            out_old = self.actor(td_in_old)
+            old_loc = out_old["loc"].detach()
+            old_scale = out_old["scale"].detach()
+
         # Sample actions from current policy
         td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
         out = self.actor(td_in)
@@ -437,9 +450,34 @@ class Trainer:
         q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
         min_q_new = torch.min(q1_new, q2_new)
 
-        # Actor loss: maximize Q(s,a) - α * log π(a|s)
-        # Equivalently: minimize α * log π(a|s) - Q(s,a)
-        actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
+        # Compute KL divergence between old and new policy (Gaussian KL)
+        # KL(N(μ1,σ1)||N(μ2,σ2)) = log(σ2/σ1) + (σ1² + (μ1-μ2)²)/(2σ2²) - 1/2
+        new_loc = out["loc"]
+        new_scale = out["scale"]
+        kl_div = (
+            torch.log(old_scale / new_scale)
+            + (new_scale.pow(2) + (new_loc - old_loc).pow(2)) / (2 * old_scale.pow(2))
+            - 0.5
+        ).sum(dim=-1, keepdim=True)
+
+        # KL penalty coefficient (can be made configurable)
+        beta_kl = getattr(self.cfg, "beta_kl", 0.01)
+        kl_penalty = beta_kl * kl_div
+
+        # Log KL divergence immediately after computation
+        wandb.log(
+            {
+                "actor/kl_divergence_instant": kl_div.mean().item(),
+                "actor/kl_divergence_max": kl_div.max().item(),
+                "actor/kl_divergence_min": kl_div.min().item(),
+                "actor/kl_penalty_instant": kl_penalty.mean().item(),
+            },
+            step=self.total_steps,
+        )
+
+        # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
+        # Equivalently: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
+        actor_loss = (alpha.detach() * log_prob_new - min_q_new + kl_penalty).mean()
 
         self.actor_opt.zero_grad()
         actor_loss.backward()
@@ -476,10 +514,13 @@ class Trainer:
                 "loss/q1_loss": q1_loss.item(),
                 "loss/q2_loss": q2_loss.item(),
                 "loss/actor_loss": actor_loss.item(),
+                "loss/kl_penalty": kl_penalty.mean().item(),
                 #
                 "critic/mean_q_value": min_q_new.mean().item(),
                 "critic/q_target_mean": q_target.mean().item(),
                 "critic/next_v_mean": next_v.mean().item(),
+                "critic/q1_explained_variance": q1_explained_var.item(),
+                "critic/q2_explained_variance": q2_explained_var.item(),
                 #
                 "actor/mean_log_prob": log_prob_new.mean().item(),
                 "actor/entropy": current_entropy,
@@ -489,6 +530,8 @@ class Trainer:
                 "actor/alpha_loss": (
                     alpha_loss.item() if alpha_loss is not None else 0.0
                 ),
+                "actor/kl_divergence": kl_div.mean().item(),
+                "actor/beta_kl": beta_kl,
                 #
                 "reward/rewards_per_step_mean": rewards_b.mean().item(),
                 "reward/rewards_per_step_max": rewards_b.max().item(),

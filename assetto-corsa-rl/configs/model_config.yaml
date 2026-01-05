@@ -8,12 +8,12 @@ model:
 
   alpha: 0.2
   alpha_lr: 3e-4
-  alpha_min: 0.05
+  alpha_min: 0.001
 
-  batch_size: 512
+  batch_size: 2048
   replay_size: 1_000_000
 
-  update_every: 256
+  update_every: 512
 
   load_initial: true
 

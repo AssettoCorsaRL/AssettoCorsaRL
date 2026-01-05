@@ -98,7 +98,7 @@ class SACPolicy:
             _make_linear(num_cells, num_cells),
             nn.Tanh(),
             _make_linear(num_cells, 2 * action_dim),
-            BoundedNormalParams(min_scale=0.1, max_scale=1.0),
+            BoundedNormalParams(min_scale=0.3, max_scale=3.0),
         )
 
         policy_module = TensorDictModule(

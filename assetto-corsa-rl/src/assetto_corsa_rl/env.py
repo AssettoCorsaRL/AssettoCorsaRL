@@ -19,7 +19,6 @@ def create_gym_env(
     render_mode: str = None,
     domain_randomize=False,
     fixed_track_seed: Optional[int] = None,
-    frame_skip: int = 4,
 ) -> ParallelEnv:
     class FixedSeedGymEnv(GymEnv):
         def __init__(self, *args, fixed_seed: Optional[int] = None, **kwargs):
@@ -46,7 +45,6 @@ def create_gym_env(
             render_mode=render_mode,
             domain_randomize=domain_randomize,
             fixed_seed=fixed_track_seed,
-            frame_skip=frame_skip,  # ADD THIS
         )
 
     base_env = ParallelEnv(num_workers=num_envs, create_env_fn=_make_env, device=device)
