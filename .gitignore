@@ -8,3 +8,4 @@
 /pretrained_model.pt
 /temp_demonstrations.pt
 /pretrained.pt
+/vae_pretrained.ckpt

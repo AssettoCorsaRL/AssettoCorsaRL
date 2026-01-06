@@ -356,12 +356,13 @@ class Trainer:
                 next_log_prob if next_log_prob is not None else 0.0
             )
 
-            # Bellman backup: Q(s,a) = r + γ * (1 - done) * V(s')
             q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
 
-            # Clip Q-targets to prevent divergence (critical for stability)
-            # Range based on expected discounted returns for your reward scale
-            q_target = torch.clamp(q_target, min=-200.0, max=200.0)
+            # clip Q-targets to prevent divergence (critical for stability)
+            # Range based on expected discounted returns [-1000, 1000]
+            min_q = float(getattr(self.cfg, "min_q_target", -1000.0))
+            max_q = float(getattr(self.cfg, "max_q_target", 1000.0))
+            q_target = torch.clamp(q_target, min=min_q, max=max_q)
 
         # Compute current Q-values
         actions_b = fix_action_shape(
@@ -370,15 +371,15 @@ class Trainer:
         q1_pred = self.q1(pixels_b, actions_b).view(-1, 1)
         q2_pred = self.q2(pixels_b, actions_b).view(-1, 1)
 
-        # Compute TD errors for PER priority updates
+        # compute TD errors for PER priority updates
         with torch.no_grad():
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
             td_errors = torch.max(td_error_1, td_error_2).squeeze(-1)
 
-            # Update priorities in PER
+            # update priorities in PER
             if batch_indices is not None:
-                # Convert to numpy if needed
+                # convert to numpy if needed
                 priorities = td_errors.cpu().numpy()
                 self.rb.update_priority(batch_indices, priorities)
 
@@ -389,12 +390,12 @@ class Trainer:
         )
         self.rb.beta = beta
 
-        # Critic loss: MSE between predicted and target Q-values
+        # critic loss: MSE
         q1_loss = F.mse_loss(q1_pred, q_target)
         q2_loss = F.mse_loss(q2_pred, q_target)
         critic_loss = q1_loss + q2_loss
 
-        # Compute explained variance for Q-functions
+        # explained variance for Q-functions
         with torch.no_grad():
             q_var = torch.var(q_target)
             q1_explained_var = 1 - torch.var(q_target - q1_pred) / (q_var + 1e-8)
@@ -409,14 +410,14 @@ class Trainer:
         self.critic_opt.step()
 
         # ===== Actor Update =====
-        # Store old policy for KL penalty
+        # store old policy for KL penalty
         with torch.no_grad():
             td_in_old = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
             out_old = self.actor(td_in_old)
             old_loc = out_old["loc"].detach()
             old_scale = out_old["scale"].detach()
 
-        # Sample actions from current policy
+        # sample actions from current policy
         td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
         out = self.actor(td_in)
         new_actions = fix_action_shape(
@@ -445,12 +446,12 @@ class Trainer:
             step=self.total_steps,
         )
 
-        # Compute Q-values for new actions (clipped double-Q)
+        # compute Q-values for new actions (clipped double-Q)
         q1_new = self.q1(pixels_b, new_actions).view(-1, 1)
         q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
         min_q_new = torch.min(q1_new, q2_new)
 
-        # Compute KL divergence between old and new policy (Gaussian KL)
+        # compute KL divergence between old and new policy (Gaussian KL)
         # KL(N(μ1,σ1)||N(μ2,σ2)) = log(σ2/σ1) + (σ1² + (μ1-μ2)²)/(2σ2²) - 1/2
         new_loc = out["loc"]
         new_scale = out["scale"]

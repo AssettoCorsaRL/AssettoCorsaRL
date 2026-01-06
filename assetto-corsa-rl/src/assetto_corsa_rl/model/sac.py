@@ -39,6 +39,7 @@ class SACPolicy:
         device=None,
         use_noisy: bool = False,
         noise_sigma: float = 0.5,
+        vae_checkpoint_path: str = None,
     ):
         if device is None:
             device = get_device()
@@ -48,27 +49,44 @@ class SACPolicy:
 
         action_dim = int(env.action_spec.shape[-1])
 
-        in_channels = 4  # TODO: remove this hardcoding later
+        in_channels = 4
 
-        # CNN output size for 84x84 input: 64 * 7 * 7 = 3136
-        cnn_output_size = 3136
+        if vae_checkpoint_path:
+            cnn_output_size = 256 * 4 * 4
+            print(f"Loading VAE encoder from {vae_checkpoint_path}")
+        else:
+            cnn_output_size = 3136
 
-        # CNN feature extractor for image inputs
-        # Input: [B, C, H, W] - e.g., [B, in_channels, 84, 84] (CarRacing frames stacked)
-        # For 84x84 inputs the conv outputs will be: 20x20 → 9x9 → 7x7 → flattened (64*7*7 = 3136)
-        cnn_features = nn.Sequential(
-            nn.Conv2d(
-                in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
-            ),  # → [B, 32, 20, 20]
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
-            # → [B, 64, 9, 9]
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
-            # → [B, 64, 7, 7]
-            nn.ReLU(),
-            nn.Flatten(start_dim=1),  # → [B, 64*7*7] = [B, 3136]
-        )
+        if vae_checkpoint_path:
+            from .vae import ConvVAE, ConvBlock
+
+            vae = ConvVAE(z_dim=32, in_channels=in_channels)
+            checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                vae.load_state_dict(checkpoint["state_dict"])
+            else:
+                vae.load_state_dict(checkpoint)
+            cnn_features = nn.Sequential(
+                vae.encoder,
+                nn.Flatten(start_dim=1),
+            )
+            # Make VAE trainable for better feature learning
+            for param in cnn_features.parameters():
+                param.requires_grad = True
+            print(f"✓ Loaded VAE encoder (trainable), output size: {cnn_output_size}")
+
+        else:
+            cnn_features = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
+                ),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
+                nn.ReLU(),
+                nn.Flatten(start_dim=1),
+            )
 
         class BoundedNormalParams(nn.Module):
             def __init__(self, min_scale=0.1, max_scale=2.0):
@@ -154,17 +172,34 @@ class SACPolicy:
             )
             print(f"Using noisy actor: found {noisy_count} noisy layer(s)")
 
-        value_cnn = nn.Sequential(
-            nn.Conv2d(
-                in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
-            ),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
-            nn.ReLU(),
-            nn.Flatten(start_dim=1),
-        )
+        if vae_checkpoint_path:
+            from .vae import ConvVAE
+
+            vae_value = ConvVAE(z_dim=32, in_channels=in_channels)
+            checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                vae_value.load_state_dict(checkpoint["state_dict"])
+            else:
+                vae_value.load_state_dict(checkpoint)
+            value_cnn = nn.Sequential(
+                vae_value.encoder,
+                nn.Flatten(start_dim=1),
+            )
+            # Make VAE trainable for better feature learning
+            for param in value_cnn.parameters():
+                param.requires_grad = True
+        else:
+            value_cnn = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
+                ),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
+                nn.ReLU(),
+                nn.Flatten(start_dim=1),
+            )
 
         value_net = nn.Sequential(
             value_cnn,
@@ -177,18 +212,34 @@ class SACPolicy:
 
         self.value = ValueOperator(module=value_net, in_keys=["pixels"])
 
-        # CNN feature extractor for target value network
-        value_cnn_target = nn.Sequential(
-            nn.Conv2d(
-                in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
-            ),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
-            nn.ReLU(),
-            nn.Flatten(start_dim=1),
-        )
+        if vae_checkpoint_path:
+            from .vae import ConvVAE
+
+            vae_target = ConvVAE(z_dim=32, in_channels=in_channels)
+            checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                vae_target.load_state_dict(checkpoint["state_dict"])
+            else:
+                vae_target.load_state_dict(checkpoint)
+            value_cnn_target = nn.Sequential(
+                vae_target.encoder,
+                nn.Flatten(start_dim=1),
+            )
+            # Target VAE will be soft-updated, needs to be trainable
+            for param in value_cnn_target.parameters():
+                param.requires_grad = True
+        else:
+            value_cnn_target = nn.Sequential(
+                nn.Conv2d(
+                    in_channels, 32, kernel_size=8, stride=4, padding=0, device=device
+                ),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0, device=device),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0, device=device),
+                nn.ReLU(),
+                nn.Flatten(start_dim=1),
+            )
 
         value_net_target = nn.Sequential(
             value_cnn_target,
@@ -201,30 +252,46 @@ class SACPolicy:
         self.value_target = ValueOperator(module=value_net_target, in_keys=["pixels"])
 
         class CriticNet(nn.Module):
-            def __init__(self, hidden: int, device):
+            def __init__(self, hidden: int, device, use_vae: bool):
                 super().__init__()
-                self.cnn = nn.Sequential(
-                    nn.Conv2d(
-                        in_channels,
-                        32,
-                        kernel_size=8,
-                        stride=4,
-                        padding=0,
-                        device=device,
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        32, 64, kernel_size=4, stride=2, padding=0, device=device
-                    ),
-                    nn.ReLU(),
-                    nn.Conv2d(
-                        64, 64, kernel_size=3, stride=1, padding=0, device=device
-                    ),
-                    nn.ReLU(),
-                    nn.Flatten(start_dim=1),
-                )
+                if use_vae:
+                    from .vae import ConvVAE
 
-                # Critic input: CNN features (3136) + action (3) = 3139
+                    vae_critic = ConvVAE(z_dim=32, in_channels=in_channels)
+                    checkpoint = torch.load(vae_checkpoint_path, map_location=device)
+                    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                        vae_critic.load_state_dict(checkpoint["state_dict"])
+                    else:
+                        vae_critic.load_state_dict(checkpoint)
+                    self.cnn = nn.Sequential(
+                        vae_critic.encoder,
+                        nn.Flatten(start_dim=1),
+                    )
+                    # Make VAE trainable for better feature learning
+                    for param in self.cnn.parameters():
+                        param.requires_grad = True
+                else:
+                    self.cnn = nn.Sequential(
+                        nn.Conv2d(
+                            in_channels,
+                            32,
+                            kernel_size=8,
+                            stride=4,
+                            padding=0,
+                            device=device,
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            32, 64, kernel_size=4, stride=2, padding=0, device=device
+                        ),
+                        nn.ReLU(),
+                        nn.Conv2d(
+                            64, 64, kernel_size=3, stride=1, padding=0, device=device
+                        ),
+                        nn.ReLU(),
+                        nn.Flatten(start_dim=1),
+                    )
+
                 critic_input_size = cnn_output_size + action_dim
                 self.fc = nn.Sequential(
                     nn.Linear(critic_input_size, hidden, device=device),
@@ -240,11 +307,12 @@ class SACPolicy:
                 x = torch.cat([img_features, act], dim=-1)
                 return self.fc(x)
 
-        q1_net = CriticNet(num_cells, device)
-        q2_net = CriticNet(num_cells, device)
+        use_vae = vae_checkpoint_path is not None
+        q1_net = CriticNet(num_cells, device, use_vae)
+        q2_net = CriticNet(num_cells, device, use_vae)
 
-        q1_net_target = CriticNet(num_cells, device)
-        q2_net_target = CriticNet(num_cells, device)
+        q1_net_target = CriticNet(num_cells, device, use_vae)
+        q2_net_target = CriticNet(num_cells, device, use_vae)
 
         self.q1 = ValueOperator(module=q1_net, in_keys=["pixels", "action"])
         self.q2 = ValueOperator(module=q2_net, in_keys=["pixels", "action"])

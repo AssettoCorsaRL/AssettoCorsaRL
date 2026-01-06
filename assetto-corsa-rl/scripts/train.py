@@ -157,12 +157,14 @@ def train():
     td = env.reset()
 
     # ===== Agent =====
+    vae_path = getattr(cfg, "vae_checkpoint_path", None)
     agent = SACPolicy(
         env=env,
         num_cells=cfg.num_cells,
         device=device,
         use_noisy=cfg.use_noisy,
         noise_sigma=cfg.noise_sigma,
+        vae_checkpoint_path=vae_path,
     )
     modules = agent.modules()
 
@@ -229,6 +231,12 @@ def train():
 
     print("Target network initialized")
 
+    # Check if VAE encoders are trainable
+    if vae_path:
+        trainable_count = sum(1 for p in actor.parameters() if p.requires_grad)
+        print(f"✓ VAE encoders are trainable with target networks for stability")
+        print(f"  Actor has {trainable_count} trainable parameter groups")
+
     # Now print the network summaries
     print("Networks:")
     for name, net in modules.items():
@@ -236,7 +244,8 @@ def train():
         print(f"{name}:")
         print(net)
         num_params = sum(p.numel() for p in net.parameters())
-        print(f"Number of parameters: {num_params}")
+        trainable_params = sum(p.numel() for p in net.parameters() if p.requires_grad)
+        print(f"Number of parameters: {num_params} (trainable: {trainable_params})")
 
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
@@ -248,9 +257,7 @@ def train():
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
 
-    # More moderate target entropy for bounded action spaces
-    # Standard SAC uses -action_dim, but -0.5 * action_dim works better for bounded actions
-    target_entropy = -float(env.action_spec.shape[-1])  # -1.5 for 3D action space
+    target_entropy = -float(env.action_spec.shape[-1])
     print(f"Target entropy: {target_entropy}")
 
     print("using PrioritizedReplayBuffer with LazyTensorStorage")

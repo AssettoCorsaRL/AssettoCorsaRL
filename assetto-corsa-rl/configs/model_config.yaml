@@ -6,14 +6,16 @@ model:
   gamma: 0.99
   tau: 0.05
 
+  vae_checkpoint_path: null
+
   alpha: 0.2
   alpha_lr: 3e-4
   alpha_min: 0.001
 
-  batch_size: 2048
+  batch_size: 512
   replay_size: 1_000_000
 
-  update_every: 512
+  update_every: 32
 
   load_initial: true
 
