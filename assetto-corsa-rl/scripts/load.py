@@ -1,14 +1,13 @@
-"""Load a pretrained SAC model and run episodes to evaluate/visualize it.
-
+"""
 Usage:
+    Record 1 episode:
+    python assetto-corsa-rl\scripts\load.py --model pretrained.pt --episodes 1 --max-steps 1000 --video agent.mp4
+
     Play 5 episodes with rendering (human window):
-    python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 5 --render
+    python assetto-corsa-rl\scripts\load.py --model pretrained.pt --episodes 5 --render
 
     Play 3 episodes on CPU without render:
     python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 3 --device cpu
-
-Options:
-    --deterministic  Use the actor mean (deterministic) instead of sampling actions
 """
 
 import argparse
@@ -16,7 +15,9 @@ import sys
 import os
 from pathlib import Path
 import torch
+import numpy as np
 from tensordict import TensorDict
+import cv2
 
 try:
     from assetto_corsa_rl.env import create_gym_env  # type: ignore
@@ -35,6 +36,33 @@ def load_checkpoint(checkpoint_path, device):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     return ckpt
+
+
+def detect_checkpoint_config(checkpoint):
+    config = {
+        "use_noisy": False,
+        "vae_checkpoint_path": None,
+        "num_cells": 256,
+    }
+
+    if "config" in checkpoint:
+        saved_config = checkpoint["config"]
+        config["use_noisy"] = saved_config.get("use_noisy", False)
+        config["vae_checkpoint_path"] = saved_config.get("vae_checkpoint_path", None)
+        config["num_cells"] = saved_config.get("num_cells", 256)
+        print(
+            f"Found saved config: use_noisy={config['use_noisy']}, vae={config['vae_checkpoint_path']}"
+        )
+        return config
+
+    if "actor_state" in checkpoint:
+        actor_keys = checkpoint["actor_state"].keys()
+        config["use_noisy"] = any(
+            "_layer.mu_weight" in k or "_layer.sigma_weight" in k for k in actor_keys
+        )
+        print(f"Detected from state_dict: use_noisy={config['use_noisy']}")
+
+    return config
 
 
 def deterministic_action_from_actor(actor, pixels):
@@ -78,14 +106,34 @@ def play(
     render=False,
     deterministic=False,
     seed=None,
+    video_path=None,
 ):
     device = torch.device(device) if device else get_device()
     print(f"Using device: {device}")
 
-    render_mode = "human" if render else None
+    if video_path:
+        render_mode = "rgb_array"
+        print(f"Video recording enabled: {video_path}")
+    else:
+        render_mode = "human" if render else None
+
     env = create_gym_env(device=device, num_envs=1, render_mode=render_mode)
 
-    policy = SACPolicy(env=env, device=device)
+    checkpoint = load_checkpoint(model_path, device)
+    model_config = detect_checkpoint_config(checkpoint)
+
+    print(
+        f"Creating policy with: use_noisy={model_config['use_noisy']}, "
+        f"num_cells={model_config['num_cells']}, vae={model_config['vae_checkpoint_path']}"
+    )
+
+    policy = SACPolicy(
+        env=env,
+        device=device,
+        use_noisy=model_config["use_noisy"],
+        num_cells=model_config["num_cells"],
+        vae_checkpoint_path=model_config["vae_checkpoint_path"],
+    )
     modules = policy.modules()
     actor = modules["actor"]
     value = modules["value"]
@@ -197,7 +245,6 @@ def play(
                 "Warning: Some lazy parameters remain uninitialized after retries; load_state_dict may fail."
             )
 
-    checkpoint = load_checkpoint(model_path, device)
     try:
         if "actor_state" in checkpoint:
             actor.load_state_dict(checkpoint["actor_state"])
@@ -230,8 +277,22 @@ def play(
         total_reward = 0.0
         steps = 0
 
+        if video_path:
+            frames = []
+
         while steps < max_steps:
             pixels = inner["pixels"][:1].to(device)
+
+            if video_path and render_mode == "rgb_array":
+                try:
+                    frame = env.render()
+                    if frame is not None:
+                        if isinstance(frame, list) and len(frame) > 0:
+                            frame = frame[0]
+                        if isinstance(frame, np.ndarray):
+                            frames.append(frame)
+                except Exception as e:
+                    print(f"Warning: failed to capture frame: {e}")
 
             with torch.no_grad():
                 if deterministic:
@@ -283,6 +344,38 @@ def play(
             f"Episode {ep+1}/{episodes} finished: steps={steps}, reward={total_reward:.2f}"
         )
 
+        if video_path and len(frames) > 0:
+            try:
+                import cv2
+
+                if episodes > 1:
+                    base, ext = os.path.splitext(video_path)
+                    out_path = f"{base}_ep{ep+1}{ext}"
+                else:
+                    out_path = video_path
+
+                first_frame = frames[0]
+                if not isinstance(first_frame, np.ndarray):
+                    print(
+                        f"Warning: frames are not numpy arrays (type: {type(first_frame)})"
+                    )
+                    continue
+
+                height, width = first_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                out = cv2.VideoWriter(out_path, fourcc, 30.0, (width, height))
+
+                for frame in frames:
+                    if isinstance(frame, np.ndarray):
+                        # Convert RGB to BGR for OpenCV
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        out.write(frame_bgr)
+
+                out.release()
+                print(f"✓ Saved video to: {out_path} ({len(frames)} frames)")
+            except Exception as e:
+                print(f"Warning: failed to save video: {e}")
+
     print(
         f"Average reward over {len(episode_returns)} episodes: {sum(episode_returns)/len(episode_returns):.2f}"
     )
@@ -316,6 +409,12 @@ def parse_args():
         "--deterministic", action="store_true", help="Use deterministic (mean) actions"
     )
     parser.add_argument("--seed", type=int, default=None, help="Optional random seed")
+    parser.add_argument(
+        "--video",
+        type=str,
+        default=None,
+        help="Path to save video recording (e.g., agent.mp4)",
+    )
     return parser.parse_args()
 
 
@@ -329,6 +428,7 @@ def main():
         render=args.render,
         deterministic=args.deterministic,
         seed=args.seed,
+        video_path=args.video,
     )
 
 

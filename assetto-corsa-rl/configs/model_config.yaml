@@ -10,7 +10,7 @@ model:
 
   alpha: 0.2
   alpha_lr: 3e-4
-  alpha_min: 0.001
+  alpha_min: 0.1
 
   batch_size: 512
   replay_size: 1_000_000
@@ -19,8 +19,13 @@ model:
 
   load_initial: true
 
-  use_noisy: true
+  use_noisy: false
   noise_sigma: 0.5
 
   per_alpha: 0.6
   per_beta: 0.4
+
+  #* exploration - IGNORE IF NOISY NETS ARE USED!!!!!
+  explore_start: 0.25
+  explore_end: 0.03
+  explore_steps: 500_000

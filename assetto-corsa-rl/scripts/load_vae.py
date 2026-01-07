@@ -22,13 +22,13 @@ import matplotlib
 matplotlib.use("TkAgg")  # Interactive backend
 
 try:
-    from assetto_corsa_rl.model.vae import ConvVAE
+    from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[1]
     src_path = str(repo_root / "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
-    from assetto_corsa_rl.model.vae import ConvVAE
+    from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 
 import gymnasium as gym
 from torchvision import transforms as T

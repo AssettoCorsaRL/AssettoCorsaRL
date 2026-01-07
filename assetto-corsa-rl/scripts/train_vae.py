@@ -1,6 +1,6 @@
-"""Train VAE on CarRacing environment with frame stacking.
-
-python assetto-corsa-rl/scripts/train_vae.py --epochs 10 --batch-size 128 --steps-per-epoch 500
+"""
+Usage:
+    python assetto-corsa-rl/scripts/train_vae.py --epochs 10 --batch-size 128 --steps-per-epoch 500
 """
 
 from __future__ import annotations
@@ -21,9 +21,8 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 try:
-    from assetto_corsa_rl.model.vae import ConvVAE
+    from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 except Exception:
-    # If package import fails, try relative import fallback
     from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 
 import lightning as pl
@@ -32,7 +31,7 @@ from lightning.pytorch.loggers import WandbLogger
 import os
 
 
-# ------------------------------- action generation -------------------------------
+# ===== action generation =====
 
 
 def generate_action(prev_action: np.ndarray) -> np.ndarray:
@@ -55,7 +54,7 @@ def generate_action(prev_action: np.ndarray) -> np.ndarray:
     return action * mask
 
 
-# ------------------------------- dataset ----------------------------------------
+# ===== dataset =====
 
 
 class CarRacingIterableDataset(IterableDataset):
@@ -141,7 +140,7 @@ class CarRacingIterableDataset(IterableDataset):
                 pass
 
 
-# ------------------------------- training helper -------------------------------
+# ===== training helper =====
 
 
 def make_dataloaders(
@@ -189,9 +188,6 @@ def make_dataloaders(
     )
 
     return train_loader, val_loader
-
-
-# ------------------------------- CLI and main ----------------------------------
 
 
 def parse_args() -> argparse.Namespace:

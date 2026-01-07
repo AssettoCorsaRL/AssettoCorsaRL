@@ -6,7 +6,7 @@ train:
   seed: 6741
   device: null # null = auto-select (GPU if available, else CPU) use gpu:id or cpu to force
 
-  pretrained_model: "pretrained.pt" #! UNTESTED
+  pretrained_model: "sac_checkpoint_9904128.pt"
 
   wandb:
     enabled: true

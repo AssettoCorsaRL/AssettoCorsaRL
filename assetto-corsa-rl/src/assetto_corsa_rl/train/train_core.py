@@ -342,14 +342,9 @@ class Trainer:
             next_q2 = self.q2_target(next_pixels_b, next_actions).view(-1, 1)
             next_min_q = torch.min(next_q1, next_q2)
 
-            # SAC target with entropy regularization
-            if self.log_alpha is not None:
-                alpha = self.log_alpha.exp()
-                # Clamp alpha to prevent entropy collapse
-                alpha_min = getattr(self.cfg, "alpha_min", 0.01)
-                alpha = torch.clamp(alpha, min=alpha_min)
-            else:
-                alpha = self.cfg.alpha
+            alpha = (
+                self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
+            )
 
             # V(s') = min_i Q_i(s', a') - α * log π(a'|s')
             next_v = next_min_q - alpha * (
@@ -490,19 +485,14 @@ class Trainer:
         if self.log_alpha is not None and self.alpha_opt is not None:
             # Tune alpha to maintain target entropy
             # We want: E[-log π(a|s)] ≈ target_entropy
-            alpha_loss = -(
-                self.log_alpha * (log_prob_new.detach() + self.target_entropy)
-            ).mean()
+            with torch.no_grad():
+                entropy_error = log_prob_new + self.target_entropy
+            alpha_loss = -(self.log_alpha * entropy_error).mean()
 
             self.alpha_opt.zero_grad()
             alpha_loss.backward()
             torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
             self.alpha_opt.step()
-
-            # Clamp log_alpha to prevent entropy collapse
-            alpha_min = getattr(self.cfg, "alpha_min", 0.01)
-            with torch.no_grad():
-                self.log_alpha.data.clamp_(min=math.log(alpha_min))
 
         # ===== Soft Update Target Networks =====
         self._soft_update_target()
@@ -628,6 +618,13 @@ class Trainer:
                     "critic_opt": self.critic_opt.state_dict(),
                     "value_opt": self.value_opt.state_dict(),
                     "steps": self.total_steps,
+                    "config": {
+                        "use_noisy": getattr(self.cfg, "use_noisy", False),
+                        "num_cells": getattr(self.cfg, "num_cells", 256),
+                        "vae_checkpoint_path": getattr(
+                            self.cfg, "vae_checkpoint_path", None
+                        ),
+                    },
                 },
                 f".\\models\\sac_checkpoint_{self.total_steps}.pt",
             )

@@ -68,7 +68,7 @@ def load_cfg_from_yaml(root: Path = None):
     env = _read(env_p).get("environment", {})
     model = _read(model_p).get("model", {})
     train_raw = _read(train_p)
-    # Support both keys 'train' and 'training' to be robust to config variants
+
     if isinstance(train_raw, dict):
         train = {**train_raw.get("train", {}), **train_raw.get("training", {})}
     else:
@@ -180,29 +180,21 @@ def train():
     q1_target = modules["q1_target"]
     q2_target = modules["q2_target"]
 
-    # Optional: Apply custom initialization
-    # def init_optimistic(m):
-    #     if isinstance(m, nn.Linear):
-    #         nn.init.constant_(m.bias, 1.0)  # Optimistic bias
-    #         nn.init.xavier_uniform_(m.weight, gain=0.01)  # Small weights
-    # q1.apply(init_optimistic)
-    # q2.apply(init_optimistic)
-
     print("Networks initialized with explicit dimensions")
 
-    # Load pretrained model if specified
+    # pretrained model if specified
     pretrained_path = getattr(cfg, "pretrained_model", None)
     if pretrained_path is not None and pretrained_path:
         print(f"Loading pretrained model from {pretrained_path}...")
         try:
             checkpoint = torch.load(pretrained_path, map_location=device)
 
-            # Load actor state
+            # load actor state
             if "actor_state" in checkpoint:
                 actor.load_state_dict(checkpoint["actor_state"])
                 print("Loaded actor state from pretrained model")
 
-            # Load critic states
+            # load critic states
             if "q1_state" in checkpoint:
                 q1.load_state_dict(checkpoint["q1_state"])
                 print("Loaded Q1 state from pretrained model")
@@ -210,12 +202,12 @@ def train():
                 q2.load_state_dict(checkpoint["q2_state"])
                 print("Loaded Q2 state from pretrained model")
 
-            # Load value state
+            # load value state
             if "value_state" in checkpoint:
                 value.load_state_dict(checkpoint["value_state"])
                 print("Loaded value state from pretrained model")
 
-            # Copy to target networks
+            # copy to target networks
             value_target.load_state_dict(value.state_dict())
             q1_target.load_state_dict(q1.state_dict())
             q2_target.load_state_dict(q2.state_dict())
@@ -231,13 +223,12 @@ def train():
 
     print("Target network initialized")
 
-    # Check if VAE encoders are trainable
+    # check if VAE encoders are trainable
     if vae_path:
         trainable_count = sum(1 for p in actor.parameters() if p.requires_grad)
         print(f"✓ VAE encoders are trainable with target networks for stability")
         print(f"  Actor has {trainable_count} trainable parameter groups")
 
-    # Now print the network summaries
     print("Networks:")
     for name, net in modules.items():
         print("=" * 40)

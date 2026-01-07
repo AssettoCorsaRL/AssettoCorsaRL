@@ -18,7 +18,7 @@ def create_gym_env(
     num_envs: int = 1,
     render_mode: str = None,
     domain_randomize=False,
-    fixed_track_seed: Optional[int] = None,
+    fixed_track_seed=6741,
 ) -> ParallelEnv:
     class FixedSeedGymEnv(GymEnv):
         def __init__(self, *args, fixed_seed: Optional[int] = None, **kwargs):
