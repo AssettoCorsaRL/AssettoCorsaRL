@@ -1,7 +1,7 @@
 """
 Usage:
     Record 1 episode:
-    python assetto-corsa-rl\scripts\load.py --model pretrained.pt --episodes 1 --max-steps 1000 --video agent.mp4
+    python assetto-corsa-rl\scripts\car-racing\load.py --model pretrained.pt --episodes 1 --max-steps 1000 --video agent.mp4
 
     Play 5 episodes with rendering (human window):
     python assetto-corsa-rl\scripts\load.py --model pretrained.pt --episodes 5 --render

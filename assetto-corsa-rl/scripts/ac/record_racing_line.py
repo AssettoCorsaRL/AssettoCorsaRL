@@ -21,7 +21,7 @@ _src_path = str((_repo_root / "src").resolve())
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
-from assetto_corsa_rl.ac_telemetry_helper import Telemetry
+from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
 
 
 class RacingLineRecorder:

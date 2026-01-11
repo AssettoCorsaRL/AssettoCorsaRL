@@ -13,7 +13,7 @@ _src_path = str((_repo_root / "src").resolve())
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
-from assetto_corsa_rl.ac_env import make_env, AssettoCorsa
+from assetto_corsa_rl.ac_env import make_env, AssettoCorsa  # type: ignore
 
 
 class TestAssettoCorsa:

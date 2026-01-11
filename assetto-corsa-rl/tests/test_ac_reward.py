@@ -22,6 +22,8 @@ if _src_path not in sys.path:
 from assetto_corsa_rl.ac_env import AssettoCorsa
 import numpy as np
 
+import matplotlib.pyplot as plt
+
 
 def test_reward_monitoring(
     racing_line_path: str = None,
@@ -29,6 +31,7 @@ def test_reward_monitoring(
     reward_per_m_advanced: float = 1.0,
     speed_reward: float = 0.1,
     ms_per_action: float = 20.0,
+    show_image: bool = False,
 ):
     """Monitor and print rewards from current AC state."""
 
@@ -58,6 +61,14 @@ def test_reward_monitoring(
     print(f"  MS per action: {ms_per_action}")
     print("=" * 60)
 
+    fig, ax = None, None
+
+    print("\n✓ Image display enabled")
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_title("Assetto Corsa View")
+    ax.axis("off")
+
     try:
         print("\n🔴 Monitoring rewards... (Press Ctrl+C to stop)\n")
 
@@ -65,7 +76,6 @@ def test_reward_monitoring(
         total_reward = 0.0
 
         while True:
-            # Get current observation
             obs = env._get_observation()
             data = env._last_obs
 
@@ -74,7 +84,6 @@ def test_reward_monitoring(
                 time.sleep(0.1)
                 continue
 
-            # Check if episode is done
             if env._check_done(obs, data):
                 print("\n\n✓ Episode completed!")
 
@@ -87,6 +96,15 @@ def test_reward_monitoring(
             position = data.get("car", {}).get("world_location", [0, 0, 0])
             velocity = data.get("car", {}).get("velocity", [0, 0, 0])
             speed = np.linalg.norm(velocity)
+
+            if show_image:
+                img = env.telemetry.get_latest_image()
+                if img is not None:
+                    ax.clear()
+                    ax.imshow(img)
+                    ax.set_title(f"Assetto Corsa View - Step {step_count}")
+                    ax.axis("off")
+                    plt.pause(0.00001)
 
             print(f"\r[Step {step_count:4d}] ", end="")
             print(f"Reward: {reward:8.3f} | ", end="")
@@ -116,6 +134,8 @@ def test_reward_monitoring(
             print(f"  Final progress: {env._meters_advanced:.1f} meters")
 
     finally:
+        if fig is not None:
+            plt.close(fig)
         env.close()
         print("\n✓ Environment closed")
 
@@ -175,6 +195,7 @@ def main():
         reward_per_m_advanced=args.progress_reward,
         speed_reward=args.speed_reward,
         ms_per_action=args.ms_per_action,
+        show_image=True,
     )
 
 
