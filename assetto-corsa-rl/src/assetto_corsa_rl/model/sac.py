@@ -114,9 +114,19 @@ class SACPolicy:
         min_scale = torch.tensor([1e-3, 1e-3, 1e-3], device=device)
         max_scale = torch.tensor([1.0, 0.5, 0.5], device=device)
 
+        # Use LazyLinear for the first projection so it adapts to the actual
+        # flattened conv output size (handles minor shape drift from upstream
+        # transforms without crashing). Noisy nets still use the fixed-size
+        # layer because the custom noisy layer is not lazy-aware.
+        first_linear = (
+            _make_linear(cnn_output_size, num_cells)
+            if self.use_noisy
+            else nn.LazyLinear(num_cells, device=device)
+        )
+
         actor_net = nn.Sequential(
             cnn_features,
-            _make_linear(cnn_output_size, num_cells),
+            first_linear,
             nn.Tanh(),
             _make_linear(num_cells, num_cells),
             nn.Tanh(),
@@ -206,9 +216,15 @@ class SACPolicy:
                 nn.Flatten(start_dim=1),
             )
 
+        value_first_linear = (
+            nn.Linear(cnn_output_size, num_cells, device=device)
+            if self.use_noisy
+            else nn.LazyLinear(num_cells, device=device)
+        )
+
         value_net = nn.Sequential(
             value_cnn,
-            nn.Linear(cnn_output_size, num_cells, device=device),
+            value_first_linear,
             nn.Tanh(),
             nn.Linear(num_cells, num_cells, device=device),
             nn.Tanh(),

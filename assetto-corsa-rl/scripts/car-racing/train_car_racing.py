@@ -33,6 +33,11 @@ from torchrl.data.replay_buffers import (
 )
 from tensordict import TensorDict
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+
 
 def init_weights(m):
     if isinstance(m, nn.Linear):
@@ -126,6 +131,9 @@ def load_cfg_from_yaml(root: Path = None):
     return cfg
 
 
+@cli_command(
+    group="car-racing", name="train", help="Train SAC agent in CarRacing environment"
+)
 def train():
 
     cfg = load_cfg_from_yaml()

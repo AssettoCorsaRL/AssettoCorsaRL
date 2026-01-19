@@ -6,6 +6,7 @@ import time
 import json
 from pathlib import Path
 import cv2
+import torch
 
 from .ac_send_actions import XboxController
 from .ac_telemetry_helper import Telemetry
@@ -320,6 +321,8 @@ class AssettoCorsa(gym.Env):
         Returns:
             observation, reward, terminated, truncated, info
         """
+        action = np.asarray(action).flatten()
+
         steering = float(np.clip(action[0], -1.0, 1.0))
         throttle = float(np.clip(action[1], 0.0, 1.0))
         brake = float(np.clip(action[2], 0.0, 1.0))
@@ -385,3 +388,145 @@ def make_env(
         racing_line_path=racing_line_path,
         **kwargs,
     )
+
+
+# Utility functions
+def parse_image_shape(shape_str: str) -> Tuple[int, int]:
+    """Parse image shape string like '84x84' into (height, width) tuple.
+
+    Args:
+        shape_str: String in format 'HxW' (e.g., '84x84')
+
+    Returns:
+        Tuple of (height, width)
+
+    Raises:
+        ValueError: If format is invalid
+    """
+    try:
+        parts = shape_str.lower().split("x")
+        if len(parts) != 2:
+            raise ValueError(f"Expected format 'HxW', got '{shape_str}'")
+        height, width = int(parts[0]), int(parts[1])
+        return height, width
+    except (ValueError, IndexError) as e:
+        raise ValueError(
+            f"Invalid image shape format '{shape_str}'. Expected format like '84x84'"
+        ) from e
+
+
+def get_device(device_str: Optional[str] = None) -> torch.device:
+    """Get torch device, defaulting to CUDA if available.
+
+    Args:
+        device_str: Optional device string ('cuda', 'cpu', 'mps', etc.)
+
+    Returns:
+        torch.device instance
+    """
+    if device_str is not None:
+        return torch.device(device_str)
+
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cpu")
+
+
+def create_transformed_env(
+    racing_line_path: str = "racing_lines.json",
+    device: Optional[torch.device] = None,
+    host: str = "127.0.0.1",
+    send_port: int = 9877,
+    recv_port: int = 9876,
+    image_shape: Tuple[int, int] = (84, 84),
+    frame_stack: int = 4,
+    **env_kwargs,
+):
+    """Create an AssettoCorsa environment with standard transforms for vision-based RL.
+
+    Args:
+        racing_line_path: Path to racing line JSON file
+        device: Torch device (defaults to CUDA if available)
+        host: Telemetry host address
+        send_port: Port for sending actions
+        recv_port: Port for receiving telemetry
+        image_shape: Target image dimensions (H, W)
+        frame_stack: Number of frames to stack
+        **env_kwargs: Additional arguments passed to AssettoCorsa
+
+    Returns:
+        TransformedEnv instance ready for training/testing
+    """
+    from torchrl.envs import GymWrapper, TransformedEnv
+    from torchrl.envs.transforms import (
+        Compose,
+        ToTensorImage,
+        Resize,
+        CatFrames,
+        RenameTransform,
+    )
+
+    if device is None:
+        device = get_device()
+
+    h, w = image_shape
+
+    env = AssettoCorsa(
+        host=host,
+        send_port=send_port,
+        recv_port=recv_port,
+        racing_line_path=racing_line_path,
+        include_image=True,
+        observation_image_shape=(h, w),
+        **env_kwargs,
+    )
+
+    base_env = GymWrapper(env, device=device)
+    transform = Compose(
+        RenameTransform(in_keys=["image"], out_keys=["pixels"]),
+        ToTensorImage(from_int=True, in_keys=["pixels"], out_keys=["pixels"]),
+        Resize(h=h, w=w, in_keys=["pixels"], out_keys=["pixels"]),
+        CatFrames(N=frame_stack, in_keys=["pixels"], out_keys=["pixels"], dim=-3),
+    )
+
+    return TransformedEnv(base_env, transform)
+
+
+def create_mock_env(device: Optional[torch.device] = None):
+    """Create a minimal mock environment for initializing models without AC running.
+
+    Useful for loading pretrained models or initializing architectures.
+
+    Args:
+        device: Torch device (defaults to CUDA if available)
+
+    Returns:
+        Mock environment object with action_spec and observation_spec
+    """
+    from torchrl.data import (
+        BoundedTensorSpec,
+        CompositeSpec,
+        UnboundedContinuousTensorSpec,
+    )
+
+    if device is None:
+        device = get_device()
+
+    class MockEnv:
+        def __init__(self, device):
+            self.device = device
+            # Match AssettoCorsa action space: [steering, throttle, brake]
+            self.action_spec = BoundedTensorSpec(
+                low=-1.0, high=1.0, shape=(3,), dtype=torch.float32, device=device
+            )
+            # Vision-based observation: 4 stacked 84x84 grayscale frames
+            self.observation_spec = CompositeSpec(
+                pixels=UnboundedContinuousTensorSpec(
+                    shape=(4, 84, 84), dtype=torch.float32, device=device
+                )
+            )
+
+    return MockEnv(device)

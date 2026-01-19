@@ -30,6 +30,11 @@ except Exception:
     from assetto_corsa_rl.env_helper import create_gym_env  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+
 
 def load_checkpoint(checkpoint_path, device):
     if not os.path.exists(checkpoint_path):
@@ -418,7 +423,20 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+@cli_command(
+    group="car-racing", name="test", help="Test a trained SAC agent in CarRacing"
+)
+@cli_option("--model", required=True, help="Path to pretrained model (.pt)")
+@cli_option("--device", default=None, help="Device to use (e.g., cuda:0, cpu)")
+@cli_option("--episodes", default=5, help="Number of episodes to play")
+@cli_option("--max-steps", default=1000, help="Max steps per episode")
+@cli_option("--render", is_flag=True, help="Render environment to screen")
+@cli_option("--deterministic", is_flag=True, help="Use deterministic (mean) actions")
+@cli_option("--seed", default=None, type=int, help="Optional random seed")
+@cli_option(
+    "--video", default=None, help="Path to save video recording (e.g., agent.mp4)"
+)
+def main(model, device, episodes, max_steps, render, deterministic, seed, video):
     args = parse_args()
     play(
         model_path=args.model,

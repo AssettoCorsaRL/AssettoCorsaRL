@@ -88,9 +88,34 @@ class Trainer:
             cfg, "update_every", cfg.num_envs
         )  # Default: update after each batch from all envs
 
+        self._updates_count = 0
+        self._updates_per_step = getattr(cfg, "updates_per_step", 1)
+        self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
+        self._freeze_encoder_steps = getattr(cfg, "freeze_encoder_steps", 0)
+        self._encoder_frozen = False
+
     def _get_alpha_value(self):
         """Return current alpha value (prefer model parameter if present)."""
         return float(self.log_alpha.exp().item())
+
+    def _set_encoder_requires_grad(self, requires_grad: bool):
+        """Enable or disable gradients for visual encoder layers in all networks."""
+        # This assumes actor, value, q1, q2 have a .cnn or the first few layers are the encoder
+        # In our SACPolicy, they have separate sequences.
+        for net in [self.actor, self.value, self.q1, self.q2]:
+            if net is None:
+                continue
+            # Try to find the CNN part. In SACPolicy:
+            # actor: cnn_features (first element of Sequential)
+            # value: value_cnn (first element)
+            # q1/q2: .cnn attribute
+
+            # Module handles recurisvely
+            for name, module in net.named_modules():
+                # Heuristic: layers called 'cnn' or involving Conv2d are usually the encoder
+                if "cnn" in name.lower() or isinstance(module, torch.nn.Conv2d):
+                    for param in module.parameters():
+                        param.requires_grad = requires_grad
 
     def _step_random(self):
         actions = sample_random_action(self.cfg.num_envs)
@@ -143,8 +168,10 @@ class Trainer:
                 self._steps_since_update += self.cfg.num_envs
                 if self._steps_since_update >= self._update_every:
                     # Do one or more gradient updates
-                    num_updates = max(1, self._steps_since_update // self._update_every)
-                    for _ in range(num_updates):
+                    num_base_updates = max(
+                        1, self._steps_since_update // self._update_every
+                    )
+                    for _ in range(num_base_updates * self._updates_per_step):
                         if len(self.rb) >= self.cfg.batch_size:
                             self._do_update()
                     self._steps_since_update = 0
@@ -157,6 +184,8 @@ class Trainer:
         with torch.no_grad():
             inner_obs = get_inner(self.current_td)
             pixels_only = inner_obs["pixels"]
+            if pixels_only.dim() == 3:
+                pixels_only = pixels_only.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
             actor_input = TensorDict(
                 {"pixels": pixels_only}, batch_size=[pixels_only.shape[0]]
             )
@@ -223,6 +252,13 @@ class Trainer:
 
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
+
+        # Ensure we have a batch dimension even if num_envs=1 and batch_size is empty
+        if pixels.ndim == 3:
+            pixels = pixels.unsqueeze(0)
+        if next_pixels.ndim == 3:
+            next_pixels = next_pixels.unsqueeze(0)
+
         for i in range(self.cfg.num_envs):
             add_transition(self.rb, i, pixels, next_pixels, actions, rewards, dones)
 
@@ -292,6 +328,26 @@ class Trainer:
 
     # ===== Updates =====
     def _do_update(self):
+        # Handle visual encoder freezing/unfreezing logic
+        if self._freeze_encoder_steps > 0:
+            if (
+                self.total_steps < self._freeze_encoder_steps
+                and not self._encoder_frozen
+            ):
+                self._set_encoder_requires_grad(False)
+                self._encoder_frozen = True
+                print(
+                    f"[INFO] Visual encoder frozen (step {self.total_steps} < {self._freeze_encoder_steps})"
+                )
+            elif (
+                self.total_steps >= self._freeze_encoder_steps and self._encoder_frozen
+            ):
+                self._set_encoder_requires_grad(True)
+                self._encoder_frozen = False
+                print(
+                    f"[INFO] Visual encoder unfrozen (step {self.total_steps} >= {self._freeze_encoder_steps})"
+                )
+
         # Sample with return_info=True to get indices for priority updates
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
 
@@ -299,6 +355,10 @@ class Trainer:
         batch_indices = info.get("index", None)
 
         pixels_b = batch["pixels"]
+
+        # Debug: print sampled batch shape
+        if self.total_steps % 500 == 0:
+            print(f"[DEBUG] pixels_b from batch shape: {pixels_b.shape}")
 
         # NOTE: Do NOT sample noise during gradient updates
         # Noisy networks should only resample during environment rollout
@@ -405,115 +465,145 @@ class Trainer:
         self.critic_opt.step()
 
         # ===== Actor Update =====
-        # store old policy for KL penalty
-        with torch.no_grad():
-            td_in_old = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
-            out_old = self.actor(td_in_old)
-            old_loc = out_old["loc"].detach()
-            old_scale = out_old["scale"].detach()
-
-        # sample actions from current policy
-        td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
-        out = self.actor(td_in)
-        new_actions = fix_action_shape(
-            out["action"], pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
-        )
-
-        log_prob_new = out["action_log_prob"]
-        if log_prob_new is None:
-            print(
-                f"WARNING: No log_prob returned! Actor output keys: {list(out.keys())}"
-            )
-            log_prob_new = torch.zeros((new_actions.shape[0], 1), device=self.device)
-
-        if log_prob_new.ndim == 1:
-            log_prob_new = log_prob_new.view(-1, 1)
-
-        wandb.log(
-            {
-                "actor/loc_mean": out["loc"].mean().item(),
-                "actor/loc_std": out["loc"].std().item(),
-                "actor/loc_max": out["loc"].max().item(),
-                "actor/scale_mean": out["scale"].mean().item(),
-                "actor/scale_min": out["scale"].min().item(),
-                "actor/scale_max": out["scale"].max().item(),
-            },
-            step=self.total_steps,
-        )
-
-        # compute Q-values for new actions (clipped double-Q)
-        q1_new = self.q1(pixels_b, new_actions).view(-1, 1)
-        q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
-        min_q_new = torch.min(q1_new, q2_new)
-
-        # compute KL divergence between old and new policy (Gaussian KL)
-        # KL(N(μ1,σ1)||N(μ2,σ2)) = log(σ2/σ1) + (σ1² + (μ1-μ2)²)/(2σ2²) - 1/2
-        new_loc = out["loc"]
-        new_scale = out["scale"]
-        kl_div = (
-            torch.log(old_scale / new_scale)
-            + (new_scale.pow(2) + (new_loc - old_loc).pow(2)) / (2 * old_scale.pow(2))
-            - 0.5
-        ).sum(dim=-1, keepdim=True)
-
-        # KL penalty coefficient (can be made configurable)
-        beta_kl = getattr(self.cfg, "beta_kl", 0.001)
-        kl_penalty = beta_kl * kl_div
-
-        # Log KL divergence immediately after computation
-        wandb.log(
-            {
-                "actor/kl_divergence_instant": kl_div.mean().item(),
-                "actor/kl_divergence_max": kl_div.max().item(),
-                "actor/kl_divergence_min": kl_div.min().item(),
-                "actor/kl_penalty_instant": kl_penalty.mean().item(),
-            },
-            step=self.total_steps,
-        )
-
-        # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
-        # Equivalently: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
-        actor_loss = (alpha.detach() * log_prob_new - min_q_new + kl_penalty).mean()
-
-        self.actor_opt.zero_grad()
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
-        self.actor_opt.step()
-
-        # ===== Alpha (Temperature) Update =====
-        alpha_loss = None
-        if self.log_alpha is not None and self.alpha_opt is not None:
-            # Tune alpha to maintain target entropy
-            # We want: E[-log π(a|s)] ≈ target_entropy
+        self._updates_count += 1
+        if self._updates_count % self._actor_update_delay == 0:
+            # store old policy for KL penalty
             with torch.no_grad():
-                entropy_error = log_prob_new + self.target_entropy
-            alpha_loss = -(self.log_alpha * entropy_error).mean()
+                td_in_old = TensorDict(
+                    {"pixels": pixels_b}, batch_size=pixels_b.shape[0]
+                )
+                out_old = self.actor(td_in_old)
+                old_loc = out_old["loc"].detach()
+                old_scale = out_old["scale"].detach()
 
-            self.alpha_opt.zero_grad()
-            alpha_loss.backward()
-            torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
-            self.alpha_opt.step()
+            # sample actions from current policy
+            td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
+            out = self.actor(td_in)
+            new_actions = fix_action_shape(
+                out["action"],
+                pixels_b.shape[0],
+                action_dim=self.env.action_spec.shape[-1],
+            )
+
+            log_prob_new = out["action_log_prob"]
+            if log_prob_new is None:
+                print(
+                    f"WARNING: No log_prob returned! Actor output keys: {list(out.keys())}"
+                )
+                log_prob_new = torch.zeros(
+                    (new_actions.shape[0], 1), device=self.device
+                )
+
+            if log_prob_new.ndim == 1:
+                log_prob_new = log_prob_new.view(-1, 1)
+
+            wandb.log(
+                {
+                    "actor/loc_mean": out["loc"].mean().item(),
+                    "actor/loc_std": out["loc"].std().item(),
+                    "actor/loc_max": out["loc"].max().item(),
+                    "actor/scale_mean": out["scale"].mean().item(),
+                    "actor/scale_min": out["scale"].min().item(),
+                    "actor/scale_max": out["scale"].max().item(),
+                },
+                step=self.total_steps,
+            )
+
+            # compute Q-values for new actions (clipped double-Q)
+            q1_new = self.q1(pixels_b, new_actions).view(-1, 1)
+            q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
+            min_q_new = torch.min(q1_new, q2_new)
+
+            # compute KL divergence between old and new policy (Gaussian KL)
+            # KL(N(μ1,σ1)||N(μ2,σ2)) = log(σ2/σ1) + (σ1² + (μ1-μ2)²)/(2σ2²) - 1/2
+            new_loc = out["loc"]
+            new_scale = out["scale"]
+            kl_div = (
+                torch.log(old_scale / new_scale)
+                + (new_scale.pow(2) + (new_loc - old_loc).pow(2))
+                / (2 * old_scale.pow(2))
+                - 0.5
+            ).sum(dim=-1, keepdim=True)
+
+            # KL penalty coefficient (can be made configurable)
+            beta_kl = getattr(self.cfg, "beta_kl", 0.001)
+            kl_penalty = beta_kl * kl_div
+
+            # Log KL divergence immediately after computation
+            wandb.log(
+                {
+                    "actor/kl_divergence_instant": kl_div.mean().item(),
+                    "actor/kl_divergence_max": kl_div.max().item(),
+                    "actor/kl_divergence_min": kl_div.min().item(),
+                    "actor/kl_penalty_instant": kl_penalty.mean().item(),
+                },
+                step=self.total_steps,
+            )
+
+            # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
+            # Equivalently: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
+            actor_loss = (alpha.detach() * log_prob_new - min_q_new + kl_penalty).mean()
+
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.actor.parameters(), self.cfg.max_grad_norm
+            )
+            self.actor_opt.step()
+
+            # ===== Alpha (Temperature) Update =====
+            alpha_loss = None
+            if self.log_alpha is not None and self.alpha_opt is not None:
+                # Tune alpha to maintain target entropy
+                # We want: E[-log π(a|s)] ≈ target_entropy
+                with torch.no_grad():
+                    entropy_error = log_prob_new + self.target_entropy
+                alpha_loss = -(self.log_alpha * entropy_error).mean()
+
+                self.alpha_opt.zero_grad()
+                alpha_loss.backward()
+                torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
+                self.alpha_opt.step()
+        else:
+            # skipped actor update; set dummy values for logging if needed
+            actor_loss = None
+            alpha_loss = None
+            log_prob_new = None
+            min_q_new = None
+            kl_div = None
+            kl_penalty = None
+            beta_kl = getattr(self.cfg, "beta_kl", 0.001)
 
         # ===== Soft Update Target Networks =====
         self._soft_update_target()
 
         # ===== Logging =====
         try:
-            current_entropy = -log_prob_new.mean().item()
+            current_entropy = (
+                -log_prob_new.mean().item() if log_prob_new is not None else 0.0
+            )
             log_dict = {
                 "loss/critic_loss": critic_loss.item(),
                 "loss/q1_loss": q1_loss.item(),
                 "loss/q2_loss": q2_loss.item(),
-                "loss/actor_loss": actor_loss.item(),
-                "loss/kl_penalty": kl_penalty.mean().item(),
+                "loss/actor_loss": (
+                    actor_loss.item() if actor_loss is not None else 0.0
+                ),
+                "loss/kl_penalty": (
+                    kl_penalty.mean().item() if kl_penalty is not None else 0.0
+                ),
                 #
-                "critic/mean_q_value": min_q_new.mean().item(),
+                "critic/mean_q_value": (
+                    min_q_new.mean().item() if min_q_new is not None else 0.0
+                ),
                 "critic/q_target_mean": q_target.mean().item(),
                 "critic/next_v_mean": next_v.mean().item(),
                 "critic/q1_explained_variance": q1_explained_var.item(),
                 "critic/q2_explained_variance": q2_explained_var.item(),
                 #
-                "actor/mean_log_prob": log_prob_new.mean().item(),
+                "actor/mean_log_prob": (
+                    log_prob_new.mean().item() if log_prob_new is not None else 0.0
+                ),
                 "actor/entropy": current_entropy,
                 "actor/target_entropy": self.target_entropy,
                 "actor/entropy_gap": current_entropy - self.target_entropy,
@@ -521,7 +611,9 @@ class Trainer:
                 "actor/alpha_loss": (
                     alpha_loss.item() if alpha_loss is not None else 0.0
                 ),
-                "actor/kl_divergence": kl_div.mean().item(),
+                "actor/kl_divergence": (
+                    kl_div.mean().item() if kl_div is not None else 0.0
+                ),
                 "actor/beta_kl": beta_kl,
                 #
                 "reward/rewards_per_step_mean": rewards_b.mean().item(),

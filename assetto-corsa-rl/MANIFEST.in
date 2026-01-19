@@ -1,0 +1,15 @@
+include README.md
+include LICENSE
+include requirements.txt
+include pyproject.toml
+include setup.cfg
+
+recursive-include src/assetto_corsa_rl *.py
+recursive-include configs *.yaml *.json
+recursive-include scripts *.py
+
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude *.dylib

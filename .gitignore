@@ -16,3 +16,9 @@
 /checkpoints
 /loss=0.2452.ckpt
 /loss=0.1031.ckpt
+/.env
+/.pytest_cache
+/assetto-corsa-rl/.pytest_cache
+/assetto-corsa-rl/dist
+/assetto-corsa-rl/scripts/ac/__pycache__
+/assetto-corsa-rl/scripts/car-racing/__pycache__

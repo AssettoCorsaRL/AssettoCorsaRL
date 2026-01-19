@@ -23,6 +23,11 @@ if _src_path not in sys.path:
 
 from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+
 
 class RacingLineRecorder:
     """Records racing lines from Assetto Corsa telemetry."""
@@ -192,7 +197,20 @@ class RacingLineRecorder:
             print("\n✓ Recorder closed")
 
 
-def main():
+@cli_command(
+    group="ac",
+    name="record-racing-line",
+    help="Record racing line from Assetto Corsa telemetry",
+)
+@cli_option("--output", "-o", default="racing_lines.json", help="Output file path")
+@cli_option("--track", "-t", default=None, help="Track name")
+@cli_option("--laps", "-l", default=2, help="Maximum number of laps to record")
+@cli_option(
+    "--sample-rate", "-s", default=0.05, type=float, help="Sample rate in seconds"
+)
+@cli_option("--host", default="127.0.0.1", help="Telemetry host")
+@cli_option("--port", "-p", default=9876, help="Telemetry port")
+def main(output, track, laps, sample_rate, host, port):
     """Main entry point for the racing line recorder."""
     parser = argparse.ArgumentParser(
         description="Record racing line from Assetto Corsa telemetry"

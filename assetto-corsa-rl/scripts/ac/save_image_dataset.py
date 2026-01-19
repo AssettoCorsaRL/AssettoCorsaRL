@@ -19,6 +19,7 @@ import numpy as np
 
 try:
     from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
+    from assetto_corsa_rl.ac_env import parse_image_shape
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
@@ -83,14 +84,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def _parse_shape(s: str) -> Tuple[int, int]:
-    try:
-        parts = s.lower().split("x")
-        return int(parts[0]), int(parts[1])
-    except Exception:
-        raise argparse.ArgumentTypeError("image-shape must be HxW, e.g. 84x84")
-
-
 def save_stack_npz(stack: np.ndarray, out_dir: Path, prefix: str, counter: int) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -125,7 +118,7 @@ def key_loop(telemetry: Telemetry, args) -> None:
     saving = False
     saved = 0
     frame_stack = args.frame_stack
-    img_h, img_w = _parse_shape(args.image_shape)
+    img_h, img_w = parse_image_shape(args.image_shape)
 
     buffer = deque(maxlen=frame_stack)
 

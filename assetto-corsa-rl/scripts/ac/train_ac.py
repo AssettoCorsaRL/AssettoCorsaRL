@@ -8,27 +8,33 @@ import torch.nn as nn
 import yaml
 from types import SimpleNamespace
 import wandb
+from tensordict import TensorDict
 
 try:
-    from assetto_corsa_rl.env_helper import create_gym_env  # type: ignore
-    from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
+    from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
+    from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
-    from assetto_corsa_rl.env_helper import create_gym_env  # type: ignore
-    from assetto_corsa_rl.model.sac import SACPolicy, get_device  # type: ignore
+    from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
+    from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
 
 from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage
+
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 
 
 def load_cfg_from_yaml(root: Path = None):
     """Load configs/ac/env_config.yaml, model_config.yaml, train_config.yaml and merge."""
     if root is None:
-        root = Path(__file__).resolve().parents[1]
+        root = Path(__file__).resolve().parents[2]
 
     env_p = root / "configs" / "ac" / "env_config.yaml"
     model_p = root / "configs" / "ac" / "model_config.yaml"
@@ -86,7 +92,6 @@ def load_cfg_from_yaml(root: Path = None):
     for k in ("wandb_project", "wandb_entity", "wandb_name", "wandb_enabled"):
         converted.setdefault(k, None)
 
-    # enforce single environment
     converted["num_envs"] = 1
 
     cfg = SimpleNamespace(**converted)
@@ -94,6 +99,7 @@ def load_cfg_from_yaml(root: Path = None):
     return cfg
 
 
+@cli_command(group="ac", name="train", help="Train SAC agent in Assetto Corsa")
 def train():
     cfg = load_cfg_from_yaml()
 
@@ -116,12 +122,16 @@ def train():
     except Exception as e:
         print("Warning: WandB init failed, continuing without logging:", e)
 
-    env = create_gym_env(
+    env = create_transformed_env(
+        racing_line_path="racing_lines.json",
         device=device,
-        num_envs=1,
-        fixed_track_seed=cfg.seed,
+        image_shape=(84, 84),
+        frame_stack=4,
     )
     current_td = env.reset()
+
+    input("press enter when ur sure the controller is connected n stuff")
+    print(f"Initial pixels shape: {current_td.get('pixels').shape}")
 
     vae_path = getattr(cfg, "vae_checkpoint_path", None)
     agent = SACPolicy(
@@ -133,6 +143,12 @@ def train():
         vae_checkpoint_path=vae_path,
     )
     modules = agent.modules()
+
+    with torch.no_grad():
+        dummy_pixels = current_td.get("pixels").unsqueeze(0).to(device)
+        init_td = TensorDict({"pixels": dummy_pixels}, batch_size=[1])
+        modules["actor"](init_td.clone())
+        modules["value"](init_td.clone())
 
     if cfg.use_noisy:
         print(f"Using noisy networks for exploration (sigma={cfg.noise_sigma})")
@@ -146,6 +162,8 @@ def train():
     q2_target = modules["q2_target"]
 
     pretrained_path = getattr(cfg, "pretrained_model", None)
+    bc_pretrained_path = getattr(cfg, "bc_pretrained_model", None)
+
     if pretrained_path:
         print(f"Loading pretrained model from {pretrained_path}...")
         try:
@@ -169,16 +187,38 @@ def train():
         except Exception as e:
             print(f"Warning: Failed to load pretrained model: {e}")
             value_target.load_state_dict(value.state_dict())
+    elif bc_pretrained_path:
+        print(f"Loading BC pretrained actor from {bc_pretrained_path}...")
+        try:
+            checkpoint = torch.load(bc_pretrained_path, map_location=device)
+            if "actor_state" in checkpoint:
+                actor.load_state_dict(checkpoint["actor_state"])
+                print(
+                    f"✓ Loaded BC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
+                )
+            else:
+                print("Warning: No actor_state found in BC checkpoint")
+            # Initialize target networks fresh (no critic pretraining from BC)
+            value_target.load_state_dict(value.state_dict())
+            q1_target.load_state_dict(q1.state_dict())
+            q2_target.load_state_dict(q2.state_dict())
+        except Exception as e:
+            print(f"Warning: Failed to load BC pretrained model: {e}")
+            value_target.load_state_dict(value.state_dict())
     else:
         value_target.load_state_dict(value.state_dict())
 
     print("Target network initialized")
 
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
+    actor_lr = getattr(cfg, "actor_lr", cfg.lr)
+    critic_lr = getattr(cfg, "critic_lr", cfg.lr)
+    value_lr = getattr(cfg, "value_lr", cfg.lr)
+
+    actor_opt = torch.optim.Adam(actor.parameters(), lr=actor_lr)
     critic_opt = torch.optim.Adam(
-        list(q1.parameters()) + list(q2.parameters()), lr=cfg.lr
+        list(q1.parameters()) + list(q2.parameters()), lr=critic_lr
     )
-    value_opt = torch.optim.Adam(value.parameters(), lr=cfg.lr)
+    value_opt = torch.optim.Adam(value.parameters(), lr=value_lr)
 
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)

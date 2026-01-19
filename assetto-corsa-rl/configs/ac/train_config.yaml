@@ -7,6 +7,7 @@ train:
   device: null # null = auto-select (GPU if available, else CPU) use gpu:id or cpu to force
 
   # pretrained_model: "sac_checkpoint_9904128.pt"
+  bc_pretrained_model: null # Path to behavioral cloning pretrained actor (e.g., "models/bc_pretrained.pt")
   vae_checkpoint_path: null
   encoder_checkpoint_path: "loss=0.1031.ckpt" #* IMPORTANT: Path to pretrained encoder to load for VAE training
 

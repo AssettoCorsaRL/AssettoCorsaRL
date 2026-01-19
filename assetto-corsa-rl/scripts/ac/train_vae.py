@@ -22,6 +22,7 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
+from assetto_corsa_rl.ac_env import parse_image_shape
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
@@ -133,17 +134,9 @@ def parse_args():
     return p.parse_args()
 
 
-def _parse_shape(s: str):
-    try:
-        h, w = s.lower().split("x")
-        return int(h), int(w)
-    except Exception:
-        raise ValueError("image-shape must be HxW, e.g. 84x84")
-
-
 def main():
     args = parse_args()
-    img_h, img_w = _parse_shape(args.image_shape)
+    img_h, img_w = parse_image_shape(args.image_shape)
 
     files = sorted([p for p in Path(args.input_dir).glob("*.npz") if p.is_file()])
     if len(files) == 0:
@@ -197,18 +190,15 @@ def main():
         mse_weight=args.mse_weight,
     )
 
-    # Load pretrained encoder if provided
     if args.encoder_ckpt:
         print(f"Loading encoder from {args.encoder_ckpt}...")
         try:
             ckpt = torch.load(str(args.encoder_ckpt), map_location="cpu")
-            # Try to load full state dict first
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 state_dict = ckpt["state_dict"]
             else:
                 state_dict = ckpt
 
-            # Load only encoder weights (encoder_in, encoder_blocks, middle, to_latent)
             encoder_keys = ["encoder_in", "encoder_blocks", "middle", "to_latent"]
             encoder_state = {
                 k: v

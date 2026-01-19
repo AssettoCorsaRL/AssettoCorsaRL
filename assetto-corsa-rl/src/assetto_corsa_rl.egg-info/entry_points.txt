@@ -1,0 +1,2 @@
+[console_scripts]
+acrl = assetto_corsa_rl.cli:main

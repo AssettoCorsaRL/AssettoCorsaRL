@@ -25,6 +25,7 @@ if src_path not in sys.path:
 
 from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 from assetto_corsa_rl.env_helper import create_gym_env  # type: ignore
+from assetto_corsa_rl.ac_env import parse_image_shape, get_device
 from collections import deque
 
 # optional AC env
@@ -59,11 +60,6 @@ def parse_args():
         "--device", type=str, default=None, help="Device to run on (cpu/cuda)"
     )
     return p.parse_args()
-
-
-def _parse_shape(s: str) -> Tuple[int, int]:
-    h, w = s.lower().split("x")
-    return int(h), int(w)
 
 
 def graystack_to_rgb_input(pixels: torch.Tensor, frames: int):
@@ -130,10 +126,8 @@ def _recon_display(
 
 def main():
     args = parse_args()
-    img_h, img_w = _parse_shape(args.image_shape)
-    device = torch.device(
-        args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    img_h, img_w = parse_image_shape(args.image_shape)
+    device = get_device(args.device)
 
     vae = ConvVAE(
         z_dim=1024,
