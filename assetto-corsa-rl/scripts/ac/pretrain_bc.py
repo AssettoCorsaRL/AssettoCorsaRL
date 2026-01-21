@@ -9,18 +9,18 @@ Usage:
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
-from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.distributions import Normal
 import click
 import wandb
+from tensordict import TensorDict
 
 # Add src to path
 repo_root = Path(__file__).resolve().parents[2]
@@ -50,20 +50,23 @@ class DemonstrationDataset(Dataset):
         self.image_shape = image_shape
         self.frame_stack = frame_stack
 
-        # Find all batch files
         self.batch_files = sorted(self.data_dir.glob("demo_batch_*.npz"))
         if len(self.batch_files) == 0:
             raise RuntimeError(f"No demonstration files found in {data_dir}")
 
-        # Load all data into memory (or use lazy loading for large datasets)
         self.frames = []
         self.actions = []
 
         print(f"Loading {len(self.batch_files)} demonstration batches...")
         for batch_file in self.batch_files:
-            data = np.load(batch_file)
-            self.frames.append(data["frames"])
-            self.actions.append(data["actions"])
+            try:
+                data = np.load(batch_file)
+                if "frames" not in data or "actions" not in data:
+                    raise ValueError(f"Missing required keys in {batch_file}")
+                self.frames.append(data["frames"])
+                self.actions.append(data["actions"])
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {batch_file}: {e}")
 
         self.frames = np.concatenate(self.frames, axis=0)
         self.actions = np.concatenate(self.actions, axis=0)
@@ -71,6 +74,11 @@ class DemonstrationDataset(Dataset):
         print(f"✓ Loaded {len(self.frames)} demonstration samples")
         print(f"  Frames shape: {self.frames.shape}")
         print(f"  Actions shape: {self.actions.shape}")
+
+        # Validate data shapes
+        assert self.frames.ndim == 4, f"Expected 4D frames, got {self.frames.ndim}D"
+        assert self.actions.ndim == 2, f"Expected 2D actions, got {self.actions.ndim}D"
+        print(f"  Action dim: {self.actions.shape[1]}")
 
     def __len__(self):
         return len(self.frames)
@@ -117,6 +125,7 @@ class BehavioralCloningTrainer:
 
         total_loss = 0.0
         total_mse = 0.0
+        total_nll = 0.0
         total_samples = 0
 
         for batch_idx, (frames, actions) in enumerate(dataloader):
@@ -126,24 +135,21 @@ class BehavioralCloningTrainer:
             batch_size = frames.shape[0]
 
             # Forward pass through actor
-            from tensordict import TensorDict
-
             td_in = TensorDict({"pixels": frames}, batch_size=[batch_size])
             td_out = self.actor(td_in)
 
-            # Get predicted action (mean of the distribution)
+            # Get predicted action distribution
             pred_loc = td_out["loc"]  # (B, action_dim)
+            pred_scale = td_out["scale"]  # (B, action_dim)
 
-            # Behavioral cloning loss: MSE between predicted and demonstration actions
-            # We use the mean (loc) directly for BC, not sampling
+            # Use negative log likelihood loss which properly accounts for the distribution
+            dist = Normal(pred_loc, pred_scale)
+            nll_loss = -dist.log_prob(actions).mean()
+
+            # Still compute MSE for logging
             mse_loss = F.mse_loss(pred_loc, actions)
 
-            # Additionally, we can add a regularization on the scale to encourage
-            # low-variance predictions during BC
-            pred_scale = td_out["scale"]
-            scale_reg = pred_scale.mean() * 0.01  # Small regularization
-
-            loss = mse_loss + scale_reg
+            loss = nll_loss
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -156,14 +162,17 @@ class BehavioralCloningTrainer:
 
             total_loss += loss.item() * batch_size
             total_mse += mse_loss.item() * batch_size
+            total_nll += nll_loss.item() * batch_size
             total_samples += batch_size
 
         avg_loss = total_loss / total_samples
         avg_mse = total_mse / total_samples
+        avg_nll = total_nll / total_samples
 
         return {
             "loss": avg_loss,
             "mse": avg_mse,
+            "nll": avg_nll,
         }
 
     def validate(self, dataloader: DataLoader) -> dict:
@@ -171,6 +180,7 @@ class BehavioralCloningTrainer:
         self.actor.eval()
 
         total_mse = 0.0
+        total_nll = 0.0
         total_samples = 0
 
         with torch.no_grad():
@@ -180,96 +190,32 @@ class BehavioralCloningTrainer:
 
                 batch_size = frames.shape[0]
 
-                from tensordict import TensorDict
-
                 td_in = TensorDict({"pixels": frames}, batch_size=[batch_size])
                 td_out = self.actor(td_in)
 
                 pred_loc = td_out["loc"]
+                pred_scale = td_out["scale"]
+
+                # Compute both MSE and NLL
                 mse = F.mse_loss(pred_loc, actions)
+                dist = Normal(pred_loc, pred_scale)
+                nll = -dist.log_prob(actions).mean()
 
                 total_mse += mse.item() * batch_size
+                total_nll += nll.item() * batch_size
                 total_samples += batch_size
 
         avg_mse = total_mse / total_samples
+        avg_nll = total_nll / total_samples
 
         return {
             "val_mse": avg_mse,
+            "val_nll": avg_nll,
         }
 
     def step_scheduler(self, val_loss: float):
         """Step the learning rate scheduler."""
         self.scheduler.step(val_loss)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Pretrain SAC actor with behavioral cloning")
-    parser.add_argument(
-        "--data-dir",
-        type=Path,
-        required=True,
-        help="Directory containing demonstration data",
-    )
-    parser.add_argument(
-        "--output-path",
-        type=Path,
-        default=Path("models/bc_pretrained.pt"),
-        help="Path to save pretrained model",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=50,
-        help="Number of training epochs",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=64,
-        help="Batch size for training",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate",
-    )
-    parser.add_argument(
-        "--val-split",
-        type=float,
-        default=0.1,
-        help="Validation split ratio",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of data loader workers",
-    )
-    parser.add_argument(
-        "--num-cells",
-        type=int,
-        default=256,
-        help="Hidden layer size",
-    )
-    parser.add_argument(
-        "--vae-checkpoint",
-        type=Path,
-        default=None,
-        help="Path to VAE checkpoint for encoder",
-    )
-    parser.add_argument(
-        "--wandb-project",
-        type=str,
-        default="AssetoCorsaRL-BC",
-        help="WandB project name",
-    )
-    parser.add_argument(
-        "--wandb-offline",
-        action="store_true",
-        help="Run WandB in offline mode",
-    )
-    return parser.parse_args()
 
 
 @cli_command(group="ac", name="train-bc", help="Pretrain SAC actor using behavioral cloning")
@@ -307,26 +253,53 @@ def main(
     wandb_project,
     wandb_offline,
 ):
-    args = parse_args()
+    # Convert paths
+    data_dir = Path(data_dir)
+    output_path = Path(output_path)
+    vae_checkpoint = Path(vae_checkpoint) if vae_checkpoint else None
 
     # Setup device
     device = get_device()
     print(f"Using device: {device}")
 
     # Initialize WandB
-    wandb_mode = "offline" if args.wandb_offline else "online"
-    wandb.init(
-        project=args.wandb_project,
-        config=vars(args),
-        mode=wandb_mode,
-    )
+    wandb_mode = "offline" if wandb_offline else "online"
+    try:
+        wandb.init(
+            project=wandb_project,
+            config={
+                "data_dir": str(data_dir),
+                "output_path": str(output_path),
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "lr": lr,
+                "val_split": val_split,
+                "num_workers": num_workers,
+                "num_cells": num_cells,
+                "vae_checkpoint": str(vae_checkpoint) if vae_checkpoint else None,
+                "wandb_project": wandb_project,
+            },
+            mode=wandb_mode,
+        )
+    except Exception as e:
+        print(f"Warning: WandB initialization failed: {e}")
+        print("Continuing without WandB logging...")
+
+    # Image configuration
+    IMAGE_HEIGHT = 84
+    IMAGE_WIDTH = 84
+    FRAME_STACK = 4
 
     # Load dataset
-    dataset = DemonstrationDataset(args.data_dir)
+    dataset = DemonstrationDataset(
+        data_dir,
+        image_shape=(IMAGE_HEIGHT, IMAGE_WIDTH),
+        frame_stack=FRAME_STACK,
+    )
 
     # Split into train/val
     n_samples = len(dataset)
-    n_val = int(n_samples * args.val_split)
+    n_val = int(n_samples * val_split)
     n_train = n_samples - n_val
 
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [n_train, n_val])
@@ -335,34 +308,33 @@ def main(
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
     )
 
     # Create actor
     mock_env = create_mock_env(device)
 
-    vae_path = str(args.vae_checkpoint) if args.vae_checkpoint else None
+    vae_path = str(vae_checkpoint) if vae_checkpoint else None
     agent = SACPolicy(
         env=mock_env,
-        num_cells=args.num_cells,
+        num_cells=num_cells,
         device=device,
         use_noisy=False,
         vae_checkpoint_path=vae_path,
     )
 
     # Initialize lazy layers with a dummy forward pass
-    dummy_frames = torch.zeros(1, 4, 84, 84, device=device)
-    from tensordict import TensorDict
+    dummy_frames = torch.zeros(1, FRAME_STACK, IMAGE_HEIGHT, IMAGE_WIDTH, device=device)
 
     with torch.no_grad():
         init_td = TensorDict({"pixels": dummy_frames}, batch_size=[1])
@@ -375,18 +347,20 @@ def main(
     trainer = BehavioralCloningTrainer(
         actor=actor,
         device=device,
-        lr=args.lr,
+        lr=lr,
     )
 
     # Training loop
     best_val_mse = float("inf")
-    args.output_path.parent.mkdir(parents=True, exist_ok=True)
+    patience_counter = 0
+    EARLY_STOP_PATIENCE = 10
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 50)
     print("Starting Behavioral Cloning Training")
     print("=" * 50)
 
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
 
@@ -401,13 +375,18 @@ def main(
             "epoch": epoch,
             "train/loss": train_metrics["loss"],
             "train/mse": train_metrics["mse"],
+            "train/nll": train_metrics["nll"],
             "val/mse": val_metrics["val_mse"],
+            "val/nll": val_metrics["val_nll"],
             "lr": trainer.optimizer.param_groups[0]["lr"],
         }
-        wandb.log(metrics)
+        try:
+            wandb.log(metrics)
+        except:
+            pass  # Continue if wandb logging fails
 
         print(
-            f"Epoch {epoch + 1}/{args.epochs} | "
+            f"Epoch {epoch + 1}/{epochs} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
             f"Train MSE: {train_metrics['mse']:.6f} | "
             f"Val MSE: {val_metrics['val_mse']:.6f}"
@@ -416,41 +395,56 @@ def main(
         # Save best model
         if val_metrics["val_mse"] < best_val_mse:
             best_val_mse = val_metrics["val_mse"]
-            torch.save(
-                {
-                    "actor_state": actor.state_dict(),
-                    "epoch": epoch,
-                    "val_mse": best_val_mse,
-                    "config": {
-                        "num_cells": args.num_cells,
-                        "vae_checkpoint_path": vae_path,
+            patience_counter = 0
+            try:
+                torch.save(
+                    {
+                        "actor_state": actor.state_dict(),
+                        "epoch": epoch,
+                        "val_mse": best_val_mse,
+                        "config": {
+                            "num_cells": num_cells,
+                            "vae_checkpoint_path": vae_path,
+                        },
                     },
-                },
-                args.output_path,
-            )
-            print(f"  ✓ Saved best model (val_mse: {best_val_mse:.6f})")
+                    output_path,
+                )
+                print(f"  ✓ Saved best model (val_mse: {best_val_mse:.6f})")
+            except Exception as e:
+                print(f"  ✗ Failed to save model: {e}")
+        else:
+            patience_counter += 1
+            if patience_counter >= EARLY_STOP_PATIENCE:
+                print(f"\nEarly stopping after {epoch + 1} epochs")
+                break
 
     # Final save
-    final_path = args.output_path.with_stem(args.output_path.stem + "_final")
-    torch.save(
-        {
-            "actor_state": actor.state_dict(),
-            "epoch": args.epochs - 1,
-            "val_mse": val_metrics["val_mse"],
-            "config": {
-                "num_cells": args.num_cells,
-                "vae_checkpoint_path": vae_path,
+    final_path = output_path.with_stem(output_path.stem + "_final")
+    try:
+        torch.save(
+            {
+                "actor_state": actor.state_dict(),
+                "epoch": epoch,
+                "val_mse": val_metrics["val_mse"],
+                "config": {
+                    "num_cells": num_cells,
+                    "vae_checkpoint_path": vae_path,
+                },
             },
-        },
-        final_path,
-    )
+            final_path,
+        )
+    except Exception as e:
+        print(f"Failed to save final model: {e}")
 
-    wandb.finish()
+    try:
+        wandb.finish()
+    except:
+        pass
 
     print("\n" + "=" * 50)
     print("Behavioral Cloning Training Complete!")
     print(f"Best Val MSE: {best_val_mse:.6f}")
-    print(f"Best model saved to: {args.output_path}")
+    print(f"Best model saved to: {output_path}")
     print(f"Final model saved to: {final_path}")
     print("=" * 50)
 
