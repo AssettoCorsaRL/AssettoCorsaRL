@@ -5,7 +5,7 @@ to a file when each lap completes. The script waits for a new lap to start
 before beginning recording.
 
 Usage:
-    python assetto-corsa-rl/scripts/ac/record_racing_line.py --output racing_lines.json --track monza
+    acrl ac record-racing-line --output racing_lines.json --track monza
 """
 
 import sys
@@ -164,10 +164,7 @@ class RacingLineRecorder:
                         break
 
                 current_time = time.time()
-                if (
-                    self.recording
-                    and (current_time - last_sample_time) >= self.sample_rate
-                ):
+                if self.recording and (current_time - last_sample_time) >= self.sample_rate:
                     self.record_position(data)
                     last_sample_time = current_time
 
@@ -205,16 +202,12 @@ class RacingLineRecorder:
 @cli_option("--output", "-o", default="racing_lines.json", help="Output file path")
 @cli_option("--track", "-t", default=None, help="Track name")
 @cli_option("--laps", "-l", default=2, help="Maximum number of laps to record")
-@cli_option(
-    "--sample-rate", "-s", default=0.05, type=float, help="Sample rate in seconds"
-)
+@cli_option("--sample-rate", "-s", default=0.05, type=float, help="Sample rate in seconds")
 @cli_option("--host", default="127.0.0.1", help="Telemetry host")
 @cli_option("--port", "-p", default=9876, help="Telemetry port")
 def main(output, track, laps, sample_rate, host, port):
     """Main entry point for the racing line recorder."""
-    parser = argparse.ArgumentParser(
-        description="Record racing line from Assetto Corsa telemetry"
-    )
+    parser = argparse.ArgumentParser(description="Record racing line from Assetto Corsa telemetry")
     parser.add_argument(
         "--output",
         "-o",
@@ -262,8 +255,7 @@ def main(output, track, laps, sample_rate, host, port):
     if args.track:
         output_path = Path(output_file)
         output_file = str(
-            output_path.parent
-            / f"{args.track}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            output_path.parent / f"{args.track}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
         )
 
     recorder = RacingLineRecorder(

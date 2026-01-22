@@ -1,7 +1,7 @@
 """Load a trained SAC agent and test it in Assetto Corsa environment.
 
 Usage:
-    python assetto-corsa-rl/scripts/ac/load_ac.py --ckpt models/bc_pretrained.pt --episodes 5
+    acrl ac test --ckpt models/bc_pretrained.pt --episodes 5
 """
 
 from __future__ import annotations
@@ -17,11 +17,11 @@ src_path = str(repo_root / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from assetto_corsa_rl.ac_env import AssettoCorsa, create_transformed_env, get_device
-from assetto_corsa_rl.model.sac import SACPolicy
+from assetto_corsa_rl.ac_env import AssettoCorsa, create_transformed_env, get_device  # type: ignore
+from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
 
 try:
-    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 
@@ -95,18 +95,29 @@ def load_checkpoint(ckpt_path: str, device: str):
     return checkpoint, actor_state, config
 
 
-def main():
-    args = parse_args()
-    device = get_device(args.device)
+@cli_command(group="ac", name="test", help="Test a trained SAC agent in Assetto Corsa")
+@cli_option(
+    "--ckpt", required=True, help="Path to checkpoint file (e.g., models/sac_checkpoint.pt)"
+)
+@cli_option("--episodes", default=5, help="Number of test episodes to run")
+@cli_option("--device", default=None, help="Device to run on")
+@cli_option("--racing-line", default="racing_lines.json", help="Path to racing line JSON file")
+@cli_option(
+    "--deterministic", is_flag=True, help="Use deterministic actions (mean of distribution)"
+)
+def main(ckpt, episodes, device, racing_line, deterministic):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = get_device(device)
 
     print("=" * 60)
     print("Loading Trained SAC Agent for Assetto Corsa")
     print("=" * 60)
 
-    print(f"Creating environment with racing line: {args.racing_line}")
-    env = create_env(args.racing_line, device)
+    print(f"Creating environment with racing line: {racing_line}")
+    env = create_env(racing_line, device)
 
-    checkpoint, actor_state, config = load_checkpoint(args.ckpt, args.device)
+    checkpoint, actor_state, config = load_checkpoint(ckpt, device)
 
     num_cells = config.get("num_cells", 256)
     vae_checkpoint_path = config.get("vae_checkpoint_path", None)
@@ -149,20 +160,20 @@ def main():
     input("\nPress Enter when Assetto Corsa is running and ready...")
 
     print("\n" + "=" * 60)
-    print(f"Running {args.episodes} test episodes...")
+    print(f"Running {episodes} test episodes...")
     print("=" * 60)
 
     episode_rewards = []
     episode_lengths = []
 
     try:
-        for ep in range(args.episodes):
+        for ep in range(episodes):
             td = env.reset()
             episode_reward = 0.0
             episode_length = 0
             done = False
 
-            print(f"\nEpisode {ep + 1}/{args.episodes}")
+            print(f"\nEpisode {ep + 1}/{episodes}")
 
             while not done:
                 pixels = td.get("pixels")
@@ -176,14 +187,12 @@ def main():
                 with torch.no_grad():
                     actor_output = actor(actor_input)
 
-                    if args.deterministic:
+                    if deterministic:
                         action = actor_output.get("loc")
                     else:
                         action = actor_output.get("action")
 
-                action_td = TensorDict(
-                    {"action": action.squeeze(0).cpu()}, batch_size=[]
-                )
+                action_td = TensorDict({"action": action.squeeze(0).cpu()}, batch_size=[])
 
                 td = env.step(action_td)
 
@@ -223,12 +232,8 @@ def main():
         print("Test Summary")
         print("=" * 60)
         print(f"Episodes completed: {len(episode_rewards)}")
-        print(
-            f"Average reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}"
-        )
-        print(
-            f"Average length: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}"
-        )
+        print(f"Average reward: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+        print(f"Average length: {np.mean(episode_lengths):.1f} ± {np.std(episode_lengths):.1f}")
         print(f"Best episode reward: {np.max(episode_rewards):.2f}")
         print(f"Worst episode reward: {np.min(episode_rewards):.2f}")
 

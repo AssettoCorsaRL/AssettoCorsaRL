@@ -1,6 +1,6 @@
 """
 Example:
-    python assetto-corsa-rl/scripts/ac/train_vae.py --input-dir datasets/ac_images --frames 1 --epochs 100 --batch-size 64
+    acrl ac train-vae --input-dir datasets/ac_images --frames 1 --epochs 100 --batch-size 64
 """
 
 from __future__ import annotations
@@ -22,7 +22,21 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
-from assetto_corsa_rl.ac_env import parse_image_shape
+from assetto_corsa_rl.ac_env import parse_image_shape  # type: ignore
+
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+except Exception:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "cli_registry", Path(src_path) / "assetto_corsa_rl" / "cli_registry.py"
+    )
+    if spec and spec.loader:
+        cli_registry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_registry)
+        cli_command = cli_registry.cli_command
+        cli_option = cli_registry.cli_option
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger
@@ -42,9 +56,7 @@ class ACImageStackDataset(Dataset):
         self.input_dir = Path(input_dir)
         self.image_shape = tuple(map(int, image_shape))
         self.frames = frames
-        self.files = files or sorted(
-            [p for p in self.input_dir.glob("*.npz") if p.is_file()]
-        )
+        self.files = files or sorted([p for p in self.input_dir.glob("*.npz") if p.is_file()])
         if len(self.files) == 0:
             raise RuntimeError(f"No .npz files found in {self.input_dir}")
 
@@ -67,9 +79,7 @@ class ACImageStackDataset(Dataset):
         h, w = self.image_shape
         if fr.shape != (h, w):
             try:
-                return cv2.resize(fr, (w, h), interpolation=cv2.INTER_LINEAR).astype(
-                    np.uint8
-                )
+                return cv2.resize(fr, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.uint8)
             except Exception:
                 return cv2.resize(fr, (w, h)).astype(np.uint8)
         return fr
@@ -94,15 +104,9 @@ class ACImageStackDataset(Dataset):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--input-dir", type=Path, required=True, help="Directory with .npz stacks"
-    )
-    p.add_argument(
-        "--image-shape", type=str, default="84x84", help="HxW target size (e.g. 84x84)"
-    )
-    p.add_argument(
-        "--frames", type=int, default=4, help="Number of grayscale frames per stack"
-    )
+    p.add_argument("--input-dir", type=Path, required=True, help="Directory with .npz stacks")
+    p.add_argument("--image-shape", type=str, default="84x84", help="HxW target size (e.g. 84x84)")
+    p.add_argument("--frames", type=int, default=4, help="Number of grayscale frames per stack")
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=3e-4)
@@ -134,13 +138,46 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    img_h, img_w = parse_image_shape(args.image_shape)
+@cli_command(group="ac", name="train-vae", help="Train VAE on Assetto Corsa image dataset")
+@cli_option("--input-dir", required=True, help="Directory with .npz stacks")
+@cli_option("--image-shape", default="84x84", help="Target image shape HxW")
+@cli_option("--frames", default=4, help="Number of grayscale frames per stack")
+@cli_option("--epochs", default=10, help="Number of epochs")
+@cli_option("--batch-size", default=32, help="Batch size")
+@cli_option("--lr", default=3e-4, type=float, help="Learning rate")
+@cli_option("--beta", default=0.01, type=float, help="KL weight")
+@cli_option("--mse-weight", default=1.0, type=float, help="MSE loss weight")
+@cli_option("--num-workers", default=4, help="Number of data loader workers")
+@cli_option("--gpus", default=1, help="Number of GPUs")
+@cli_option("--ckpt-dir", default="checkpoints", help="Checkpoint directory")
+@cli_option("--encoder-ckpt", default=None, help="Pretrained encoder checkpoint")
+@cli_option("--wandb-project", default="assetto_corsa_rl_vae", help="WandB project")
+@cli_option("--wandb-entity", default=None, help="WandB entity")
+@cli_option("--wandb-name", default=None, help="WandB run name")
+@cli_option("--wandb-offline", is_flag=True, help="Run WandB offline")
+def main(
+    input_dir,
+    image_shape,
+    frames,
+    epochs,
+    batch_size,
+    lr,
+    beta,
+    mse_weight,
+    num_workers,
+    gpus,
+    ckpt_dir,
+    encoder_ckpt,
+    wandb_project,
+    wandb_entity,
+    wandb_name,
+    wandb_offline,
+):
+    img_h, img_w = parse_image_shape(image_shape)
 
-    files = sorted([p for p in Path(args.input_dir).glob("*.npz") if p.is_file()])
+    files = sorted([p for p in Path(input_dir).glob("*.npz") if p.is_file()])
     if len(files) == 0:
-        raise RuntimeError(f"No .npz files found in {args.input_dir}")
+        raise RuntimeError(f"No .npz files found in {input_dir}")
 
     # split train/val 90/10
     split = max(1, int(len(files) * 0.9))
@@ -148,52 +185,50 @@ def main():
     val_files = files[split:]
 
     train_ds = ACImageStackDataset(
-        args.input_dir,
+        input_dir,
         image_shape=(img_h, img_w),
         files=train_files,
-        frames=args.frames,
+        frames=frames,
     )
     val_ds = ACImageStackDataset(
-        args.input_dir, image_shape=(img_h, img_w), files=val_files, frames=args.frames
+        input_dir, image_shape=(img_h, img_w), files=val_files, frames=frames
     )
 
     train_loader = DataLoader(
         train_ds,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=max(1, args.num_workers // 2),
+        num_workers=max(1, num_workers // 2),
         pin_memory=True,
     )
 
     xb = next(iter(train_loader))
-    in_channels = 3 * args.frames
+    in_channels = 3 * frames
     if xb.ndim != 4 or xb.size(1) != in_channels:
-        raise RuntimeError(
-            f"Unexpected batch shape {xb.shape}, expected (B, {in_channels}, H, W)"
-        )
+        raise RuntimeError(f"Unexpected batch shape {xb.shape}, expected (B, {in_channels}, H, W)")
     print(f"✓ Batch shape verified: {xb.shape}")
 
     model = ConvVAE(
         z_dim=1024,
-        lr=args.lr,
-        beta=args.beta,
+        lr=lr,
+        beta=beta,
         in_channels=in_channels,
         warmup_steps=500,
         im_shape=(img_h, img_w),
-        mse_weight=args.mse_weight,
+        mse_weight=mse_weight,
     )
 
-    if args.encoder_ckpt:
-        print(f"Loading encoder from {args.encoder_ckpt}...")
+    if encoder_ckpt:
+        print(f"Loading encoder from {encoder_ckpt}...")
         try:
-            ckpt = torch.load(str(args.encoder_ckpt), map_location="cpu")
+            ckpt = torch.load(str(encoder_ckpt), map_location="cpu")
             if isinstance(ckpt, dict) and "state_dict" in ckpt:
                 state_dict = ckpt["state_dict"]
             else:
@@ -215,7 +250,7 @@ def main():
             print(f"Warning: Failed to load encoder checkpoint: {e}")
 
     ckpt_cb = ModelCheckpoint(
-        dirpath=args.ckpt_dir,
+        dirpath=ckpt_dir,
         filename="vae-{epoch:02d}-{val/loss:.4f}",
         monitor="val/loss",
         mode="min",
@@ -224,19 +259,19 @@ def main():
     )
 
     logger = WandbLogger(
-        project=args.wandb_project,
-        name=args.wandb_name,
-        entity=args.wandb_entity,
-        offline=args.wandb_offline,
+        project=wandb_project,
+        name=wandb_name,
+        entity=wandb_entity,
+        offline=wandb_offline,
     )
-    if args.wandb_offline:
+    if wandb_offline:
         os.environ["WANDB_MODE"] = "offline"
 
     logger.watch(model, log="all", log_freq=100)
 
-    if torch.cuda.is_available() and args.gpus != 0:
+    if torch.cuda.is_available() and gpus != 0:
         accelerator = "cuda"
-        devices = args.gpus if args.gpus > 0 else torch.cuda.device_count()
+        devices = gpus if gpus > 0 else torch.cuda.device_count()
         print(f"✓ Using CUDA with {devices} device(s)")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         accelerator = "mps"
@@ -248,8 +283,8 @@ def main():
         print("✓ Using CPU")
 
     trainer = pl.Trainer(
-        max_epochs=args.epochs,
-        default_root_dir=args.ckpt_dir,
+        max_epochs=epochs,
+        default_root_dir=ckpt_dir,
         callbacks=[ckpt_cb],
         logger=logger,
         accelerator=accelerator,
@@ -260,7 +295,7 @@ def main():
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-    final_ckpt = Path(args.ckpt_dir) / "vae-final.pth"
+    final_ckpt = Path(ckpt_dir) / "vae-final.pth"
     model.cpu()
     torch.save(model.state_dict(), final_ckpt)
     print(f"Saved final model to {final_ckpt}")

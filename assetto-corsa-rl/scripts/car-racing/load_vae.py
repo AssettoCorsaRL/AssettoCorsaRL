@@ -1,7 +1,7 @@
 """Load a trained VAE and visualize reconstructions in real-time with user control.
 
 Usage:
-    python assetto-corsa-rl/scripts/load_vae.py --model vae_pretrained.ckpt --frames 4
+    acrl car-racing load-vae --model vae_pretrained.ckpt --frames 4
 
 Controls:
     Arrow Keys: Steer, accelerate, brake
@@ -69,9 +69,7 @@ class KeyboardController:
         return self.action.copy()
 
 
-def load_vae_model(
-    checkpoint_path: str, z_dim: int, in_channels: int, device: torch.device
-):
+def load_vae_model(checkpoint_path: str, z_dim: int, in_channels: int, device: torch.device):
     """Load VAE model from checkpoint."""
     model = ConvVAE(z_dim=z_dim, in_channels=in_channels)
 
@@ -95,9 +93,7 @@ def run_visualization(
     max_steps: int = 10000,
 ):
     """Run interactive visualization with VAE reconstruction."""
-    device = torch.device(
-        device if device else ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Using device: {device}")
 
     in_channels = 3 * frames
@@ -185,13 +181,9 @@ def run_visualization(
         plt.pause(0.001)
 
         if terminated or truncated or controller.reset:
-            print(
-                f"Episode {episode} finished: {steps} steps, reward={total_reward:.2f}"
-            )
+            print(f"Episode {episode} finished: {steps} steps, reward={total_reward:.2f}")
             obs, _ = env.reset()
-            frame_buffer = deque(
-                [transform(obs).clone() for _ in range(frames)], maxlen=frames
-            )
+            frame_buffer = deque([transform(obs).clone() for _ in range(frames)], maxlen=frames)
             total_reward = 0.0
             steps = 0
             episode += 1
@@ -210,24 +202,27 @@ def parse_args():
         "--model", type=str, required=True, help="Path to trained VAE checkpoint (.pth)"
     )
     parser.add_argument("--z-dim", type=int, default=32, help="Latent dimension of VAE")
-    parser.add_argument(
-        "--frames", type=int, default=4, help="Number of stacked frames"
-    )
+    parser.add_argument("--frames", type=int, default=4, help="Number of stacked frames")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
-    parser.add_argument(
-        "--max-steps", type=int, default=10000, help="Maximum total steps"
-    )
+    parser.add_argument("--max-steps", type=int, default=10000, help="Maximum total steps")
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+@cli_command(
+    group="car-racing", name="load-vae", help="Load and visualize VAE reconstructions in real-time"
+)
+@cli_option("--model", required=True, help="Path to trained VAE checkpoint")
+@cli_option("--z-dim", default=32, help="Latent dimension of VAE")
+@cli_option("--frames", default=4, help="Number of stacked frames")
+@cli_option("--device", default=None, help="Device (cuda/cpu)")
+@cli_option("--max-steps", default=10000, help="Maximum total steps")
+def main(model, z_dim, frames, device, max_steps):
     run_visualization(
-        model_path=args.model,
-        z_dim=args.z_dim,
-        frames=args.frames,
-        device=args.device,
-        max_steps=args.max_steps,
+        model_path=model,
+        z_dim=z_dim,
+        frames=frames,
+        device=device,
+        max_steps=max_steps,
     )
 
 

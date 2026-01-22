@@ -4,7 +4,7 @@ This script loads recorded human demonstrations and pretrains the SAC actor
 to imitate the human policy before starting RL training.
 
 Usage:
-    python scripts/ac/pretrain_bc.py --data-dir datasets/demonstrations --epochs 50 --batch-size 64
+    acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from torch.distributions import Normal
 import click
 import wandb
 from tensordict import TensorDict
+from typing import Tuple
 
 # Add src to path
 repo_root = Path(__file__).resolve().parents[2]
@@ -28,11 +29,11 @@ src_path = str(repo_root / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from assetto_corsa_rl.model.sac import SACPolicy
-from assetto_corsa_rl.ac_env import create_mock_env, get_device
+from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
+from assetto_corsa_rl.ac_env import create_mock_env, get_device  # type: ignore
 
 try:
-    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 

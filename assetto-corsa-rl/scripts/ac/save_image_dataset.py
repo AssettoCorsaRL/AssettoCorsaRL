@@ -20,12 +20,14 @@ import numpy as np
 try:
     from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
     from assetto_corsa_rl.ac_env import parse_image_shape
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
     if src_path not in sys.path:
         sys.path.insert(0, src_path)
     from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option
 
 
 def parse_args():
@@ -40,9 +42,7 @@ def parse_args():
         help="Directory where image stacks will be saved",
     )
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Telemetry host")
-    parser.add_argument(
-        "--recv-port", type=int, default=9876, help="Telemetry receive port"
-    )
+    parser.add_argument("--recv-port", type=int, default=9876, help="Telemetry receive port")
     parser.add_argument(
         "--send-port", type=int, default=9877, help="Action send port (unused here)"
     )
@@ -141,9 +141,7 @@ def key_loop(telemetry: Telemetry, args) -> None:
         latest = telemetry.get_latest_image()
         if latest is not None:
             try:
-                resized = cv2.resize(
-                    latest, (img_w, img_h), interpolation=cv2.INTER_LINEAR
-                )
+                resized = cv2.resize(latest, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
             except Exception:
                 resized = cv2.resize(latest, (img_w, img_h))
             # keep as uint8 (H, W)
@@ -170,8 +168,43 @@ def key_loop(telemetry: Telemetry, args) -> None:
     print(f"Saved {saved} stacks to {args.output_dir}")
 
 
-def main():
-    args = parse_args()
+@cli_command(group="ac", name="save-images", help="Save grayscale screenshots from Assetto Corsa")
+@cli_option("--output-dir", default="datasets/ac_images", help="Output directory")
+@cli_option("--host", default="127.0.0.1", help="Telemetry host")
+@cli_option("--recv-port", default=9876, help="Telemetry receive port")
+@cli_option("--send-port", default=9877, help="Action send port")
+@cli_option("--capture-rate", default=0.1, type=float, help="Seconds between captures")
+@cli_option("--frame-stack", default=4, help="Number of frames to stack per sample")
+@cli_option("--image-shape", default="84x84", help="Target image shape HxW")
+@cli_option("--max-images", default=None, type=int, help="Maximum number of image stacks")
+@cli_option("--prefix", default="frame", help="Filename prefix")
+@cli_option("--save-png", is_flag=True, help="Also save PNG visualization")
+def main(
+    output_dir,
+    host,
+    recv_port,
+    send_port,
+    capture_rate,
+    frame_stack,
+    image_shape,
+    max_images,
+    prefix,
+    save_png,
+):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        output_dir=Path(output_dir),
+        host=host,
+        recv_port=recv_port,
+        send_port=send_port,
+        capture_rate=capture_rate,
+        frame_stack=frame_stack,
+        image_shape=image_shape,
+        max_images=max_images,
+        prefix=prefix,
+        save_png=save_png,
+    )
 
     with Telemetry(
         host=args.host,

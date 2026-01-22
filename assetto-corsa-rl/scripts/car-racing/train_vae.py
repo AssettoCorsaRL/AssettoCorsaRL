@@ -1,6 +1,6 @@
 """
 Usage:
-    python assetto-corsa-rl/scripts/train_vae.py --epochs 10 --batch-size 128 --steps-per-epoch 500
+    acrl car-racing train-vae --epochs 10 --batch-size 128 --steps-per-epoch 500
 """
 
 from __future__ import annotations
@@ -199,12 +199,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--z-dim", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--beta", type=float, default=1.0)
-    p.add_argument(
-        "--warmup-steps", type=int, default=500, help="Linear LR warmup steps"
-    )
-    p.add_argument(
-        "--grad-clip", type=float, default=1.0, help="Gradient clipping value"
-    )
+    p.add_argument("--warmup-steps", type=int, default=500, help="Linear LR warmup steps")
+    p.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value")
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gpus", type=int, default=0)
@@ -218,14 +214,71 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-project", type=str, default="assetto_corsa_rl_vae")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-name", type=str, default=None)
-    p.add_argument(
-        "--wandb-offline", action="store_true", help="Run wandb in offline mode"
-    )
+    p.add_argument("--wandb-offline", action="store_true", help="Run wandb in offline mode")
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
+@cli_command(group="car-racing", name="train-vae", help="Train VAE on CarRacing environment")
+@cli_option("--epochs", default=10, help="Number of epochs")
+@cli_option("--batch-size", default=32, help="Batch size")
+@cli_option("--steps-per-epoch", default=1000, help="Steps per epoch")
+@cli_option("--val-steps", default=200, help="Validation steps")
+@cli_option("--z-dim", default=32, help="Latent dimension")
+@cli_option("--lr", default=1e-3, type=float, help="Learning rate")
+@cli_option("--beta", default=1.0, type=float, help="KL weight")
+@cli_option("--warmup-steps", default=500, help="Linear LR warmup steps")
+@cli_option("--grad-clip", default=1.0, type=float, help="Gradient clipping value")
+@cli_option("--num-workers", default=4, help="Data loader workers")
+@cli_option("--seed", default=42, help="Random seed")
+@cli_option("--gpus", default=0, help="Number of GPUs")
+@cli_option("--ckpt-dir", default="checkpoints", help="Checkpoint directory")
+@cli_option("--frames", default=4, help="Number of consecutive frames to stack")
+@cli_option("--wandb-project", default="assetto_corsa_rl_vae", help="WandB project")
+@cli_option("--wandb-entity", default=None, help="WandB entity")
+@cli_option("--wandb-name", default=None, help="WandB run name")
+@cli_option("--wandb-offline", is_flag=True, help="Run wandb in offline mode")
+def main(
+    epochs,
+    batch_size,
+    steps_per_epoch,
+    val_steps,
+    z_dim,
+    lr,
+    beta,
+    warmup_steps,
+    grad_clip,
+    num_workers,
+    seed,
+    gpus,
+    ckpt_dir,
+    frames,
+    wandb_project,
+    wandb_entity,
+    wandb_name,
+    wandb_offline,
+):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(
+        epochs=epochs,
+        batch_size=batch_size,
+        steps_per_epoch=steps_per_epoch,
+        val_steps=val_steps,
+        z_dim=z_dim,
+        lr=lr,
+        beta=beta,
+        warmup_steps=warmup_steps,
+        grad_clip=grad_clip,
+        num_workers=num_workers,
+        seed=seed,
+        gpus=gpus,
+        ckpt_dir=ckpt_dir,
+        frames=frames,
+        wandb_project=wandb_project,
+        wandb_entity=wandb_entity,
+        wandb_name=wandb_name,
+        wandb_offline=wandb_offline,
+    )
 
     pl.seed_everything(args.seed, workers=True)
 
@@ -304,9 +357,7 @@ def main():
         gradient_clip_val=args.grad_clip,
     )
 
-    print(
-        f"\n🚀 Starting training: {args.epochs} epochs, {args.steps_per_epoch} steps/epoch\n"
-    )
+    print(f"\n🚀 Starting training: {args.epochs} epochs, {args.steps_per_epoch} steps/epoch\n")
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
     final_ckpt = Path(args.ckpt_dir) / "vae-final.pth"

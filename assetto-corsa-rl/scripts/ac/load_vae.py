@@ -1,7 +1,7 @@
 """Load a trained VAE and inspect encoder/decoder outputs on environment frames.
 
 Example:
-    python assetto-corsa-rl/scripts/ac/load_vae.py --ckpt loss=0.1031.ckpt
+    acrl ac load-vae --ckpt loss=0.1031.ckpt
 """
 
 from __future__ import annotations
@@ -10,13 +10,13 @@ import argparse
 import sys
 from pathlib import Path
 from typing import Tuple
-
 import torch
 import torchvision
 import numpy as np
 from PIL import Image
 import cv2
 import time
+import click
 
 repo_root = Path(__file__).resolve().parents[2]
 src_path = str(repo_root / "src")
@@ -25,8 +25,22 @@ if src_path not in sys.path:
 
 from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 from assetto_corsa_rl.env_helper import create_gym_env  # type: ignore
-from assetto_corsa_rl.ac_env import parse_image_shape, get_device
+from assetto_corsa_rl.ac_env import parse_image_shape, get_device  # type: ignore
 from collections import deque
+
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+except Exception:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "cli_registry", Path(src_path) / "assetto_corsa_rl" / "cli_registry.py"
+    )
+    if spec and spec.loader:
+        cli_registry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_registry)
+        cli_command = cli_registry.cli_command
+        cli_option = cli_registry.cli_option
 
 # optional AC env
 try:
@@ -37,9 +51,7 @@ except Exception:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument(
-        "--ckpt", type=Path, required=True, help="VAE checkpoint (state_dict) to load"
-    )
+    p.add_argument("--ckpt", type=Path, required=True, help="VAE checkpoint (state_dict) to load")
     p.add_argument(
         "--env",
         type=str,
@@ -53,12 +65,8 @@ def parse_args():
         default=1,
         help="Number of grayscale frames stacked by the env",
     )
-    p.add_argument(
-        "--image-shape", type=str, default="84x84", help="HxW image shape (e.g. 84x84)"
-    )
-    p.add_argument(
-        "--device", type=str, default=None, help="Device to run on (cpu/cuda)"
-    )
+    p.add_argument("--image-shape", type=str, default="84x84", help="HxW image shape (e.g. 84x84)")
+    p.add_argument("--device", type=str, default=None, help="Device to run on (cpu/cuda)")
     return p.parse_args()
 
 
@@ -124,10 +132,17 @@ def _recon_display(
     return key
 
 
-def main():
-    args = parse_args()
-    img_h, img_w = parse_image_shape(args.image_shape)
-    device = get_device(args.device)
+@cli_command(
+    group="ac", name="load-vae", help="Load and inspect a trained VAE on environment frames"
+)
+@cli_option("--ckpt", required=True, help="VAE checkpoint path")
+@cli_option("--env", default="ac", type=click.Choice(["gym", "ac"]), help="Environment to use")
+@cli_option("--frames", default=1, help="Number of grayscale frames stacked")
+@cli_option("--image-shape", default="84x84", help="Image shape HxW")
+@cli_option("--device", default=None, help="Device to run on")
+def main(ckpt, env, frames, image_shape, device):
+    img_h, img_w = parse_image_shape(image_shape)
+    device = get_device(device)
 
     vae = ConvVAE(
         z_dim=1024,
@@ -135,21 +150,22 @@ def main():
         warmup_steps=500,
         im_shape=(img_h, img_w),
     )
-    ckpt = torch.load(str(args.ckpt), map_location="cpu")
+    ckpt_data = torch.load(str(ckpt), map_location="cpu")
     try:
-        vae.load_state_dict(ckpt)
+        vae.load_state_dict(ckpt_data)
     except Exception:
         # try nested key (lightning or dict)
-        if isinstance(ckpt, dict) and "state_dict" in ckpt:
-            vae.load_state_dict(ckpt["state_dict"])  # type: ignore
+        if isinstance(ckpt_data, dict) and "state_dict" in ckpt_data:
+            vae.load_state_dict(ckpt_data["state_dict"])  # type: ignore
         else:
             raise
 
     vae.to(device)
     vae.eval()
+    print(f"✓ Loaded VAE from {ckpt}")
 
     # continuous interactive-only display of decoder output
-    if args.env == "gym":
+    if env == "gym":
         env = create_gym_env(height=img_h, width=img_w, device=device, num_envs=1)
         td = env.reset()
 
@@ -158,7 +174,7 @@ def main():
                 pixels = td["pixels"]  # shape (B, C, H, W) or (C, H, W)
                 pixels_sample = pixels[0] if pixels.dim() == 4 else pixels
 
-                x = graystack_to_rgb_input(pixels_sample.cpu(), args.frames).to(device)
+                x = graystack_to_rgb_input(pixels_sample.cpu(), frames).to(device)
                 with torch.no_grad():
                     recon = vae(x)
 
@@ -188,15 +204,15 @@ def main():
 
         # initialize frame buffer with the initial frame repeated
         initial_img = obs["image"]  # H, W, 1 uint8
-        frame_buf = deque(maxlen=args.frames)
+        frame_buf = deque(maxlen=frames)
         fr = torch.from_numpy(initial_img[..., 0].astype(np.float32) / 255.0)
-        for _ in range(args.frames):
+        for _ in range(frames):
             frame_buf.append(fr.clone())
 
         try:
             while True:
                 stacked = torch.stack(list(frame_buf), dim=0)
-                x = graystack_to_rgb_input(stacked, args.frames).to(device)
+                x = graystack_to_rgb_input(stacked, frames).to(device)
 
                 with torch.no_grad():
                     recon = vae(x)
@@ -217,13 +233,8 @@ def main():
                     obs, info = env.reset()
                     initial_img = obs["image"]
                     frame_buf = deque(
-                        [
-                            torch.from_numpy(
-                                initial_img[..., 0].astype(np.float32) / 255.0
-                            )
-                        ]
-                        * args.frames,
-                        maxlen=args.frames,
+                        [torch.from_numpy(initial_img[..., 0].astype(np.float32) / 255.0)] * frames,
+                        maxlen=frames,
                     )
 
                 time.sleep(0.01)

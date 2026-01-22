@@ -1,7 +1,7 @@
 """
 Usage:
-    python assetto-corsa-rl/scripts/ac/vis_racing_line.py --input racing_lines.json
-    python assetto-corsa-rl/scripts/ac/vis_racing_line.py --input monza_20260109_194248.json --lap 0
+    acrl ac vis-racing-line --input racing_lines.json
+    acrl ac vis-racing-line --input monza_20260109_194248.json --lap 0
 """
 
 import sys
@@ -17,6 +17,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.animation import FuncAnimation
 
+from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+
 
 class RacingLineVisualizer:
     def __init__(self, racing_data: Dict[str, Any], lap_index: int = 0):
@@ -29,9 +31,7 @@ class RacingLineVisualizer:
             )
 
         self.lap = racing_data["laps"][lap_index]
-        self.positions = np.array(
-            [[p["x"], p["y"], p["z"]] for p in self.lap["positions"]]
-        )
+        self.positions = np.array([[p["x"], p["y"], p["z"]] for p in self.lap["positions"]])
 
         self.azim = -60
         self.elev = 30
@@ -299,10 +299,14 @@ def load_racing_data(filepath: str) -> Dict[str, Any]:
     return data
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Visualize racing line from recorded telemetry"
-    )
+@cli_command(
+    group="ac", name="vis-racing-line", help="Visualize racing line from recorded telemetry"
+)
+@cli_option("--input", "-i", required=True, help="Input racing line JSON file")
+@cli_option("--lap", "-l", default=0, help="Lap index to visualize")
+@cli_option("--no-animate", is_flag=True, help="Disable car animation")
+def main(input, lap, no_animate):
+    parser = argparse.ArgumentParser(description="Visualize racing line from recorded telemetry")
     parser.add_argument(
         "--input",
         "-i",
@@ -323,9 +327,9 @@ def main():
         help="Disable car animation",
     )
 
-    args = parser.parse_args()
+    # args = parser.parse_args()
 
-    input_path = Path(args.input)
+    input_path = Path(input)
     if not input_path.exists():
         print(f"❌ Error: File not found: {input_path}")
         return
@@ -336,12 +340,12 @@ def main():
     print(f"✓ Loaded {racing_data['num_laps']} lap(s)")
 
     try:
-        visualizer = RacingLineVisualizer(racing_data, lap_index=args.lap)
-        print(f"\n🏁 Visualizing lap {args.lap}")
+        visualizer = RacingLineVisualizer(racing_data, lap_index=lap)
+        print(f"\n🏁 Visualizing lap {lap}")
         print(f"   Points: {len(visualizer.positions)}")
         print(f"   Lap time: {visualizer.lap.get('lap_time', 0):.2f}s\n")
 
-        visualizer.show(animate=not args.no_animate)
+        visualizer.show(animate=not no_animate)
     except ValueError as e:
         print(f"❌ Error: {e}")
         return

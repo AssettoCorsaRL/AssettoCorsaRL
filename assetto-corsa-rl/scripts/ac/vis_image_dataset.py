@@ -1,7 +1,7 @@
 """Visualize saved frame-stack datasets (.npz) from Assetto Corsa.
 
 Usage:
-    python assetto-corsa-rl\scripts\ac\vis_image_dataset.py --input-dir datasets/ac_images
+    acrl ac vis-dataset --input-dir datasets/demonstrations
 
 Controls (when window active):
  - n : next sample
@@ -21,22 +21,33 @@ import argparse
 import sys
 import time
 import math
+import click
 
 import cv2
 import numpy as np
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+except Exception:
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[2]
+    src_path = repo_root / "src"
+    spec = importlib.util.spec_from_file_location(
+        "cli_registry", src_path / "assetto_corsa_rl" / "cli_registry.py"
+    )
+    if spec and spec.loader:
+        cli_registry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_registry)
+        cli_command = cli_registry.cli_command
+        cli_option = cli_registry.cli_option
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Visualize frame-stack dataset (.npz)")
-    p.add_argument(
-        "--input-dir", type=Path, required=True, help="Directory with .npz stacks"
-    )
-    p.add_argument(
-        "--pattern", type=str, default="*.npz", help="Glob pattern to find stacks"
-    )
-    p.add_argument(
-        "--delay", type=float, default=0.08, help="Frame playback delay in seconds"
-    )
+    p.add_argument("--input-dir", type=Path, required=True, help="Directory with .npz stacks")
+    p.add_argument("--pattern", type=str, default="*.npz", help="Glob pattern to find stacks")
+    p.add_argument("--delay", type=float, default=0.08, help="Frame playback delay in seconds")
     p.add_argument("--scale", type=float, default=1.0, help="Display scale factor")
     p.add_argument("--start", type=int, default=0, help="Starting sample index")
     p.add_argument(
@@ -64,11 +75,33 @@ def load_stack(path: Path) -> np.ndarray:
         d = np.load(str(path))
         if "stack" in d:
             stack = d["stack"]
+        elif "frames" in d:
+            # Demonstration batch format: (N, F, H, W)
+            frames = d["frames"]
+            if frames.ndim == 4:
+                # Take first sample and return as (F, H, W)
+                stack = frames[0]
+            else:
+                stack = frames
         else:
             # try first array
             keys = [k for k in d.files]
             stack = d[keys[0]]
+
         stack = np.asarray(stack)
+
+        # Scale floats in 0..1 to 0..255 so images aren’t black
+        if np.issubdtype(stack.dtype, np.floating):
+            max_val = float(stack.max() if stack.size else 1.0)
+            if max_val <= 1.0:
+                stack = stack * 255.0
+            stack = stack.clip(0, 255)
+
+        # Handle different formats
+        if stack.ndim == 4:
+            # Format: (N, F, H, W) - take first sample
+            stack = stack[0]
+
         if stack.ndim != 3:
             raise ValueError(f"Expected stack with shape (F, H, W), got {stack.shape}")
         return stack.astype(np.uint8)
@@ -101,26 +134,35 @@ def to_bgr(img: np.ndarray) -> np.ndarray:
 
 
 def overlay_text(img: np.ndarray, text: str) -> None:
-    cv2.putText(
-        img, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA
-    )
+    cv2.putText(img, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
 
-def main():
-    args = parse_args()
-    files = list_files(args.input_dir, args.pattern)
+@cli_command(
+    group="ac", name="vis-dataset", help="Visualize saved frame-stack datasets from Assetto Corsa"
+)
+@cli_option("--input-dir", required=True, help="Directory with .npz stacks")
+@cli_option("--pattern", default="*.npz", help="Glob pattern to find stacks")
+@cli_option("--delay", default=0.08, type=float, help="Frame playback delay in seconds")
+@cli_option("--scale", default=1.0, type=float, help="Display scale factor")
+@cli_option("--start", default=0, help="Starting sample index")
+@cli_option(
+    "--view-mode", default="anim", type=click.Choice(["anim", "montage"]), help="Initial view mode"
+)
+@cli_option("--save-dir", default=None, help="Directory to save visualizations")
+def main(input_dir, pattern, delay, scale, start, view_mode, save_dir):
+    input_dir = Path(input_dir)
+    files = list_files(input_dir, pattern)
     if len(files) == 0:
-        print(f"No files found in {args.input_dir} matching {args.pattern}")
+        print(f"No files found in {input_dir} matching {pattern}")
         sys.exit(1)
 
-    idx = max(0, min(args.start, len(files) - 1))
+    idx = max(0, min(start, len(files) - 1))
 
     window_name = "AC Dataset Viewer"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     playing = False
-    view_mode = args.view_mode
-    delay = args.delay
+    # view_mode is already a parameter
     frame_idx = 0
     last_time = time.time()
 
@@ -150,14 +192,12 @@ def main():
         # overlay filename and instructions
         overlay = display_img.copy()
         overlay_text(overlay, title)
-        overlay_text(
-            overlay, "n:next  b:prev  space:play/pause  m:toggle view  s:save  q:quit"
-        )
+        overlay_text(overlay, "n:next  b:prev  space:play/pause  m:toggle view  s:save  q:quit")
 
         # apply scaling
-        if args.scale != 1.0:
-            h = int(overlay.shape[0] * args.scale)
-            w = int(overlay.shape[1] * args.scale)
+        if scale != 1.0:
+            h = int(overlay.shape[0] * scale)
+            w = int(overlay.shape[1] * scale)
             overlay = cv2.resize(overlay, (w, h), interpolation=cv2.INTER_LINEAR)
 
         cv2.imshow(window_name, overlay)
@@ -186,13 +226,13 @@ def main():
             elif key == ord("<"):
                 delay = delay * 1.5
             elif key == ord("s"):
-                save_dir = args.save_dir or args.input_dir
-                save_dir.mkdir(parents=True, exist_ok=True)
+                save_path = Path(save_dir) if save_dir else input_dir
+                save_path.mkdir(parents=True, exist_ok=True)
                 if view_mode == "montage":
                     out = make_montage(stack)
                 else:
                     out = stack[frame_idx]
-                out_path = save_dir / f"viz_{idx+1:06d}_{path.stem}.png"
+                out_path = save_path / f"viz_{idx+1:06d}_{path.stem}.png"
                 cv2.imwrite(str(out_path), out)
                 print(f"Saved visualization: {out_path}")
 

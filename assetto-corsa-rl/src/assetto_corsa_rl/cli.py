@@ -61,7 +61,7 @@ def discover_commands():
 
 
 @click.group()
-@click.version_option(version="0.1.1", prog_name="acrl")
+@click.version_option(version="0.1.2", prog_name="acrl")
 def cli():
     """Assetto Corsa Reinforcement Learning Toolkit.
 
@@ -80,17 +80,22 @@ def build_cli():
 
     # Create groups and commands dynamically
     for group_name, commands in all_commands.items():
-        # Create the group
-        @cli.group(name=group_name)
-        def make_group():
-            pass
+        # Create the group with proper closure
+        def make_group_factory(gname):
+            @cli.group(name=gname)
+            def group():
+                pass
 
-        if group_name == "ac":
-            make_group.__doc__ = "Assetto Corsa commands"
-        elif group_name == "car-racing":
-            make_group.__doc__ = "Car Racing (Gym) commands"
-        else:
-            make_group.__doc__ = f"{group_name} commands"
+            if gname == "ac":
+                group.__doc__ = "Assetto Corsa commands"
+            elif gname == "car-racing":
+                group.__doc__ = "Car Racing (Gym) commands"
+            else:
+                group.__doc__ = f"{gname} commands"
+
+            return group
+
+        current_group = make_group_factory(group_name)
 
         # Add each command to the group
         for cmd_def in commands:
@@ -109,7 +114,7 @@ def build_cli():
             cmd_func.__doc__ = cmd_def.get("help") or original_func.__doc__
 
             # Apply click.command decorator
-            cmd_func = make_group.command(
+            cmd_func = current_group.command(
                 name=cmd_def["name"],
                 help=cmd_def.get("help"),
                 short_help=cmd_def.get("short_help"),

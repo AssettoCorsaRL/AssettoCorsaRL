@@ -4,7 +4,7 @@ This script records image observations and user inputs (steering, throttle, brak
 from Assetto Corsa to create a dataset for pretraining the SAC actor.
 
 Usage:
-    python scripts/ac/record_demonstrations.py --output-dir datasets/demonstrations --duration 300
+    acrl ac record-demonstrations --output-dir datasets/demonstrations2 --duration 999999999999
 
 Controls:
     - Press Ctrl+C to stop recording early
@@ -30,11 +30,11 @@ src_path = str(repo_root / "src")
 if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
-from assetto_corsa_rl.ac_telemetry_helper import Telemetry
-from assetto_corsa_rl.ac_env import parse_image_shape
+from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
+from assetto_corsa_rl.ac_env import parse_image_shape  # type: ignore
 
 try:
-    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 
@@ -227,9 +227,7 @@ class DemonstrationRecorder:
         )
 
         self.saved_samples += len(self.frames)
-        print(
-            f"✓ Saved {len(self.frames)} samples to {filename} (total: {self.saved_samples})"
-        )
+        print(f"✓ Saved {len(self.frames)} samples to {filename} (total: {self.saved_samples})")
 
         # Clear buffers
         self.frames = []
@@ -244,9 +242,7 @@ class DemonstrationRecorder:
 
         # Save session metadata
         session_info = {
-            "session_start": (
-                self.session_start.isoformat() if self.session_start else None
-            ),
+            "session_start": (self.session_start.isoformat() if self.session_start else None),
             "session_end": datetime.now().isoformat(),
             "total_samples": self.saved_samples,
             "image_shape": list(self.image_shape),
@@ -266,9 +262,7 @@ class DemonstrationRecorder:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Record human demonstrations from Assetto Corsa"
-    )
+    parser = argparse.ArgumentParser(description="Record human demonstrations from Assetto Corsa")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -320,46 +314,38 @@ def parse_args():
     help="Record human demonstrations for behavioral cloning",
 )
 @cli_option("--output-dir", default="datasets/demonstrations", help="Output directory")
-@cli_option(
-    "--duration", default=0, help="Recording duration in seconds (0 = until Ctrl+C)"
-)
+@cli_option("--duration", default=0, help="Recording duration in seconds (0 = until Ctrl+C)")
 @cli_option("--image-shape", default="84x84", help="Image shape HxW")
 @cli_option("--frame-stack", default=4, help="Number of frames to stack")
 @cli_option("--save-interval", default=500, help="Save batch every N frames")
-@cli_option(
-    "--min-speed", default=5.0, type=float, help="Minimum speed (mph) to record"
-)
+@cli_option("--min-speed", default=5.0, type=float, help="Minimum speed (mph) to record")
 @cli_option("--target-fps", default=20.0, type=float, help="Target recording FPS")
-def main(
-    output_dir, duration, image_shape, frame_stack, save_interval, min_speed, target_fps
-):
-    args = parse_args()
-
+def main(output_dir, duration, image_shape, frame_stack, save_interval, min_speed, target_fps):
     # Parse image shape
     try:
-        image_shape = parse_image_shape(args.image_shape)
+        parsed_image_shape = parse_image_shape(image_shape)
     except ValueError as e:
         print(f"Error: {e}")
         return
 
     recorder = DemonstrationRecorder(
-        output_dir=args.output_dir,
-        image_shape=image_shape,
-        frame_stack=args.frame_stack,
-        save_interval=args.save_interval,
-        min_speed_mph=args.min_speed,
+        output_dir=output_dir,
+        image_shape=parsed_image_shape,
+        frame_stack=frame_stack,
+        save_interval=save_interval,
+        min_speed_mph=min_speed,
     )
 
     print("=" * 50)
     print("Assetto Corsa Demonstration Recorder")
     print("=" * 50)
-    print(f"Output: {args.output_dir}")
-    print(f"Image shape: {image_shape}")
-    print(f"Frame stack: {args.frame_stack}")
-    print(f"Min speed: {args.min_speed} mph")
-    print(f"Target FPS: {args.target_fps}")
-    if args.duration > 0:
-        print(f"Duration: {args.duration} seconds")
+    print(f"Output: {output_dir}")
+    print(f"Image shape: {parsed_image_shape}")
+    print(f"Frame stack: {frame_stack}")
+    print(f"Min speed: {min_speed} mph")
+    print(f"Target FPS: {target_fps}")
+    if duration > 0:
+        print(f"Duration: {duration} seconds")
     else:
         print("Duration: Until Ctrl+C")
     print("=" * 50)
@@ -367,7 +353,7 @@ def main(
     input("\nPress Enter when Assetto Corsa is running and you're ready to record...")
 
     recorder.start()
-    frame_interval = 1.0 / args.target_fps
+    frame_interval = 1.0 / target_fps
     start_time = time.time()
     last_frame_time = start_time
 
@@ -376,7 +362,7 @@ def main(
             current_time = time.time()
 
             # Check duration
-            if args.duration > 0 and (current_time - start_time) >= args.duration:
+            if duration > 0 and (current_time - start_time) >= duration:
                 print("\nDuration reached, stopping...")
                 break
 

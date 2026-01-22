@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "assetto-corsa-rl"
-version = "0.1.1"
+version = "0.1.2"
 description = "Reinforcement Learning toolkit for Assetto Corsa and Car Racing environments"
 readme = "README.md"
 requires-python = ">=3.9"

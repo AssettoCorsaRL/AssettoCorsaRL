@@ -1,13 +1,13 @@
 """
 Usage:
     Record 1 episode:
-    python assetto-corsa-rl\scripts\car-racing\load.py --model pretrained.pt --episodes 1 --max-steps 1000 --video agent.mp4
+    acrl car-racing test --model pretrained.pt --episodes 1 --max-steps 1000 --video agent.mp4
 
     Play 5 episodes with rendering (human window):
-    python assetto-corsa-rl\scripts\load.py --model pretrained.pt --episodes 5 --render
+    acrl car-racing test --model pretrained.pt --episodes 5 --render
 
     Play 3 episodes on CPU without render:
-    python assetto-corsa-rl\scripts\load.py --model pretrained_model.pt --episodes 3 --device cpu
+    acrl car-racing test --model pretrained_model.pt --episodes 3 --device cpu
 """
 
 import argparse
@@ -86,12 +86,8 @@ def deterministic_action_from_actor(actor, pixels):
         if dist_kwargs is None:
             dist_kwargs = getattr(actor, "_distribution_kwargs", None)
         if dist_kwargs is not None and "low" in dist_kwargs and "high" in dist_kwargs:
-            low = torch.as_tensor(
-                dist_kwargs["low"], device=raw.device, dtype=raw.dtype
-            )
-            high = torch.as_tensor(
-                dist_kwargs["high"], device=raw.device, dtype=raw.dtype
-            )
+            low = torch.as_tensor(dist_kwargs["low"], device=raw.device, dtype=raw.dtype)
+            high = torch.as_tensor(dist_kwargs["high"], device=raw.device, dtype=raw.dtype)
 
             low = low.unsqueeze(0).expand_as(raw)
             high = high.unsqueeze(0).expand_as(raw)
@@ -152,9 +148,7 @@ def play(
             sample_pixels = sample_pixels.unsqueeze(0)
         if sample_pixels.shape[1] != 4:
             print("Using dummy pixels tensor (1,4,84,84) to initialize lazy layers")
-            sample_pixels = torch.zeros(
-                1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
-            )
+            sample_pixels = torch.zeros(1, 4, 84, 84, device=device, dtype=sample_pixels.dtype)
 
         sample_action = torch.zeros(1, env.action_spec.shape[-1], device=device)
 
@@ -189,9 +183,7 @@ def play(
             needs = []
             if _has_uninitialized_params(actor):
                 needs.append("actor")
-                print(
-                    "Actor has uninitialized params; running alternative module forward"
-                )
+                print("Actor has uninitialized params; running alternative module forward")
                 try:
                     actor.module(TensorDict({"pixels": sample_pixels}, batch_size=1))
                 except Exception as e:
@@ -236,9 +228,7 @@ def play(
             if not needs:
                 break
 
-            sample_pixels = torch.randn(
-                1, 4, 84, 84, device=device, dtype=sample_pixels.dtype
-            )
+            sample_pixels = torch.randn(1, 4, 84, 84, device=device, dtype=sample_pixels.dtype)
 
         if (
             _has_uninitialized_params(actor)
@@ -345,9 +335,7 @@ def play(
                 break
 
         episode_returns.append(total_reward)
-        print(
-            f"Episode {ep+1}/{episodes} finished: steps={steps}, reward={total_reward:.2f}"
-        )
+        print(f"Episode {ep+1}/{episodes} finished: steps={steps}, reward={total_reward:.2f}")
 
         if video_path and len(frames) > 0:
             try:
@@ -361,9 +349,7 @@ def play(
 
                 first_frame = frames[0]
                 if not isinstance(first_frame, np.ndarray):
-                    print(
-                        f"Warning: frames are not numpy arrays (type: {type(first_frame)})"
-                    )
+                    print(f"Warning: frames are not numpy arrays (type: {type(first_frame)})")
                     continue
 
                 height, width = first_frame.shape[:2]
@@ -392,24 +378,14 @@ def play(
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Load a pretrained SAC model and play episodes"
-    )
-    parser.add_argument(
-        "--model", type=str, required=True, help="Path to pretrained model (.pt)"
-    )
+    parser = argparse.ArgumentParser(description="Load a pretrained SAC model and play episodes")
+    parser.add_argument("--model", type=str, required=True, help="Path to pretrained model (.pt)")
     parser.add_argument(
         "--device", type=str, default=None, help="Device to use (e.g., cuda:0, cpu)"
     )
-    parser.add_argument(
-        "--episodes", type=int, default=5, help="Number of episodes to play"
-    )
-    parser.add_argument(
-        "--max-steps", type=int, default=1000, help="Max steps per episode"
-    )
-    parser.add_argument(
-        "--render", action="store_true", help="Render environment to screen"
-    )
+    parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to play")
+    parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
+    parser.add_argument("--render", action="store_true", help="Render environment to screen")
     parser.add_argument(
         "--deterministic", action="store_true", help="Use deterministic (mean) actions"
     )
@@ -423,9 +399,7 @@ def parse_args():
     return parser.parse_args()
 
 
-@cli_command(
-    group="car-racing", name="test", help="Test a trained SAC agent in CarRacing"
-)
+@cli_command(group="car-racing", name="test", help="Test a trained SAC agent in CarRacing")
 @cli_option("--model", required=True, help="Path to pretrained model (.pt)")
 @cli_option("--device", default=None, help="Device to use (e.g., cuda:0, cpu)")
 @cli_option("--episodes", default=5, help="Number of episodes to play")
@@ -433,9 +407,7 @@ def parse_args():
 @cli_option("--render", is_flag=True, help="Render environment to screen")
 @cli_option("--deterministic", is_flag=True, help="Use deterministic (mean) actions")
 @cli_option("--seed", default=None, type=int, help="Optional random seed")
-@cli_option(
-    "--video", default=None, help="Path to save video recording (e.g., agent.mp4)"
-)
+@cli_option("--video", default=None, help="Path to save video recording (e.g., agent.mp4)")
 def main(model, device, episodes, max_steps, render, deterministic, seed, video):
     args = parse_args()
     play(
