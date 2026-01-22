@@ -20,6 +20,8 @@
 
 > [!IMPORTANT]
 > Visit the [Documentation](https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/docs)
+>
+> Check out our [PyPi package](https://pypi.org/project/assetto-corsa-rl/)
 
 ---
 <div id="user-content-toc">
