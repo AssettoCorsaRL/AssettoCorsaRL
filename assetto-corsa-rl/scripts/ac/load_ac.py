@@ -177,6 +177,16 @@ def main(ckpt, episodes, device, racing_line, deterministic):
 
             while not done:
                 pixels = td.get("pixels")
+                if pixels is None:
+                    next_td = td.get("next") if hasattr(td, "get") else None
+                    if next_td is not None:
+                        pixels = next_td.get("pixels")
+
+                if pixels is None:
+                    raise RuntimeError(
+                        "No pixels returned from env. Ensure Assetto Corsa image capture is running (capture_images=True) and telemetry is connected."
+                    )
+
                 if pixels.dim() == 3:
                     pixels = pixels.unsqueeze(0)
 

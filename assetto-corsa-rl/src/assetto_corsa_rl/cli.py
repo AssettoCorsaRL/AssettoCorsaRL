@@ -11,16 +11,48 @@ import click
 import importlib
 import importlib.util
 
-# Add scripts directory to path
-_scripts_dir = Path(__file__).resolve().parents[2] / "scripts"
-if str(_scripts_dir) not in sys.path:
-    sys.path.insert(0, str(_scripts_dir))
-
 from assetto_corsa_rl.cli_registry import get_registered_commands
+
+
+def _find_scripts_dir():
+    # 1. Development mode - scripts at repo root
+    dev_scripts = Path(__file__).parent.parent.parent / "scripts"
+    if dev_scripts.exists():
+        return dev_scripts
+
+    # 2. Installed via pip - check sys.prefix/share
+    installed_scripts = Path(sys.prefix) / "share" / "assetto_corsa_rl" / "scripts"
+    if installed_scripts.exists():
+        return installed_scripts
+
+    # 3. Check in package directory (if copied during install)
+    package_scripts = Path(__file__).parent / "scripts"
+    if package_scripts.exists():
+        return package_scripts
+
+    return None
+
+
+_scripts_dir = _find_scripts_dir()
 
 
 def discover_commands():
     """Discover and import all scripts with CLI decorators."""
+    if _scripts_dir is None or not _scripts_dir.exists():
+        print(f"Warning: Scripts directory not found. Searched locations:", file=sys.stderr)
+        print(
+            f"  - Development: {Path(__file__).parent.parent.parent / 'scripts'}", file=sys.stderr
+        )
+        print(
+            f"  - Installed: {Path(sys.prefix) / 'share' / 'assetto_corsa_rl' / 'scripts'}",
+            file=sys.stderr,
+        )
+        return
+
+    # Add scripts directory to path for imports
+    if str(_scripts_dir) not in sys.path:
+        sys.path.insert(0, str(_scripts_dir))
+
     # Import all AC scripts
     ac_scripts_dir = _scripts_dir / "ac"
     if ac_scripts_dir.exists():
@@ -40,7 +72,6 @@ def discover_commands():
                     file=sys.stderr,
                 )
 
-    # Import all car-racing scripts
     car_racing_scripts_dir = _scripts_dir / "car-racing"
     if car_racing_scripts_dir.exists():
         for script_file in car_racing_scripts_dir.glob("*.py"):
@@ -61,7 +92,7 @@ def discover_commands():
 
 
 @click.group()
-@click.version_option(version="0.1.2", prog_name="acrl")
+@click.version_option(version="0.1.3", prog_name="acrl")
 def cli():
     """Assetto Corsa Reinforcement Learning Toolkit.
 

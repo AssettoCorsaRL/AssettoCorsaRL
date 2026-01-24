@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.distributions import Normal
 import click
 import wandb
 from tensordict import TensorDict
@@ -101,9 +100,11 @@ class BehavioralCloningTrainer:
         device: torch.device,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
+        simultaneous_penalty_weight: float = 0.1,
     ):
         self.actor = actor
         self.device = device
+        self.simul_penalty_weight = simultaneous_penalty_weight
 
         # Only optimize actor parameters
         self.optimizer = torch.optim.AdamW(
@@ -126,7 +127,7 @@ class BehavioralCloningTrainer:
 
         total_loss = 0.0
         total_mse = 0.0
-        total_nll = 0.0
+        total_penalty = 0.0
         total_samples = 0
 
         for batch_idx, (frames, actions) in enumerate(dataloader):
@@ -141,16 +142,17 @@ class BehavioralCloningTrainer:
 
             # Get predicted action distribution
             pred_loc = td_out["loc"]  # (B, action_dim)
-            pred_scale = td_out["scale"]  # (B, action_dim)
 
-            # Use negative log likelihood loss which properly accounts for the distribution
-            dist = Normal(pred_loc, pred_scale)
-            nll_loss = -dist.log_prob(actions).mean()
-
-            # Still compute MSE for logging
+            # Use MSE loss between predicted mean and target actions
             mse_loss = F.mse_loss(pred_loc, actions)
 
-            loss = nll_loss
+            # Penalize overlapping throttle and brake predictions
+            throttle_pred = pred_loc[:, 1]
+            brake_pred = pred_loc[:, 2]
+            overlap = torch.relu(throttle_pred) * torch.relu(brake_pred)
+            simul_penalty = self.simul_penalty_weight * overlap.mean()
+
+            loss = mse_loss + simul_penalty
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -163,17 +165,17 @@ class BehavioralCloningTrainer:
 
             total_loss += loss.item() * batch_size
             total_mse += mse_loss.item() * batch_size
-            total_nll += nll_loss.item() * batch_size
+            total_penalty += simul_penalty.item() * batch_size
             total_samples += batch_size
 
         avg_loss = total_loss / total_samples
         avg_mse = total_mse / total_samples
-        avg_nll = total_nll / total_samples
+        avg_penalty = total_penalty / total_samples
 
         return {
             "loss": avg_loss,
             "mse": avg_mse,
-            "nll": avg_nll,
+            "simul_penalty": avg_penalty,
         }
 
     def validate(self, dataloader: DataLoader) -> dict:
@@ -181,7 +183,7 @@ class BehavioralCloningTrainer:
         self.actor.eval()
 
         total_mse = 0.0
-        total_nll = 0.0
+        total_penalty = 0.0
         total_samples = 0
 
         with torch.no_grad():
@@ -195,23 +197,24 @@ class BehavioralCloningTrainer:
                 td_out = self.actor(td_in)
 
                 pred_loc = td_out["loc"]
-                pred_scale = td_out["scale"]
 
-                # Compute both MSE and NLL
                 mse = F.mse_loss(pred_loc, actions)
-                dist = Normal(pred_loc, pred_scale)
-                nll = -dist.log_prob(actions).mean()
+
+                throttle_pred = pred_loc[:, 1]
+                brake_pred = pred_loc[:, 2]
+                overlap = torch.relu(throttle_pred) * torch.relu(brake_pred)
+                simul_penalty = self.simul_penalty_weight * overlap.mean()
 
                 total_mse += mse.item() * batch_size
-                total_nll += nll.item() * batch_size
+                total_penalty += simul_penalty.item() * batch_size
                 total_samples += batch_size
 
         avg_mse = total_mse / total_samples
-        avg_nll = total_nll / total_samples
+        avg_penalty = total_penalty / total_samples
 
         return {
             "val_mse": avg_mse,
-            "val_nll": avg_nll,
+            "val_simul_penalty": avg_penalty,
         }
 
     def step_scheduler(self, val_loss: float):
@@ -234,6 +237,12 @@ class BehavioralCloningTrainer:
 @cli_option("--num-workers", default=4, help="Data loader workers")
 @cli_option("--num-cells", default=256, help="Hidden layer size")
 @cli_option(
+    "--simul-penalty-weight",
+    default=0.1,
+    type=float,
+    help="Penalty weight when throttle and brake overlap",
+)
+@cli_option(
     "--vae-checkpoint",
     type=click.Path(exists=True),
     default=None,
@@ -250,6 +259,7 @@ def main(
     val_split,
     num_workers,
     num_cells,
+    simul_penalty_weight,
     vae_checkpoint,
     wandb_project,
     wandb_offline,
@@ -277,6 +287,7 @@ def main(
                 "val_split": val_split,
                 "num_workers": num_workers,
                 "num_cells": num_cells,
+                "simul_penalty_weight": simul_penalty_weight,
                 "vae_checkpoint": str(vae_checkpoint) if vae_checkpoint else None,
                 "wandb_project": wandb_project,
             },
@@ -349,6 +360,7 @@ def main(
         actor=actor,
         device=device,
         lr=lr,
+        simultaneous_penalty_weight=simul_penalty_weight,
     )
 
     # Training loop
@@ -376,9 +388,9 @@ def main(
             "epoch": epoch,
             "train/loss": train_metrics["loss"],
             "train/mse": train_metrics["mse"],
-            "train/nll": train_metrics["nll"],
+            "train/simul_penalty": train_metrics["simul_penalty"],
             "val/mse": val_metrics["val_mse"],
-            "val/nll": val_metrics["val_nll"],
+            "val/simul_penalty": val_metrics["val_simul_penalty"],
             "lr": trainer.optimizer.param_groups[0]["lr"],
         }
         try:
@@ -390,7 +402,9 @@ def main(
             f"Epoch {epoch + 1}/{epochs} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
             f"Train MSE: {train_metrics['mse']:.6f} | "
-            f"Val MSE: {val_metrics['val_mse']:.6f}"
+            f"Train Penalty: {train_metrics['simul_penalty']:.6f} | "
+            f"Val MSE: {val_metrics['val_mse']:.6f} | "
+            f"Val Penalty: {val_metrics['val_simul_penalty']:.6f}"
         )
 
         # Save best model
@@ -406,6 +420,7 @@ def main(
                         "config": {
                             "num_cells": num_cells,
                             "vae_checkpoint_path": vae_path,
+                            "simul_penalty_weight": simul_penalty_weight,
                         },
                     },
                     output_path,
@@ -430,6 +445,7 @@ def main(
                 "config": {
                     "num_cells": num_cells,
                     "vae_checkpoint_path": vae_path,
+                    "simul_penalty_weight": simul_penalty_weight,
                 },
             },
             final_path,

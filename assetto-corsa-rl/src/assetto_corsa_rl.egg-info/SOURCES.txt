@@ -43,9 +43,6 @@ src/assetto_corsa_rl/model/__init__.py
 src/assetto_corsa_rl/model/noisy.py
 src/assetto_corsa_rl/model/sac.py
 src/assetto_corsa_rl/model/vae.py
-src/assetto_corsa_rl/scripts/__init__.py
-src/assetto_corsa_rl/scripts/ac/__init__.py
-src/assetto_corsa_rl/scripts/car_racing/__init__.py
 src/assetto_corsa_rl/train/__init__.py
 src/assetto_corsa_rl/train/train_core.py
 src/assetto_corsa_rl/train/train_utils.py

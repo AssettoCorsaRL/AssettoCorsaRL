@@ -22,3 +22,5 @@
 /assetto-corsa-rl/dist
 /assetto-corsa-rl/scripts/ac/__pycache__
 /assetto-corsa-rl/scripts/car-racing/__pycache__
+/datasets2
+/clean.ps1

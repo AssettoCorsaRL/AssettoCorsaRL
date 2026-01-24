@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "assetto-corsa-rl"
-version = "0.1.2"
+version = "0.1.3"
 description = "Reinforcement Learning toolkit for Assetto Corsa and Car Racing environments"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -67,13 +67,8 @@ Documentation = "https://github.com/yourusername/assetto-corsa-rl#readme"
 acrl = "assetto_corsa_rl.cli:main"
 
 [tool.setuptools]
-packages = ["assetto_corsa_rl"]
-
-[tool.setuptools.package-dir]
-assetto_corsa_rl = "src/assetto_corsa_rl"
-
-[tool.setuptools.package-data]
-assetto_corsa_rl = ["**/*.yaml", "**/*.json"]
+packages = { find = { where = ["src"] } }
+include-package-data = false
 
 [tool.black]
 line-length = 100

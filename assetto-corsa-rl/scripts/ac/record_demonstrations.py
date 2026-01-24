@@ -131,6 +131,11 @@ class DemonstrationRecorder:
 
         inputs = data["inputs"]
         steer = inputs.get("steer", 0.0)
+        steer = (
+            max(-1.0, min(1.0, float(steer) / 260.0))
+            if abs(float(steer)) <= 260
+            else float(steer) / abs(float(steer))
+        )
         gas = inputs.get("gas", 0.0)
         brake = inputs.get("brake", 0.0)
 
@@ -164,20 +169,20 @@ class DemonstrationRecorder:
 
         return True
 
-    def record_frame(self) -> bool:
-        """Record a single frame. Returns True if successful."""
+    def record_frame(self, return_frame: bool = False):
+        """Record a single frame. Optionally returns (success, stacked_frame, action)."""
         if self.telemetry is None:
-            return False
+            return (False, None, None) if return_frame else False
 
         # Get telemetry data
         data = self.telemetry.get_latest()
         if not self._should_record(data):
-            return False
+            return (False, None, None) if return_frame else False
 
         # Get image
         img = self.telemetry.get_latest_image()
         if img is None:
-            return False
+            return (False, None, None) if return_frame else False
 
         # Preprocess and stack
         processed = self._preprocess_image(img)
@@ -186,7 +191,7 @@ class DemonstrationRecorder:
         # Extract action
         action = self._extract_action(data)
         if action is None:
-            return False
+            return (False, None, None) if return_frame else False
 
         # Store
         self.frames.append(stacked.copy())
@@ -205,6 +210,8 @@ class DemonstrationRecorder:
         if len(self.frames) >= self.save_interval:
             self._save_batch()
 
+        if return_frame:
+            return True, stacked, action
         return True
 
     def _save_batch(self):
@@ -320,7 +327,19 @@ def parse_args():
 @cli_option("--save-interval", default=500, help="Save batch every N frames")
 @cli_option("--min-speed", default=5.0, type=float, help="Minimum speed (mph) to record")
 @cli_option("--target-fps", default=20.0, type=float, help="Target recording FPS")
-def main(output_dir, duration, image_shape, frame_stack, save_interval, min_speed, target_fps):
+@cli_option("--display", is_flag=True, help="Show live frames and input values in a window")
+@cli_option("--display-scale", default=2.0, type=float, help="Scale factor for display window")
+def main(
+    output_dir,
+    duration,
+    image_shape,
+    frame_stack,
+    save_interval,
+    min_speed,
+    target_fps,
+    display,
+    display_scale,
+):
     # Parse image shape
     try:
         parsed_image_shape = parse_image_shape(image_shape)
@@ -357,6 +376,12 @@ def main(output_dir, duration, image_shape, frame_stack, save_interval, min_spee
     start_time = time.time()
     last_frame_time = start_time
 
+    window_name = "AC Demo Recorder" if display else None
+    if display and window_name:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    paused = False
+
     try:
         while True:
             current_time = time.time()
@@ -374,14 +399,64 @@ def main(output_dir, duration, image_shape, frame_stack, save_interval, min_spee
 
             last_frame_time = current_time
 
-            # Record frame
-            success = recorder.record_frame()
+            if paused:
+                # Still process key input when paused
+                if display:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord("q"):
+                        print("\nQuit requested (q pressed)")
+                        break
+                    if key == ord("p"):
+                        paused = not paused
+                        print("\nResumed recording")
+                    if key == ord("d"):
+                        recorder.frames = []
+                        recorder.actions = []
+                        recorder.metadata = []
+                        recorder.frame_buffer = []
+                        print("\nCleared unsaved batch")
+                continue
 
-            # Progress update
+            # Record frame
+            result = recorder.record_frame(return_frame=display)
+            if display:
+                success, stacked_frame, action = (
+                    result if isinstance(result, tuple) else (False, None, None)
+                )
+            else:
+                success = bool(result)
+
+            if display and success and stacked_frame is not None and action is not None:
+                frame_to_show = stacked_frame[-1]
+                vis = cv2.cvtColor(frame_to_show, cv2.COLOR_GRAY2BGR)
+                text = f"{action[0]:.2f} {action[1]:.2f} {action[2]:.2f}"
+                cv2.putText(
+                    vis, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA
+                )
+                if display_scale and display_scale != 1.0:
+                    h, w = vis.shape[:2]
+                    new_w = max(1, int(w * display_scale))
+                    new_h = max(1, int(h * display_scale))
+                    vis = cv2.resize(vis, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                cv2.imshow(window_name, vis)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q"):
+                    print("\nQuit requested (q pressed)")
+                    break
+                if key == ord("p"):
+                    paused = not paused
+                    print("\nPaused recording" if paused else "\nResumed recording")
+                if key == ord("d"):
+                    recorder.frames = []
+                    recorder.actions = []
+                    recorder.metadata = []
+                    recorder.frame_buffer = []
+                    print("\nCleared unsaved batch")
+
             if recorder.total_frames % 100 == 0 and recorder.total_frames > 0:
                 elapsed_total = current_time - start_time
                 fps = recorder.total_frames / elapsed_total if elapsed_total > 0 else 0
-                status = "recording" if success else "waiting"
+                status = "paused" if paused else ("recording" if success else "waiting")
                 print(
                     f"\rFrames: {recorder.total_frames} | "
                     f"Saved: {recorder.saved_samples} | "
@@ -396,6 +471,8 @@ def main(output_dir, duration, image_shape, frame_stack, save_interval, min_spee
     finally:
         recorder.finalize()
         recorder.stop()
+        if display:
+            cv2.destroyWindow(window_name)
 
 
 if __name__ == "__main__":
