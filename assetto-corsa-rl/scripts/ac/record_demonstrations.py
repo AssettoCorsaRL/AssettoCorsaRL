@@ -49,6 +49,7 @@ class DemonstrationRecorder:
         frame_stack: int = 4,
         save_interval: int = 100,
         min_speed_mph: float = 5.0,
+        input_config: Optional[Dict[str, bool]] = None,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -57,10 +58,13 @@ class DemonstrationRecorder:
         self.frame_stack = frame_stack
         self.save_interval = save_interval
         self.min_speed_mph = min_speed_mph
+        self.input_config = input_config or {}
+        self.observation_keys = [k for k, v in self.input_config.items() if v]
 
         # Storage
         self.frames: list = []
         self.actions: list = []
+        self.observations: list = []  # NEW: store observation vectors
         self.metadata: list = []
 
         # Frame buffer for stacking
@@ -123,6 +127,29 @@ class DemonstrationRecorder:
 
         # Stack frames: (N, H, W)
         return np.stack(self.frame_buffer, axis=0)
+
+    def _extract_observation(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
+        """Extract observation values from telemetry data based on input_config."""
+        if data is None or not self.observation_keys:
+            return None
+
+        # Import extraction helper from ac_env
+        try:
+            from assetto_corsa_rl.ac_env import AssettoCorsa
+
+            # Create a temporary instance to use its extraction method
+            temp_env = AssettoCorsa.__new__(AssettoCorsa)
+            obs_values = [
+                temp_env._extract_value_from_data(key, data) for key in self.observation_keys
+            ]
+            return np.array(obs_values, dtype=np.float32)
+        except Exception as e:
+            # Fallback: just return zeros if extraction fails
+            return (
+                np.zeros(len(self.observation_keys), dtype=np.float32)
+                if self.observation_keys
+                else None
+            )
 
     def _extract_action(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
         """Extract user inputs as action array [steering, throttle, brake]."""
@@ -193,9 +220,14 @@ class DemonstrationRecorder:
         if action is None:
             return (False, None, None) if return_frame else False
 
+        # Extract observation
+        observation = self._extract_observation(data)
+
         # Store
         self.frames.append(stacked.copy())
         self.actions.append(action.copy())
+        if observation is not None:
+            self.observations.append(observation.copy())
         self.metadata.append(
             {
                 "timestamp": time.time(),
@@ -226,19 +258,29 @@ class DemonstrationRecorder:
         filename = f"demo_batch_{batch_idx:05d}_{timestamp}.npz"
         filepath = self.output_dir / filename
 
-        np.savez_compressed(
-            filepath,
-            frames=np.array(self.frames, dtype=np.uint8),
-            actions=np.array(self.actions, dtype=np.float32),
-            # Don't save full metadata to save space, just essential stats
-        )
+        # Build save dict
+        save_dict = {
+            "frames": np.array(self.frames, dtype=np.uint8),
+            "actions": np.array(self.actions, dtype=np.float32),
+        }
+
+        # Add observations if available
+        if self.observations:
+            save_dict["observations"] = np.array(self.observations, dtype=np.float32)
+            save_dict["observation_keys"] = np.array(self.observation_keys, dtype=object)
+
+        np.savez_compressed(filepath, **save_dict)
 
         self.saved_samples += len(self.frames)
-        print(f"✓ Saved {len(self.frames)} samples to {filename} (total: {self.saved_samples})")
+        obs_info = f" with {len(self.observation_keys)} obs dims" if self.observations else ""
+        print(
+            f"✓ Saved {len(self.frames)} samples{obs_info} to {filename} (total: {self.saved_samples})"
+        )
 
         # Clear buffers
         self.frames = []
         self.actions = []
+        self.observations = []
         self.metadata = []
 
     def finalize(self):
@@ -329,6 +371,9 @@ def parse_args():
 @cli_option("--target-fps", default=20.0, type=float, help="Target recording FPS")
 @cli_option("--display", is_flag=True, help="Show live frames and input values in a window")
 @cli_option("--display-scale", default=2.0, type=float, help="Scale factor for display window")
+@cli_option(
+    "--config-path", default=None, help="Path to env config YAML (loads input configuration)"
+)
 def main(
     output_dir,
     duration,
@@ -339,6 +384,7 @@ def main(
     target_fps,
     display,
     display_scale,
+    config_path,
 ):
     # Parse image shape
     try:
@@ -347,12 +393,33 @@ def main(
         print(f"Error: {e}")
         return
 
+    # Load input config from YAML if provided
+    input_config = None
+    if config_path:
+        try:
+            import yaml
+            from pathlib import Path
+
+            cfg_path = Path(config_path)
+            with open(cfg_path, "r") as f:
+                cfg_data = yaml.safe_load(f)
+                input_config = cfg_data.get("environment", {}).get("inputs", {})
+                if input_config:
+                    enabled_count = sum(1 for v in input_config.values() if v)
+                    print(
+                        f"✓ Loaded input config: {enabled_count}/{len(input_config)} inputs enabled"
+                    )
+        except Exception as e:
+            print(f"Warning: Could not load config from {config_path}: {e}")
+            input_config = None
+
     recorder = DemonstrationRecorder(
         output_dir=output_dir,
         image_shape=parsed_image_shape,
         frame_stack=frame_stack,
         save_interval=save_interval,
         min_speed_mph=min_speed,
+        input_config=input_config,
     )
 
     print("=" * 50)

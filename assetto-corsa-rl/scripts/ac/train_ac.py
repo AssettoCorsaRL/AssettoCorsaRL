@@ -61,6 +61,13 @@ def load_cfg_from_yaml(root: Path = None):
     cfg_dict.update(env)
     cfg_dict.update(train)
 
+    input_config = env.get("inputs", None)
+
+    cfg_dict = {}
+    cfg_dict.update(model)
+    cfg_dict.update(env)
+    cfg_dict.update(train)
+
     def _try_convert(x):
         if x is None or isinstance(x, bool):
             return x
@@ -94,8 +101,13 @@ def load_cfg_from_yaml(root: Path = None):
 
     converted["num_envs"] = 1
 
+    converted["input_config"] = input_config
+
     cfg = SimpleNamespace(**converted)
     print(f"Loaded config from: {env_p}, {model_p}, {train_p}")
+    if input_config:
+        enabled_count = sum(1 for v in input_config.values() if v)
+        print(f"  Input config: {enabled_count}/{len(input_config)} inputs enabled")
     return cfg
 
 
@@ -127,6 +139,7 @@ def train():
         device=device,
         image_shape=(84, 84),
         frame_stack=4,
+        input_config=getattr(cfg, "input_config", None),
     )
     current_td = env.reset()
 
@@ -193,9 +206,7 @@ def train():
             checkpoint = torch.load(bc_pretrained_path, map_location=device)
             if "actor_state" in checkpoint:
                 actor.load_state_dict(checkpoint["actor_state"])
-                print(
-                    f"✓ Loaded BC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
-                )
+                print(f"✓ Loaded BC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})")
             else:
                 print("Warning: No actor_state found in BC checkpoint")
             # Initialize target networks fresh (no critic pretraining from BC)
@@ -215,9 +226,7 @@ def train():
     value_lr = getattr(cfg, "value_lr", cfg.lr)
 
     actor_opt = torch.optim.Adam(actor.parameters(), lr=actor_lr)
-    critic_opt = torch.optim.Adam(
-        list(q1.parameters()) + list(q2.parameters()), lr=critic_lr
-    )
+    critic_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=critic_lr)
     value_opt = torch.optim.Adam(value.parameters(), lr=value_lr)
 
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))

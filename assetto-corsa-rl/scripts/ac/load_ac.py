@@ -60,13 +60,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def create_env(racing_line_path: str, device):
+def create_env(racing_line_path: str, device, input_config=None):
     """Create the Assetto Corsa environment with transforms matching training."""
     return create_transformed_env(
         racing_line_path=racing_line_path,
         device=device,
         image_shape=(84, 84),
         frame_stack=4,
+        input_config=input_config,
     )
 
 
@@ -105,7 +106,8 @@ def load_checkpoint(ckpt_path: str, device: str):
 @cli_option(
     "--deterministic", is_flag=True, help="Use deterministic actions (mean of distribution)"
 )
-def main(ckpt, episodes, device, racing_line, deterministic):
+@cli_option("--config-path", default=None, help="Path to env config YAML (for input configuration)")
+def main(ckpt, episodes, device, racing_line, deterministic, config_path):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     device = get_device(device)
@@ -114,8 +116,28 @@ def main(ckpt, episodes, device, racing_line, deterministic):
     print("Loading Trained SAC Agent for Assetto Corsa")
     print("=" * 60)
 
+    # Load input config from YAML if provided
+    input_config = None
+    if config_path:
+        try:
+            import yaml
+            from pathlib import Path
+
+            cfg_path = Path(config_path)
+            with open(cfg_path, "r") as f:
+                cfg_data = yaml.safe_load(f)
+                input_config = cfg_data.get("environment", {}).get("inputs", {})
+                if input_config:
+                    enabled_count = sum(1 for v in input_config.values() if v)
+                    print(
+                        f"✓ Loaded input config: {enabled_count}/{len(input_config)} inputs enabled"
+                    )
+        except Exception as e:
+            print(f"Warning: Could not load config from {config_path}: {e}")
+            input_config = None
+
     print(f"Creating environment with racing line: {racing_line}")
-    env = create_env(racing_line, device)
+    env = create_env(racing_line, device, input_config)
 
     checkpoint, actor_state, config = load_checkpoint(ckpt, device)
 

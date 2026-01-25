@@ -1,3 +1,76 @@
 environment:
   num_envs: 1 # ac env doesn't support parallel envs
   frames_per_batch: 1024
+
+  # Model inputs configuration - set to true to include in observation vector
+  inputs:
+    # car dynamics
+    speed_kmh: true
+    speed_mph: false
+    speed_ms: false
+    rpm: true
+    gear: true
+    velocity_x: true
+    velocity_y: true
+    velocity_z: true
+    acceleration_x: true
+    acceleration_y: true
+    acceleration_z: true
+
+    # car state
+    fuel: false
+    tyres_off_track: true
+    in_pit_lane: false
+    damage: false
+    cg_height: false
+    drive_train_speed: false
+
+    # DRS/ERS/KERS
+    drs_available: false
+    drs_enabled: false
+    has_drs: false
+    has_ers: false
+    has_kers: false
+
+    # inputs (current)
+    gas: true
+    brake: true
+    clutch: true
+    steer: true
+
+    # lap info
+    current_lap_time: false
+    last_lap_time: false
+    best_lap_time: false
+    lap_count: false
+    lap_delta: false
+    current_sector: false
+    invalid_lap: false
+
+    # Track/Session info
+    track_length: false
+    air_temp: false
+    road_temp: false
+    session_status: false
+
+    # Tyre info (per-tyre averages or specific tyres)
+    tyre_wear_avg: true
+    tyre_pressure_avg: true
+    tyre_temp_avg: true
+    tyre_dirty_avg: false
+    tyre_slip_ratio_avg: true
+    tyre_slip_angle_avg: true
+
+    # Individual tyre temps (front-left, front-right, rear-left, rear-right)
+    tyre_0_temp_i: true
+    tyre_0_temp_m: true
+    tyre_0_temp_o: true
+    tyre_1_temp_i: true
+    tyre_1_temp_m: true
+    tyre_1_temp_o: true
+    tyre_2_temp_i: true
+    tyre_2_temp_m: true
+    tyre_2_temp_o: true
+    tyre_3_temp_i: true
+    tyre_3_temp_m: true
+    tyre_3_temp_o: true

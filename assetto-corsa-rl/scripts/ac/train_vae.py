@@ -27,16 +27,8 @@ from assetto_corsa_rl.ac_env import parse_image_shape  # type: ignore
 try:
     from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 except Exception:
-    import importlib.util
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 
-    spec = importlib.util.spec_from_file_location(
-        "cli_registry", Path(src_path) / "assetto_corsa_rl" / "cli_registry.py"
-    )
-    if spec and spec.loader:
-        cli_registry = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cli_registry)
-        cli_command = cli_registry.cli_command
-        cli_option = cli_registry.cli_option
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger

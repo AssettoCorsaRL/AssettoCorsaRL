@@ -24,6 +24,7 @@ class AssettoCorsa(gym.Env):
         timeout: float = 1.0,
         use_dummy_controller: bool = False,
         observation_keys: Optional[list] = None,
+        input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
         constant_reward_per_ms: float = 0.01,
         reward_per_m_advanced_along_centerline: float = 1.0,
@@ -56,9 +57,15 @@ class AssettoCorsa(gym.Env):
             dtype=np.float32,
         )
 
-        if observation_keys is None:
-            observation_keys = []
-        self.observation_keys = observation_keys
+        if input_config is not None:
+            self.input_config = input_config
+            self.observation_keys = self._build_observation_keys_from_config(input_config)
+        elif observation_keys is not None:
+            self.observation_keys = observation_keys
+            self.input_config = None
+        else:
+            self.observation_keys = []
+            self.input_config = None
 
         self.include_image = include_image
         self.observation_image_shape = observation_image_shape  # (H, W)
@@ -99,6 +106,24 @@ class AssettoCorsa(gym.Env):
         self._last_speed = 0.0
         self._current_racing_line_index = 0
 
+    def _build_observation_keys_from_config(self, input_config: Dict[str, bool]) -> list:
+        """Build list of observation keys from input configuration dict.
+
+        Args:
+            input_config: Dict mapping input names to boolean (True = include in observation)
+
+        Returns:
+            List of observation key strings in consistent order
+        """
+        keys = []
+
+        # Define the order of keys (matches telemetry data structure)
+        for key, enabled in input_config.items():
+            if enabled:
+                keys.append(key)
+
+        return keys
+
     def _get_observation(self):
         """Extract observation from telemetry data and optional screenshot image.
 
@@ -127,13 +152,182 @@ class AssettoCorsa(gym.Env):
         else:
             self._last_obs = data
             vector = np.array(
-                [float(data.get(key, 0.0)) for key in self.observation_keys],
+                [self._extract_value_from_data(key, data) for key in self.observation_keys],
                 dtype=np.float32,
             )
 
         if self.include_image:
             return {"vector": vector, "image": img}
         return vector
+
+    def _extract_value_from_data(self, key: str, data: Dict[str, Any]) -> float:
+        """Extract a single observation value from telemetry data.
+
+        Args:
+            key: The observation key name
+            data: Full telemetry data dict
+
+        Returns:
+            Float value for the observation
+        """
+        try:
+            # Car dynamics
+            if key == "speed_kmh":
+                return float(data.get("car", {}).get("speed_kmh", 0.0))
+            elif key == "speed_mph":
+                return float(data.get("car", {}).get("speed_mph", 0.0))
+            elif key == "speed_ms":
+                return float(data.get("car", {}).get("speed_ms", 0.0))
+            elif key == "rpm":
+                return float(data.get("car", {}).get("rpm", 0.0))
+            elif key == "gear":
+                return float(data.get("car", {}).get("gear", 0.0))
+            elif key == "velocity_x":
+                vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
+                return float(vel[0] if len(vel) > 0 else 0.0)
+            elif key == "velocity_y":
+                vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
+                return float(vel[1] if len(vel) > 1 else 0.0)
+            elif key == "velocity_z":
+                vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
+                return float(vel[2] if len(vel) > 2 else 0.0)
+            elif key == "acceleration_x":
+                acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
+                return float(acc[0] if len(acc) > 0 else 0.0)
+            elif key == "acceleration_y":
+                acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
+                return float(acc[1] if len(acc) > 1 else 0.0)
+            elif key == "acceleration_z":
+                acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
+                return float(acc[2] if len(acc) > 2 else 0.0)
+
+            # Car state
+            elif key == "fuel":
+                return float(data.get("car", {}).get("fuel", 0.0))
+            elif key == "tyres_off_track":
+                return float(data.get("car", {}).get("tyres_off_track", 0.0))
+            elif key == "in_pit_lane":
+                return float(data.get("car", {}).get("in_pit_lane", 0.0))
+            elif key == "damage":
+                damage = data.get("car", {}).get("damage", [0.0, 0.0, 0.0, 0.0, 0.0])
+                return float(sum(damage) if isinstance(damage, list) else damage)
+            elif key == "cg_height":
+                return float(data.get("car", {}).get("cg_height", 0.0))
+            elif key == "drive_train_speed":
+                return float(data.get("car", {}).get("drive_train_speed", 0.0))
+
+            # DRS/ERS/KERS
+            elif key == "drs_available":
+                return float(data.get("car", {}).get("drs_available", 0.0))
+            elif key == "drs_enabled":
+                return float(data.get("car", {}).get("drs_enabled", 0.0))
+            elif key == "has_drs":
+                return float(data.get("stats", {}).get("has_drs", 0.0))
+            elif key == "has_ers":
+                return float(data.get("stats", {}).get("has_ers", 0.0))
+            elif key == "has_kers":
+                return float(data.get("stats", {}).get("has_kers", 0.0))
+
+            # Inputs
+            elif key == "gas":
+                return float(data.get("inputs", {}).get("gas", 0.0))
+            elif key == "brake":
+                return float(data.get("inputs", {}).get("brake", 0.0))
+            elif key == "clutch":
+                return float(data.get("inputs", {}).get("clutch", 0.0))
+            elif key == "steer":
+                return float(data.get("inputs", {}).get("steer", 0.0))
+
+            # Lap info
+            elif key == "current_lap_time":
+                return float(data.get("lap", {}).get("get_current_lap_time", 0.0))
+            elif key == "last_lap_time":
+                return float(data.get("lap", {}).get("get_last_lap_time", 0.0))
+            elif key == "best_lap_time":
+                return float(data.get("lap", {}).get("get_best_lap_time", 0.0))
+            elif key == "lap_count":
+                return float(data.get("lap", {}).get("get_lap_count", 0.0))
+            elif key == "lap_delta":
+                return float(data.get("lap", {}).get("get_lap_delta", 0.0))
+            elif key == "current_sector":
+                return float(data.get("lap", {}).get("get_current_sector", 0.0))
+            elif key == "invalid_lap":
+                return float(data.get("lap", {}).get("get_invalid", 0.0))
+
+            # Session info
+            elif key == "track_length":
+                return float(data.get("session", {}).get("track_length", 0.0))
+            elif key == "air_temp":
+                return float(data.get("session", {}).get("air_temp", 0.0))
+            elif key == "road_temp":
+                return float(data.get("session", {}).get("road_temp", 0.0))
+            elif key == "session_status":
+                return float(data.get("session", {}).get("session_status", 0.0))
+
+            # Tyre averages
+            elif key == "tyre_wear_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    wear_vals = [t.get("wear", 0.0) for t in tyres if t.get("wear") is not None]
+                    return float(np.mean(wear_vals) if wear_vals else 0.0)
+                return 0.0
+            elif key == "tyre_pressure_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    pressure_vals = [
+                        t.get("pressure", 0.0) for t in tyres if t.get("pressure") is not None
+                    ]
+                    return float(np.mean(pressure_vals) if pressure_vals else 0.0)
+                return 0.0
+            elif key == "tyre_temp_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    temp_vals = []
+                    for t in tyres:
+                        if t.get("temp_m") is not None:
+                            temp_vals.append(t["temp_m"])
+                    return float(np.mean(temp_vals) if temp_vals else 0.0)
+                return 0.0
+            elif key == "tyre_dirty_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    dirty_vals = [t.get("dirty", 0.0) for t in tyres if t.get("dirty") is not None]
+                    return float(np.mean(dirty_vals) if dirty_vals else 0.0)
+                return 0.0
+            elif key == "tyre_slip_ratio_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    slip_vals = [
+                        t.get("slip_ratio", 0.0) for t in tyres if t.get("slip_ratio") is not None
+                    ]
+                    return float(np.mean(slip_vals) if slip_vals else 0.0)
+                return 0.0
+            elif key == "tyre_slip_angle_avg":
+                tyres = data.get("tyres", [])
+                if tyres:
+                    slip_vals = [
+                        t.get("slip_angle", 0.0) for t in tyres if t.get("slip_angle") is not None
+                    ]
+                    return float(np.mean(slip_vals) if slip_vals else 0.0)
+                return 0.0
+
+            # Individual tyre temps (tyre_N_temp_X where N=0-3, X=i/m/o)
+            elif key.startswith("tyre_") and "_temp_" in key:
+                parts = key.split("_")
+                tyre_idx = int(parts[1])
+                temp_pos = parts[3]  # i, m, or o
+                tyres = data.get("tyres", [])
+                if tyre_idx < len(tyres):
+                    return float(tyres[tyre_idx].get(f"temp_{temp_pos}", 0.0) or 0.0)
+                return 0.0
+
+            # Fallback: try to get from data directly (for backward compatibility)
+            else:
+                return float(data.get(key, 0.0))
+
+        except Exception as e:
+            # Silently return 0 for any extraction errors
+            return 0.0
 
     def _load_racing_line(self, filepath: str) -> None:
         """Load racing line from JSON file."""
@@ -360,6 +554,7 @@ def make_env(
     send_port: int = 9877,
     recv_port: int = 9876,
     racing_line_path: str = "racing_lines.json",
+    input_config: Optional[Dict[str, bool]] = None,
     **kwargs,
 ) -> AssettoCorsa:
     """Create an AssettoCorsa environment with default settings.
@@ -369,6 +564,7 @@ def make_env(
         send_port: Port for sending actions
         recv_port: Port for receiving telemetry
         racing_line_path: Path to racing line JSON file (required)
+        input_config: Dict mapping input names to bool (True = include in observation)
         **kwargs: Additional arguments passed to AssettoCorsa
     """
     return AssettoCorsa(
@@ -376,6 +572,7 @@ def make_env(
         send_port=send_port,
         recv_port=recv_port,
         racing_line_path=racing_line_path,
+        input_config=input_config,
         **kwargs,
     )
 
@@ -433,6 +630,7 @@ def create_transformed_env(
     recv_port: int = 9876,
     image_shape: Tuple[int, int] = (84, 84),
     frame_stack: int = 4,
+    input_config: Optional[Dict[str, bool]] = None,
     **env_kwargs,
 ):
     """Create an AssettoCorsa environment with standard transforms for vision-based RL.
@@ -445,6 +643,7 @@ def create_transformed_env(
         recv_port: Port for receiving telemetry
         image_shape: Target image dimensions (H, W)
         frame_stack: Number of frames to stack
+        input_config: Dict mapping input names to bool (True = include in observation)
         **env_kwargs: Additional arguments passed to AssettoCorsa
 
     Returns:
@@ -471,6 +670,7 @@ def create_transformed_env(
         racing_line_path=racing_line_path,
         include_image=True,
         observation_image_shape=(h, w),
+        input_config=input_config,
         **env_kwargs,
     )
 

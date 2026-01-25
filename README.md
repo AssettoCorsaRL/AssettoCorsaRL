@@ -16,7 +16,7 @@
 </div>
 </div>
 
-
+A reinforcement learning agent (using the SAC algorithm) learns to drive a Formula 1 car around the Monaco GP circuit in Assetto Corsa. The agent controls steering, acceleration, and braking by interacting with the track, receiving feedback, and improving over time.
 
 > [!IMPORTANT]
 > Visit the [Documentation](https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/docs)

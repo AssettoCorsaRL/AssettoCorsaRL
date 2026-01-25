@@ -4,7 +4,7 @@ This script loads recorded human demonstrations and pretrains the SAC actor
 to imitate the human policy before starting RL training.
 
 Usage:
-    acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64
+    acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1031.ckpt
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
 import click
 import wandb
 from tensordict import TensorDict
@@ -45,10 +46,19 @@ class DemonstrationDataset(Dataset):
         data_dir: Path,
         image_shape: Tuple[int, int] = (84, 84),
         frame_stack: int = 4,
+        augment: bool = True,
     ):
         self.data_dir = Path(data_dir)
         self.image_shape = image_shape
         self.frame_stack = frame_stack
+        self.augment = augment
+
+        if self.augment:
+            self.transform = T.Compose(
+                [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)]
+            )
+        else:
+            self.transform = None
 
         self.batch_files = sorted(self.data_dir.glob("demo_batch_*.npz"))
         if len(self.batch_files) == 0:
@@ -56,26 +66,45 @@ class DemonstrationDataset(Dataset):
 
         self.frames = []
         self.actions = []
+        self.observations = []  # store observations if available
+        self.has_observations = False
+        self.observation_keys = None
 
         print(f"Loading {len(self.batch_files)} demonstration batches...")
         for batch_file in self.batch_files:
             try:
-                data = np.load(batch_file)
+                data = np.load(batch_file, allow_pickle=True)
                 if "frames" not in data or "actions" not in data:
                     raise ValueError(f"Missing required keys in {batch_file}")
                 self.frames.append(data["frames"])
                 self.actions.append(data["actions"])
+
+                if "observations" in data:
+                    self.observations.append(data["observations"])
+                    if not self.has_observations and "observation_keys" in data:
+                        self.observation_keys = data["observation_keys"].tolist()
+                    self.has_observations = True
             except Exception as e:
                 raise RuntimeError(f"Failed to load {batch_file}: {e}")
 
         self.frames = np.concatenate(self.frames, axis=0)
         self.actions = np.concatenate(self.actions, axis=0)
 
-        print(f"✓ Loaded {len(self.frames)} demonstration samples")
+        if self.has_observations and self.observations:
+            self.observations = np.concatenate(self.observations, axis=0)
+            print(f"✓ Loaded {len(self.frames)} demonstration samples with observations")
+            print(f"  Observations shape: {self.observations.shape}")
+            if self.observation_keys:
+                print(
+                    f"  Observation keys ({len(self.observation_keys)}): {', '.join(self.observation_keys[:5])}..."
+                )
+        else:
+            self.observations = None
+            print(f"✓ Loaded {len(self.frames)} demonstration samples (no observations)")
+
         print(f"  Frames shape: {self.frames.shape}")
         print(f"  Actions shape: {self.actions.shape}")
 
-        # Validate data shapes
         assert self.frames.ndim == 4, f"Expected 4D frames, got {self.frames.ndim}D"
         assert self.actions.ndim == 2, f"Expected 2D actions, got {self.actions.ndim}D"
         print(f"  Action dim: {self.actions.shape[1]}")
@@ -88,7 +117,23 @@ class DemonstrationDataset(Dataset):
         frames = self.frames[idx].astype(np.float32) / 255.0
         actions = self.actions[idx].astype(np.float32)
 
-        return torch.from_numpy(frames), torch.from_numpy(actions)
+        frames_tensor = torch.from_numpy(frames)
+
+        # Apply augmentation if enabled (apply to all frames in stack)
+        if self.augment and self.transform is not None:
+            # Stack frames temporarily for augmentation
+            # frames_tensor is (frame_stack, H, W), need (1, frame_stack, H, W) for transforms
+            frames_stacked = frames_tensor.unsqueeze(0)  # (1, frame_stack, H, W)
+            frames_stacked = self.transform(frames_stacked)
+            frames_tensor = frames_stacked.squeeze(0)  # (frame_stack, H, W)
+
+        result = {"frames": frames_tensor, "actions": torch.from_numpy(actions)}
+
+        if self.has_observations and self.observations is not None:
+            observations = self.observations[idx].astype(np.float32)
+            result["observations"] = torch.from_numpy(observations)
+
+        return result
 
 
 class BehavioralCloningTrainer:
@@ -100,11 +145,9 @@ class BehavioralCloningTrainer:
         device: torch.device,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
-        simultaneous_penalty_weight: float = 0.1,
     ):
         self.actor = actor
         self.device = device
-        self.simul_penalty_weight = simultaneous_penalty_weight
 
         # Only optimize actor parameters
         self.optimizer = torch.optim.AdamW(
@@ -126,13 +169,18 @@ class BehavioralCloningTrainer:
         self.actor.train()
 
         total_loss = 0.0
-        total_mse = 0.0
-        total_penalty = 0.0
         total_samples = 0
 
-        for batch_idx, (frames, actions) in enumerate(dataloader):
-            frames = frames.to(self.device)
-            actions = actions.to(self.device)
+        for batch_idx, batch in enumerate(dataloader):
+            # Handle both old tuple format and new dict format
+            if isinstance(batch, dict):
+                frames = batch["frames"].to(self.device)
+                actions = batch["actions"].to(self.device)
+                # observations available but not used in BC training (vision-based)
+            else:
+                frames, actions = batch
+                frames = frames.to(self.device)
+                actions = actions.to(self.device)
 
             batch_size = frames.shape[0]
 
@@ -144,15 +192,7 @@ class BehavioralCloningTrainer:
             pred_loc = td_out["loc"]  # (B, action_dim)
 
             # Use MSE loss between predicted mean and target actions
-            mse_loss = F.mse_loss(pred_loc, actions)
-
-            # Penalize overlapping throttle and brake predictions
-            throttle_pred = pred_loc[:, 1]
-            brake_pred = pred_loc[:, 2]
-            overlap = torch.relu(throttle_pred) * torch.relu(brake_pred)
-            simul_penalty = self.simul_penalty_weight * overlap.mean()
-
-            loss = mse_loss + simul_penalty
+            loss = F.mse_loss(pred_loc, actions)
 
             # Backward pass
             self.optimizer.zero_grad()
@@ -164,18 +204,12 @@ class BehavioralCloningTrainer:
             self.optimizer.step()
 
             total_loss += loss.item() * batch_size
-            total_mse += mse_loss.item() * batch_size
-            total_penalty += simul_penalty.item() * batch_size
             total_samples += batch_size
 
         avg_loss = total_loss / total_samples
-        avg_mse = total_mse / total_samples
-        avg_penalty = total_penalty / total_samples
 
         return {
             "loss": avg_loss,
-            "mse": avg_mse,
-            "simul_penalty": avg_penalty,
         }
 
     def validate(self, dataloader: DataLoader) -> dict:
@@ -183,13 +217,18 @@ class BehavioralCloningTrainer:
         self.actor.eval()
 
         total_mse = 0.0
-        total_penalty = 0.0
         total_samples = 0
 
         with torch.no_grad():
-            for frames, actions in dataloader:
-                frames = frames.to(self.device)
-                actions = actions.to(self.device)
+            for batch in dataloader:
+                # Handle both old tuple format and new dict format
+                if isinstance(batch, dict):
+                    frames = batch["frames"].to(self.device)
+                    actions = batch["actions"].to(self.device)
+                else:
+                    frames, actions = batch
+                    frames = frames.to(self.device)
+                    actions = actions.to(self.device)
 
                 batch_size = frames.shape[0]
 
@@ -200,21 +239,13 @@ class BehavioralCloningTrainer:
 
                 mse = F.mse_loss(pred_loc, actions)
 
-                throttle_pred = pred_loc[:, 1]
-                brake_pred = pred_loc[:, 2]
-                overlap = torch.relu(throttle_pred) * torch.relu(brake_pred)
-                simul_penalty = self.simul_penalty_weight * overlap.mean()
-
                 total_mse += mse.item() * batch_size
-                total_penalty += simul_penalty.item() * batch_size
                 total_samples += batch_size
 
         avg_mse = total_mse / total_samples
-        avg_penalty = total_penalty / total_samples
 
         return {
             "val_mse": avg_mse,
-            "val_simul_penalty": avg_penalty,
         }
 
     def step_scheduler(self, val_loss: float):
@@ -236,12 +267,7 @@ class BehavioralCloningTrainer:
 @cli_option("--val-split", default=0.1, type=float, help="Validation split ratio")
 @cli_option("--num-workers", default=4, help="Data loader workers")
 @cli_option("--num-cells", default=256, help="Hidden layer size")
-@cli_option(
-    "--simul-penalty-weight",
-    default=0.1,
-    type=float,
-    help="Penalty weight when throttle and brake overlap",
-)
+@cli_option("--augment", is_flag=True, help="Enable data augmentation")
 @cli_option(
     "--vae-checkpoint",
     type=click.Path(exists=True),
@@ -259,7 +285,7 @@ def main(
     val_split,
     num_workers,
     num_cells,
-    simul_penalty_weight,
+    augment,
     vae_checkpoint,
     wandb_project,
     wandb_offline,
@@ -287,7 +313,7 @@ def main(
                 "val_split": val_split,
                 "num_workers": num_workers,
                 "num_cells": num_cells,
-                "simul_penalty_weight": simul_penalty_weight,
+                "augment": augment,
                 "vae_checkpoint": str(vae_checkpoint) if vae_checkpoint else None,
                 "wandb_project": wandb_project,
             },
@@ -307,6 +333,7 @@ def main(
         data_dir,
         image_shape=(IMAGE_HEIGHT, IMAGE_WIDTH),
         frame_stack=FRAME_STACK,
+        augment=augment,
     )
 
     # Split into train/val
@@ -360,7 +387,6 @@ def main(
         actor=actor,
         device=device,
         lr=lr,
-        simultaneous_penalty_weight=simul_penalty_weight,
     )
 
     # Training loop
@@ -387,10 +413,7 @@ def main(
         metrics = {
             "epoch": epoch,
             "train/loss": train_metrics["loss"],
-            "train/mse": train_metrics["mse"],
-            "train/simul_penalty": train_metrics["simul_penalty"],
             "val/mse": val_metrics["val_mse"],
-            "val/simul_penalty": val_metrics["val_simul_penalty"],
             "lr": trainer.optimizer.param_groups[0]["lr"],
         }
         try:
@@ -401,10 +424,7 @@ def main(
         print(
             f"Epoch {epoch + 1}/{epochs} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Train MSE: {train_metrics['mse']:.6f} | "
-            f"Train Penalty: {train_metrics['simul_penalty']:.6f} | "
-            f"Val MSE: {val_metrics['val_mse']:.6f} | "
-            f"Val Penalty: {val_metrics['val_simul_penalty']:.6f}"
+            f"Val MSE: {val_metrics['val_mse']:.6f}"
         )
 
         # Save best model
@@ -420,7 +440,6 @@ def main(
                         "config": {
                             "num_cells": num_cells,
                             "vae_checkpoint_path": vae_path,
-                            "simul_penalty_weight": simul_penalty_weight,
                         },
                     },
                     output_path,
@@ -445,7 +464,6 @@ def main(
                 "config": {
                     "num_cells": num_cells,
                     "vae_checkpoint_path": vae_path,
-                    "simul_penalty_weight": simul_penalty_weight,
                 },
             },
             final_path,

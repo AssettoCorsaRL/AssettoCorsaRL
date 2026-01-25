@@ -168,9 +168,7 @@ class UpBlock(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        self.upsample = nn.ConvTranspose2d(
-            in_channels, out_channels, 4, stride=2, padding=1
-        )
+        self.upsample = nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1)
 
         self.res_blocks = nn.ModuleList()
         self.attn_blocks = nn.ModuleList()
@@ -319,9 +317,7 @@ class ConvVAE(pl.LightningModule):
             nn.Sigmoid(),
         )
 
-        self.final_resize = nn.Upsample(
-            size=im_shape, mode="bilinear", align_corners=False
-        )
+        self.final_resize = nn.Upsample(size=im_shape, mode="bilinear", align_corners=False)
 
     def _encode_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features through encoder without computing latent params."""
@@ -400,9 +396,7 @@ class ConvVAE(pl.LightningModule):
             target_scaled = target * 2.0 - 1.0
             lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
             mse_loss = F.mse_loss(recon, target, reduction="mean")
-            self.log(
-                "train/lpips", lpips_loss, on_step=True, on_epoch=True, sync_dist=True
-            )
+            self.log("train/lpips", lpips_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log("train/mse", mse_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # Log images every 500 steps
@@ -466,6 +460,132 @@ class ConvVAE(pl.LightningModule):
             )
         except Exception as e:
             print(f"Failed to log images: {e}")
+
+
+class VAEEncoder(nn.Module):
+    """Wrapper to use VAE encoder components as a feature extractor."""
+
+    def __init__(self, vae):
+        super().__init__()
+        self.encoder_in = vae.encoder_in
+        self.encoder_blocks = vae.encoder_blocks
+        self.middle = vae.middle
+
+    def forward(self, x):
+        x = self.encoder_in(x)
+        for block in self.encoder_blocks:
+            x = block(x)
+        x = self.middle(x)
+        return x
+
+
+def load_vae_encoder(
+    checkpoint_path: str,
+    device,
+    in_channels: int = 4,
+    trainable: bool = True,
+    verbose: bool = True,
+) -> Tuple[nn.Module, int]:
+    """Load a VAE encoder from checkpoint with automatic parameter detection.
+
+    Args:
+        checkpoint_path: Path to VAE checkpoint file
+        device: Device to load the encoder on
+        in_channels: Number of input channels (e.g., 4 for stacked frames)
+        trainable: Whether to make encoder parameters trainable
+        verbose: Whether to print loading information
+
+    Returns:
+        Tuple of (encoder_module, output_size) where encoder_module handles
+        channel adaptation if needed and output_size is the flattened feature size
+    """
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    if isinstance(checkpoint, dict):
+        hparams = checkpoint.get("hyper_parameters", {})
+        state_dict = checkpoint.get("state_dict", checkpoint)
+
+        if not hparams:
+            if "to_latent.weight" in state_dict:
+                z_dim = state_dict["to_latent.weight"].shape[0]
+            else:
+                z_dim = 1024
+
+            if "encoder_in.weight" in state_dict:
+                vae_in_channels = state_dict["encoder_in.weight"].shape[1]
+            else:
+                vae_in_channels = 3
+        else:
+            z_dim = hparams.get("z_dim", 1024)
+            vae_in_channels = hparams.get("in_channels", 3)
+    else:
+        z_dim = 1024
+        vae_in_channels = 3
+        state_dict = checkpoint
+
+    # Create VAE and load weights (suppress LPIPS output by not printing)
+    import sys
+    import os
+
+    # Temporarily redirect stdout to suppress LPIPS messages
+    old_stdout = sys.stdout
+    if not verbose:
+        sys.stdout = open(os.devnull, "w")
+
+    try:
+        vae = ConvVAE(z_dim=z_dim, in_channels=vae_in_channels)
+    finally:
+        if not verbose:
+            sys.stdout.close()
+            sys.stdout = old_stdout
+
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        vae.load_state_dict(checkpoint["state_dict"])
+    else:
+        vae.load_state_dict(checkpoint)
+
+    # Move VAE to device BEFORE creating wrapper
+    vae = vae.to(device)
+
+    # Create encoder wrapper
+    vae_encoder = VAEEncoder(vae)
+
+    # Set trainable status
+    for param in vae_encoder.parameters():
+        param.requires_grad = trainable
+
+    # Handle channel mismatch with adapter if needed
+    needs_adapter = vae_in_channels != in_channels
+    if needs_adapter and verbose:
+        print(
+            f"VAE: {vae_in_channels}ch→adapter→{in_channels}ch, z_dim={z_dim}, {'trainable' if trainable else 'frozen'}"
+        )
+        encoder_module = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                vae_in_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                device=device,
+            ),
+            vae_encoder,
+            nn.Flatten(start_dim=1),
+        )
+    else:
+        if verbose:
+            print(
+                f"VAE: z_dim={z_dim}, in_channels={vae_in_channels}, {'trainable' if trainable else 'frozen'}"
+            )
+        encoder_module = nn.Sequential(
+            vae_encoder,
+            nn.Flatten(start_dim=1),
+        )
+
+    # Calculate output size (256 channels * 4 * 4 spatial dims for typical VAE)
+    output_size = 256 * 4 * 4
+
+    return encoder_module, output_size
 
 
 def main() -> None:
