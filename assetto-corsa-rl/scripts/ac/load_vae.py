@@ -79,10 +79,9 @@ def graystack_to_rgb_input(pixels: torch.Tensor, frames: int):
         pixels = pixels.unsqueeze(0)
     B, C, H, W = pixels.shape
     assert C == frames, f"Expected {frames} frames in pixels, got {C}"
-    # Expand each frame to 3 channels and concatenate
     per_frame = []
     for i in range(frames):
-        fr = pixels[:, i : i + 1, :, :].repeat(1, 3, 1, 1)  # (B,3,H,W)
+        fr = pixels[:, i : i + 1, :, :].repeat(1, 3, 1, 1)
         per_frame.append(fr)
     x = torch.cat(per_frame, dim=1)
     return x
@@ -92,18 +91,15 @@ def _recon_display(
     original: torch.Tensor, recon_rgb: torch.Tensor, title: str = "VAE Comparison"
 ) -> int:
     """Display original and reconstruction side-by-side in a popout window. Returns pressed key code."""
-    # Process original
     if original.dim() == 4:
         orig_t = original[0]
     else:
         orig_t = original
-    # Take last 3 channels (most recent frame RGB)
     if orig_t.size(0) > 3:
         orig_t = orig_t[-3:]
     elif orig_t.size(0) == 1:
         orig_t = orig_t.repeat(3, 1, 1)
 
-    # Process reconstruction
     if recon_rgb.dim() == 4:
         recon_t = recon_rgb[0]
     else:
@@ -111,20 +107,16 @@ def _recon_display(
     if recon_t.size(0) > 3:
         recon_t = recon_t[-3:]
 
-    # Convert to numpy H,W,C scaled 0..255
     orig_arr = (orig_t.detach().cpu().numpy() * 255.0).astype(np.uint8)
     orig_arr = np.transpose(orig_arr, (1, 2, 0))  # H,W,C
 
     recon_arr = (recon_t.detach().cpu().numpy() * 255.0).astype(np.uint8)
     recon_arr = np.transpose(recon_arr, (1, 2, 0))  # H,W,C
 
-    # Concatenate side-by-side
     combined = np.hstack([orig_arr, recon_arr])
 
-    # Convert RGB->BGR for cv2
     combined = combined[..., ::-1]
 
-    # Show with larger size
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(title, combined.shape[1] * 4, combined.shape[0] * 4)
     cv2.imshow(title, combined)
@@ -154,7 +146,6 @@ def main(ckpt, env, frames, image_shape, device):
     try:
         vae.load_state_dict(ckpt_data)
     except Exception:
-        # try nested key (lightning or dict)
         if isinstance(ckpt_data, dict) and "state_dict" in ckpt_data:
             vae.load_state_dict(ckpt_data["state_dict"])  # type: ignore
         else:
@@ -164,7 +155,6 @@ def main(ckpt, env, frames, image_shape, device):
     vae.eval()
     print(f"✓ Loaded VAE from {ckpt}")
 
-    # continuous interactive-only display of decoder output
     if env == "gym":
         env = create_gym_env(height=img_h, width=img_w, device=device, num_envs=1)
         td = env.reset()
@@ -178,12 +168,10 @@ def main(ckpt, env, frames, image_shape, device):
                 with torch.no_grad():
                     recon = vae(x)
 
-                # show original vs reconstruction
                 key = _recon_display(x, recon)
                 if key in (ord("q"), 27):
                     break
 
-                # step env
                 action_shape = env.action_spec.shape
                 action = torch.zeros((env.num_workers, *action_shape), device=device)
                 td = env.step(action)

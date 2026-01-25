@@ -9,24 +9,20 @@ import glob
 from pathlib import Path
 
 
-# Collect scripts and configs as data files to install alongside the package
 def get_data_files():
     data_files = []
 
-    # Collect all script files
     script_files = []
     for pattern in ["scripts/**/*.py"]:
         for file in glob.glob(pattern, recursive=True):
             if "__pycache__" not in file and not file.endswith(".pyc"):
                 script_files.append(file)
 
-    # Collect all config files
     config_files = []
     for pattern in ["configs/**/*.yaml", "configs/**/*.json"]:
         for file in glob.glob(pattern, recursive=True):
             config_files.append(file)
 
-    # Install to share/assetto_corsa_rl/
     if script_files:
         data_files.append(
             (
@@ -55,5 +51,4 @@ def get_data_files():
     return data_files
 
 
-# Configuration is in pyproject.toml and setup.cfg
 setup(data_files=get_data_files())

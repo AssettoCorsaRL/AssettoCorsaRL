@@ -41,9 +41,7 @@ class AssettoCorsa(gym.Env):
         self.timeout = timeout
 
         self.constant_reward_per_ms = constant_reward_per_ms
-        self.reward_per_m_advanced_along_centerline = (
-            reward_per_m_advanced_along_centerline
-        )
+        self.reward_per_m_advanced_along_centerline = reward_per_m_advanced_along_centerline
         self.final_speed_reward_per_m_per_s = final_speed_reward_per_m_per_s
         self.ms_per_action = ms_per_action
 
@@ -80,9 +78,7 @@ class AssettoCorsa(gym.Env):
                 shape=(img_h, img_w, 1),
                 dtype=np.uint8,
             )
-            self.observation_space = spaces.Dict(
-                {"vector": vector_space, "image": image_space}
-            )
+            self.observation_space = spaces.Dict({"vector": vector_space, "image": image_space})
         else:
             self.observation_space = vector_space
 
@@ -99,7 +95,6 @@ class AssettoCorsa(gym.Env):
         self._episode_step = 0
         self._last_obs = None
 
-        # Racing line tracking
         self._meters_advanced = 0.0
         self._last_speed = 0.0
         self._current_racing_line_index = 0
@@ -121,9 +116,7 @@ class AssettoCorsa(gym.Env):
                 img = np.zeros((img_h, img_w, 1), dtype=np.uint8)
             else:
                 try:
-                    resized = cv2.resize(
-                        latest_img, (img_w, img_h), interpolation=cv2.INTER_LINEAR
-                    )
+                    resized = cv2.resize(latest_img, (img_w, img_h), interpolation=cv2.INTER_LINEAR)
                 except Exception:
                     resized = cv2.resize(latest_img, (img_w, img_h))
                 img = resized[..., np.newaxis].astype(np.uint8)
@@ -160,9 +153,7 @@ class AssettoCorsa(gym.Env):
 
         print(f"✓ Loaded racing line with {len(positions)} points")
 
-    def _find_closest_point_on_racing_line(
-        self, position: np.ndarray
-    ) -> Tuple[int, float]:
+    def _find_closest_point_on_racing_line(self, position: np.ndarray) -> Tuple[int, float]:
         if self.racing_line_positions is None:
             return 0, 0.0
 
@@ -217,10 +208,11 @@ class AssettoCorsa(gym.Env):
 
         return float(total_distance)
 
+    # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
+    #! UNTESTED WITH PRETRAINED AGENTS
     def _calculate_reward(self, obs: np.ndarray, data: Optional[Dict]) -> float:
         """Calculate reward based on observation and telemetry.
 
-        Reward definition:
         reward = constant_reward_per_ms * ms_per_action
                + (meters_advanced[i] - meters_advanced[i-1]) * reward_per_m_advanced_along_centerline
                + final_speed_reward_per_m_per_s * (|v_i| - |v_{i-1}|) if moving forward
@@ -310,9 +302,7 @@ class AssettoCorsa(gym.Env):
 
         return obs, info
 
-    def step(
-        self, action: np.ndarray
-    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """Execute one step in the environment.
 
         Args:
