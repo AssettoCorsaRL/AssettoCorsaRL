@@ -30,6 +30,12 @@ except Exception:
         sys.path.insert(0, src_path)
     from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+
+
 import gymnasium as gym
 from torchvision import transforms as T
 

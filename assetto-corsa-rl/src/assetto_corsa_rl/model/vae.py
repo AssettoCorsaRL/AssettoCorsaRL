@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import lightning as pl
 from typing import Tuple, Optional
 import lpips
-import math
+import sys
+import os
 
 
 class ConvBlock(nn.Module):
@@ -53,11 +54,6 @@ class DeConvBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(self.deconv(x)))
-
-
-# ============================================================================
-# Enhanced Building Blocks for Powerful VAE
-# ============================================================================
 
 
 class ResidualBlock(nn.Module):
@@ -109,7 +105,7 @@ class SelfAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, 3, self.num_heads, self.head_dim, H * W)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        # Attention: (B, heads, head_dim, HW) @ (B, heads, HW, head_dim) -> (B, heads, HW, HW)
+        # attention: (B, heads, head_dim, HW) @ (B, heads, HW, head_dim) -> (B, heads, HW, HW)
         q = q.permute(0, 1, 3, 2)  # (B, heads, HW, head_dim)
         k = k.permute(0, 1, 2, 3)  # (B, heads, head_dim, HW)
         v = v.permute(0, 1, 3, 2)  # (B, heads, HW, head_dim)
@@ -241,19 +237,15 @@ class ConvVAE(pl.LightningModule):
         self.base_channels = base_channels
         self.mse_weight = mse_weight
 
-        # LPIPS perceptual loss (uses VGG by default)
         self.lpips = lpips.LPIPS(net="vgg")
-        # Freeze LPIPS network (we don't train it)
+        # freeze LPIPS network
         for param in self.lpips.parameters():
             param.requires_grad = False
 
-        # Calculate channel sizes at each resolution
         channels = [base_channels * m for m in channel_multipliers]
 
-        # Initial projection
         self.encoder_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
 
-        # Build encoder
         self.encoder_blocks = nn.ModuleList()
         current_res = im_shape[0]
         in_ch = base_channels
@@ -272,7 +264,6 @@ class ConvVAE(pl.LightningModule):
             in_ch = out_ch
             current_res //= 2
 
-        # Middle block
         self.middle = MiddleBlock(channels[-1], dropout=dropout)
 
         with torch.no_grad():
@@ -353,7 +344,7 @@ class ConvVAE(pl.LightningModule):
         return recon
 
     def _loss(self, recon: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # Scale from [0, 1] to [-1, 1]
+        # scale from [0, 1] to [-1, 1]
         recon_scaled = recon * 2.0 - 1.0
         target_scaled = target * 2.0 - 1.0
         lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
@@ -374,7 +365,6 @@ class ConvVAE(pl.LightningModule):
 
         loss = self._loss(recon, target)
 
-        # Log loss and lr consistently every step
         self.log(
             "train/loss",
             loss,
@@ -390,7 +380,6 @@ class ConvVAE(pl.LightningModule):
             on_step=True,
         )
 
-        # Log detailed metrics every step (but aggregate for epoch)
         if self.mse_weight > 0:
             recon_scaled = recon * 2.0 - 1.0
             target_scaled = target * 2.0 - 1.0
@@ -435,7 +424,6 @@ class ConvVAE(pl.LightningModule):
     @torch.no_grad()
     def sample(self, num_samples: int = 1) -> torch.Tensor:
         """Sample from the prior and decode to image space."""
-        # Sample latent with spatial dimensions matching encoder output
         _, H_enc, W_enc = self.encoder_out_shape
         z = torch.randn(num_samples, self.z_dim, H_enc, W_enc, device=self.device)
         return self.decode(z)
@@ -523,11 +511,6 @@ def load_vae_encoder(
         vae_in_channels = 3
         state_dict = checkpoint
 
-    # Create VAE and load weights (suppress LPIPS output by not printing)
-    import sys
-    import os
-
-    # Temporarily redirect stdout to suppress LPIPS messages
     old_stdout = sys.stdout
     if not verbose:
         sys.stdout = open(os.devnull, "w")
@@ -544,17 +527,13 @@ def load_vae_encoder(
     else:
         vae.load_state_dict(checkpoint)
 
-    # Move VAE to device BEFORE creating wrapper
     vae = vae.to(device)
 
-    # Create encoder wrapper
     vae_encoder = VAEEncoder(vae)
-
-    # Set trainable status
     for param in vae_encoder.parameters():
         param.requires_grad = trainable
 
-    # Handle channel mismatch with adapter if needed
+    # handle channel mismatch with adapter if needed
     needs_adapter = vae_in_channels != in_channels
     if needs_adapter and verbose:
         print(
@@ -582,7 +561,6 @@ def load_vae_encoder(
             nn.Flatten(start_dim=1),
         )
 
-    # Calculate output size (256 channels * 4 * 4 spatial dims for typical VAE)
     output_size = 256 * 4 * 4
 
     return encoder_module, output_size

@@ -85,44 +85,34 @@ def load_cfg_from_yaml(root: Path = None):
     cfg_dict.update(train)
 
     def _try_convert(x):
-        # preserve booleans and None
         if x is None or isinstance(x, bool):
             return x
-        # dict -> recurse
         if isinstance(x, dict):
             return {k: _try_convert(v) for k, v in x.items()}
-        # list/tuple -> recurse and return list
         if isinstance(x, (list, tuple)):
             return [_try_convert(v) for v in x]
-        # Keep integers as integers, floats as floats
         if isinstance(x, int):
-            return x  # Don't convert to float!
+            return x
         if isinstance(x, float):
             return x
-        # strings -> try to parse as int first, then float
         if isinstance(x, str):
             s = x.strip().replace(",", "").replace("_", "")
             try:
-                # Try int first (this handles cases like "4" or "1_000_000")
                 if "." not in s and "e" not in s.lower():
                     return int(s)
                 else:
                     return float(s)
             except Exception:
                 return x
-        # fallback: return original
         return x
 
     converted = {k: _try_convert(v) for k, v in cfg_dict.items()}
 
-    # If train config contains a nested `wandb` dict, flatten it to top-level
-    # keys with prefix `wandb_` so downstream code can access `cfg.wandb_project` etc.
     if isinstance(converted.get("wandb"), dict):
         wandb_dict = converted.pop("wandb")
         for k, v in wandb_dict.items():
             converted[f"wandb_{k}"] = v
 
-    # Ensure common top-level wandb keys exist (default to None)
     for k in ("wandb_project", "wandb_entity", "wandb_name", "wandb_enabled"):
         converted.setdefault(k, None)
 
@@ -131,9 +121,7 @@ def load_cfg_from_yaml(root: Path = None):
     return cfg
 
 
-@cli_command(
-    group="car-racing", name="train", help="Train SAC agent in CarRacing environment"
-)
+@cli_command(group="car-racing", name="train", help="Train SAC agent in CarRacing environment")
 def train():
 
     cfg = load_cfg_from_yaml()
@@ -248,9 +236,7 @@ def train():
 
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
-    critic_opt = torch.optim.Adam(
-        list(q1.parameters()) + list(q2.parameters()), lr=cfg.lr
-    )
+    critic_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=cfg.lr)
     value_opt = torch.optim.Adam(value.parameters(), lr=cfg.lr)
 
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))

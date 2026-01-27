@@ -39,6 +39,7 @@ class SACPolicy:
         device=None,
         use_noisy: bool = False,
         noise_sigma: float = 0.5,
+        actor_dropout: float = 0.0,
         vae_checkpoint_path: str = None,
     ):
         if device is None:
@@ -46,6 +47,7 @@ class SACPolicy:
         self.device = device
         self.use_noisy = use_noisy
         self.noise_sigma = noise_sigma
+        self.actor_dropout = float(actor_dropout)  # dropout probability for actor MLP
 
         action_dim = int(env.action_spec.shape[-1])
 
@@ -97,10 +99,6 @@ class SACPolicy:
         min_scale = torch.tensor([1e-3, 1e-3, 1e-3], device=device)
         max_scale = torch.tensor([1.0, 0.5, 0.5], device=device)
 
-        # Use LazyLinear for the first projection so it adapts to the actual
-        # flattened conv output size (handles minor shape drift from upstream
-        # transforms without crashing). Noisy nets still use the fixed-size
-        # layer because the custom noisy layer is not lazy-aware.
         first_linear = (
             _make_linear(cnn_output_size, num_cells)
             if self.use_noisy
@@ -111,8 +109,10 @@ class SACPolicy:
             cnn_features,
             first_linear,
             nn.Tanh(),
+            nn.Dropout(p=self.actor_dropout),
             _make_linear(num_cells, num_cells),
             nn.Tanh(),
+            nn.Dropout(p=self.actor_dropout),
             _make_linear(num_cells, 2 * action_dim),
             BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
         )
@@ -124,6 +124,8 @@ class SACPolicy:
 
         # g = gym.make("CarRacing-v3")
         # print("gym action_bounds:", g.action_space.low, g.action_space.high)
+
+        # NOTE: i hate mysefl this was the issue for the freaking ac thing THIS IS WHY IT DOESN'T TURN!!!!!
 
         # TODO: remove hardcoded bounds and use env specs directly
         low = [-1.0, 0.0, 0.0]  # env.action_spec_unbatched.space.low
@@ -159,7 +161,6 @@ class SACPolicy:
             return_log_prob=True,
         )
 
-        # Informational log when noisy nets are enabled
         if self.use_noisy:
             noisy_count = sum(1 for m in self.actor.modules() if hasattr(m, "sample_noise"))
             print(f"Using noisy actor: found {noisy_count} noisy layer(s)")

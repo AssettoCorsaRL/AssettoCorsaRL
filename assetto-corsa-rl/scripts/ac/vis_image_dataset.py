@@ -76,30 +76,24 @@ def load_stack(path: Path) -> np.ndarray:
         if "stack" in d:
             stack = d["stack"]
         elif "frames" in d:
-            # Demonstration batch format: (N, F, H, W)
             frames = d["frames"]
             if frames.ndim == 4:
-                # Take first sample and return as (F, H, W)
                 stack = frames[0]
             else:
                 stack = frames
         else:
-            # try first array
             keys = [k for k in d.files]
             stack = d[keys[0]]
 
         stack = np.asarray(stack)
 
-        # Scale floats in 0..1 to 0..255 so images aren’t black
         if np.issubdtype(stack.dtype, np.floating):
             max_val = float(stack.max() if stack.size else 1.0)
             if max_val <= 1.0:
                 stack = stack * 255.0
             stack = stack.clip(0, 255)
 
-        # Handle different formats
         if stack.ndim == 4:
-            # Format: (N, F, H, W) - take first sample
             stack = stack[0]
 
         if stack.ndim != 3:
@@ -110,11 +104,9 @@ def load_stack(path: Path) -> np.ndarray:
 
 
 def make_montage(stack: np.ndarray) -> np.ndarray:
-    # stack: (F, H, W), uint8
     F, H, W = stack.shape
     cols = math.ceil(math.sqrt(F))
     rows = math.ceil(F / cols)
-    # pad with zeros frames
     pad = cols * rows - F
     if pad > 0:
         pad_frames = np.zeros((pad, H, W), dtype=np.uint8)
@@ -172,7 +164,6 @@ def main(input_dir, pattern, delay, scale, start, view_mode, save_dir):
             stack = load_stack(path)
         except Exception as e:
             print(e)
-            # skip to next
             idx = (idx + 1) % len(files)
             continue
 

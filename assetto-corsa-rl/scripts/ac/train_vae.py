@@ -83,7 +83,6 @@ class ACImageStackDataset(Dataset):
         if self.frames is not None and stack.shape[0] > self.frames:
             stack = stack[-self.frames :]  # keep most recent frames
 
-        # Convert each grayscale frame to RGB and concatenate along channel dim
         rgb_frames = []
         for fr in stack:
             fr_resized = self._resize_frame(fr)
@@ -282,7 +281,7 @@ def main(
         accelerator=accelerator,
         devices=devices,
         log_every_n_steps=50,
-        gradient_clip_val=1.0,  # Clip gradients to prevent NaN
+        gradient_clip_val=1.0,  # clip gradients to prevent NaN
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)

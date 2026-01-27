@@ -24,7 +24,6 @@ import json
 import numpy as np
 import cv2
 
-# Add src to path
 repo_root = Path(__file__).resolve().parents[2]
 src_path = str(repo_root / "src")
 if src_path not in sys.path:
@@ -50,6 +49,7 @@ class DemonstrationRecorder:
         save_interval: int = 100,
         min_speed_mph: float = 5.0,
         input_config: Optional[Dict[str, bool]] = None,
+        racing_line_path: Optional[str] = "racing_lines.json",
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -60,23 +60,38 @@ class DemonstrationRecorder:
         self.min_speed_mph = min_speed_mph
         self.input_config = input_config or {}
         self.observation_keys = [k for k, v in self.input_config.items() if v]
+        self.racing_line_path = racing_line_path
 
-        # Storage
         self.frames: list = []
         self.actions: list = []
-        self.observations: list = []  # NEW: store observation vectors
+        self.observations: list = []
+        self.rewards: list = []
         self.metadata: list = []
 
-        # Frame buffer for stacking
         self.frame_buffer: list = []
 
-        # Statistics
         self.total_frames = 0
         self.saved_samples = 0
         self.session_start = None
 
-        # Telemetry
         self.telemetry: Optional[Telemetry] = None
+
+        from assetto_corsa_rl.ac_env import AssettoCorsa
+
+        self._env_helper = AssettoCorsa.__new__(AssettoCorsa)
+
+        try:
+            self._env_helper._load_racing_line(racing_line_path)
+            self._env_helper.constant_reward_per_ms = 0.01
+            self._env_helper.reward_per_m_advanced_along_centerline = 1.0
+            self._env_helper.final_speed_reward_per_m_per_s = 0.1
+            self._env_helper.ms_per_action = 20.0
+            self._env_helper._meters_advanced = 0.0
+            self._env_helper._last_speed = 0.0
+            self._env_helper._current_racing_line_index = 0
+            print(f"✓ Using environment reward function with racing line")
+        except Exception as e:
+            print(f"Warning: Could not load racing line: {e}")
 
     def start(self):
         """Initialize telemetry connection."""
@@ -103,11 +118,9 @@ class DemonstrationRecorder:
         if img is None:
             return np.zeros(self.image_shape, dtype=np.uint8)
 
-        # Resize to target shape
         h, w = self.image_shape
         resized = cv2.resize(img, (w, h), interpolation=cv2.INTER_LINEAR)
 
-        # Ensure grayscale
         if resized.ndim == 3:
             resized = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
 
@@ -117,15 +130,12 @@ class DemonstrationRecorder:
         """Maintain frame buffer and return stacked frames."""
         self.frame_buffer.append(new_frame)
 
-        # Keep only last N frames
         if len(self.frame_buffer) > self.frame_stack:
             self.frame_buffer = self.frame_buffer[-self.frame_stack :]
 
-        # Pad with zeros if not enough frames yet
         while len(self.frame_buffer) < self.frame_stack:
             self.frame_buffer.insert(0, np.zeros_like(new_frame))
 
-        # Stack frames: (N, H, W)
         return np.stack(self.frame_buffer, axis=0)
 
     def _extract_observation(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
@@ -133,23 +143,19 @@ class DemonstrationRecorder:
         if data is None or not self.observation_keys:
             return None
 
-        # Import extraction helper from ac_env
-        try:
-            from assetto_corsa_rl.ac_env import AssettoCorsa
+        obs_values = [
+            self._env_helper._extract_value_from_data(key, data) for key in self.observation_keys
+        ]
+        return np.array(obs_values, dtype=np.float32)
 
-            # Create a temporary instance to use its extraction method
-            temp_env = AssettoCorsa.__new__(AssettoCorsa)
-            obs_values = [
-                temp_env._extract_value_from_data(key, data) for key in self.observation_keys
-            ]
-            return np.array(obs_values, dtype=np.float32)
-        except Exception as e:
-            # Fallback: just return zeros if extraction fails
-            return (
-                np.zeros(len(self.observation_keys), dtype=np.float32)
-                if self.observation_keys
-                else None
-            )
+    def _calculate_reward(self, data: Dict[str, Any]) -> float:
+        """Calculate reward from telemetry data.
+
+        Uses environment's reward function if racing line is available,
+        otherwise uses simple speed-based reward.
+        """
+        obs = np.array([], dtype=np.float32)
+        return self._env_helper._calculate_reward(obs, data)
 
     def _extract_action(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
         """Extract user inputs as action array [steering, throttle, brake]."""
@@ -169,8 +175,6 @@ class DemonstrationRecorder:
         if steer is None or gas is None or brake is None:
             return None
 
-        # Normalize steering to [-1, 1] (AC gives [-1, 1] already)
-        # Gas and brake are already [0, 1]
         action = np.array([float(steer), float(gas), float(brake)], dtype=np.float32)
         return action
 
@@ -185,13 +189,7 @@ class DemonstrationRecorder:
         if speed is None or speed < self.min_speed_mph:
             return False
 
-        # Don't record if in pit lane
         if car.get("in_pit_lane", False):
-            return False
-
-        # Don't record if damaged
-        damage = car.get("damage", [0, 0, 0, 0, 0])
-        if damage and sum(damage) > 0:
             return False
 
         return True
@@ -201,31 +199,28 @@ class DemonstrationRecorder:
         if self.telemetry is None:
             return (False, None, None) if return_frame else False
 
-        # Get telemetry data
         data = self.telemetry.get_latest()
         if not self._should_record(data):
             return (False, None, None) if return_frame else False
 
-        # Get image
         img = self.telemetry.get_latest_image()
         if img is None:
             return (False, None, None) if return_frame else False
 
-        # Preprocess and stack
         processed = self._preprocess_image(img)
         stacked = self._get_stacked_frames(processed)
 
-        # Extract action
         action = self._extract_action(data)
         if action is None:
             return (False, None, None) if return_frame else False
 
-        # Extract observation
         observation = self._extract_observation(data)
 
-        # Store
+        reward = self._calculate_reward(data)
+
         self.frames.append(stacked.copy())
         self.actions.append(action.copy())
+        self.rewards.append(reward)
         if observation is not None:
             self.observations.append(observation.copy())
         self.metadata.append(
@@ -233,12 +228,12 @@ class DemonstrationRecorder:
                 "timestamp": time.time(),
                 "speed_mph": data.get("car", {}).get("speed_mph", 0),
                 "lap": data.get("lap", {}).get("get_lap_count", 0),
+                "reward": reward,
             }
         )
 
         self.total_frames += 1
 
-        # Save periodically
         if len(self.frames) >= self.save_interval:
             self._save_batch()
 
@@ -254,17 +249,15 @@ class DemonstrationRecorder:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         batch_idx = self.saved_samples // self.save_interval
 
-        # Save as .npz
         filename = f"demo_batch_{batch_idx:05d}_{timestamp}.npz"
         filepath = self.output_dir / filename
 
-        # Build save dict
         save_dict = {
             "frames": np.array(self.frames, dtype=np.uint8),
             "actions": np.array(self.actions, dtype=np.float32),
+            "rewards": np.array(self.rewards, dtype=np.float32),
         }
 
-        # Add observations if available
         if self.observations:
             save_dict["observations"] = np.array(self.observations, dtype=np.float32)
             save_dict["observation_keys"] = np.array(self.observation_keys, dtype=object)
@@ -277,19 +270,17 @@ class DemonstrationRecorder:
             f"✓ Saved {len(self.frames)} samples{obs_info} to {filename} (total: {self.saved_samples})"
         )
 
-        # Clear buffers
         self.frames = []
         self.actions = []
+        self.rewards = []
         self.observations = []
         self.metadata = []
 
     def finalize(self):
         """Save any remaining data and session info."""
-        # Save remaining frames
         if len(self.frames) > 0:
             self._save_batch()
 
-        # Save session metadata
         session_info = {
             "session_start": (self.session_start.isoformat() if self.session_start else None),
             "session_end": datetime.now().isoformat(),
@@ -374,6 +365,11 @@ def parse_args():
 @cli_option(
     "--config-path", default=None, help="Path to env config YAML (loads input configuration)"
 )
+@cli_option(
+    "--racing-line-path",
+    default=None,
+    help="Path to racing line JSON (enables env reward function)",
+)
 def main(
     output_dir,
     duration,
@@ -385,15 +381,14 @@ def main(
     display,
     display_scale,
     config_path,
+    racing_line_path,
 ):
-    # Parse image shape
     try:
         parsed_image_shape = parse_image_shape(image_shape)
     except ValueError as e:
         print(f"Error: {e}")
         return
 
-    # Load input config from YAML if provided
     input_config = None
     if config_path:
         try:
@@ -420,6 +415,7 @@ def main(
         save_interval=save_interval,
         min_speed_mph=min_speed,
         input_config=input_config,
+        racing_line_path=racing_line_path,
     )
 
     print("=" * 50)
@@ -453,12 +449,11 @@ def main(
         while True:
             current_time = time.time()
 
-            # Check duration
             if duration > 0 and (current_time - start_time) >= duration:
                 print("\nDuration reached, stopping...")
                 break
 
-            # Rate limiting
+            # raet limiting
             elapsed = current_time - last_frame_time
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
@@ -467,7 +462,6 @@ def main(
             last_frame_time = current_time
 
             if paused:
-                # Still process key input when paused
                 if display:
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
@@ -479,12 +473,14 @@ def main(
                     if key == ord("d"):
                         recorder.frames = []
                         recorder.actions = []
+                        recorder.rewards = []
+                        recorder.observations = []
                         recorder.metadata = []
                         recorder.frame_buffer = []
                         print("\nCleared unsaved batch")
                 continue
 
-            # Record frame
+            # record frame
             result = recorder.record_frame(return_frame=display)
             if display:
                 success, stacked_frame, action = (
@@ -516,6 +512,8 @@ def main(
                 if key == ord("d"):
                     recorder.frames = []
                     recorder.actions = []
+                    recorder.rewards = []
+                    recorder.observations = []
                     recorder.metadata = []
                     recorder.frame_buffer = []
                     print("\nCleared unsaved batch")

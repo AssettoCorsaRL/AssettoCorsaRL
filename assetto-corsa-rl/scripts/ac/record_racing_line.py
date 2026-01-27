@@ -37,7 +37,7 @@ class RacingLineRecorder:
         output_file: str = "racing_lines.json",
         host: str = "127.0.0.1",
         recv_port: int = 9876,
-        sample_rate: float = 0.01,  # 100 Hz (higher sample rate)
+        sample_rate: float = 0.01,  # 100 Hz
     ):
         self.output_file = output_file
         self.sample_rate = sample_rate

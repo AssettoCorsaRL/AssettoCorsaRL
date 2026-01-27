@@ -76,17 +76,11 @@ class Trainer:
         self.alpha_opt = alpha_opt
         self.target_entropy = target_entropy if target_entropy is not None else -3.0
 
-        # Track last steps when logging and saving to ensure we log/save
-        # at least every `log_interval` / `save_interval` regardless of batch increments.
         self._last_log_steps = 0
         self._last_save_steps = 0
 
-        # Track update frequency for interleaved updates
         self._steps_since_update = 0
-        # How many env steps between gradient updates (lower = more frequent updates)
-        self._update_every = getattr(
-            cfg, "update_every", cfg.num_envs
-        )  # Default: update after each batch from all envs
+        self._update_every = getattr(cfg, "update_every", cfg.num_envs)
 
         self._updates_count = 0
         self._updates_per_step = getattr(cfg, "updates_per_step", 1)
@@ -100,19 +94,15 @@ class Trainer:
 
     def _set_encoder_requires_grad(self, requires_grad: bool):
         """Enable or disable gradients for visual encoder layers in all networks."""
-        # This assumes actor, value, q1, q2 have a .cnn or the first few layers are the encoder
-        # In our SACPolicy, they have separate sequences.
+        # assumes actor, value, q1, q2 have a .cnn or the first few layers are the encoder
         for net in [self.actor, self.value, self.q1, self.q2]:
             if net is None:
                 continue
-            # Try to find the CNN part. In SACPolicy:
             # actor: cnn_features (first element of Sequential)
             # value: value_cnn (first element)
             # q1/q2: .cnn attribute
 
-            # Module handles recurisvely
             for name, module in net.named_modules():
-                # Heuristic: layers called 'cnn' or involving Conv2d are usually the encoder
                 if "cnn" in name.lower() or isinstance(module, torch.nn.Conv2d):
                     for param in module.parameters():
                         param.requires_grad = requires_grad
@@ -126,9 +116,7 @@ class Trainer:
         next_td = self.env.step(action_td)
         td_next = get_inner(next_td)
 
-        rewards, dones = extract_reward_and_done(
-            td_next, self.cfg.num_envs, self.device
-        )
+        rewards, dones = extract_reward_and_done(td_next, self.cfg.num_envs, self.device)
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
 
@@ -160,17 +148,12 @@ class Trainer:
         self.total_steps = total_steps
 
         while self.total_steps < self.cfg.total_steps:
-            # Interleaved approach: spread updates throughout data collection
             for _ in range(self.cfg.frames_per_batch):
                 self._step_and_store()
 
-                # Perform update after collecting update_every steps
                 self._steps_since_update += self.cfg.num_envs
                 if self._steps_since_update >= self._update_every:
-                    # Do one or more gradient updates
-                    num_base_updates = max(
-                        1, self._steps_since_update // self._update_every
-                    )
+                    num_base_updates = max(1, self._steps_since_update // self._update_every)
                     for _ in range(num_base_updates * self._updates_per_step):
                         if len(self.rb) >= self.cfg.batch_size:
                             self._do_update()
@@ -186,9 +169,7 @@ class Trainer:
             pixels_only = inner_obs["pixels"]
             if pixels_only.dim() == 3:
                 pixels_only = pixels_only.unsqueeze(0)  # [C, H, W] -> [1, C, H, W]
-            actor_input = TensorDict(
-                {"pixels": pixels_only}, batch_size=[pixels_only.shape[0]]
-            )
+            actor_input = TensorDict({"pixels": pixels_only}, batch_size=[pixels_only.shape[0]])
             use_noisy = getattr(self.cfg, "use_noisy", False)
 
             # if using noisy-net exploration, resample actor noise each step
@@ -204,20 +185,17 @@ class Trainer:
             )
             actor_action = actor_output["action"] if has_actor_action else None
 
-            # If using noisy nets, disable epsilon-greedy entirely.
-            # Also try one more actor call (resample noise) if no action was returned.
+            # if using noisy, disable epsilon-greedy entirely.
             if use_noisy:
                 eps = 0.0
                 if actor_action is None:
-                    # try once more after resampling noise to obtain a policy action
                     for m in self.actor.modules():
                         if hasattr(m, "sample_noise"):
                             m.sample_noise()
                     actor_output = self.actor(actor_input)
                     has_actor_action = (
                         "action" in actor_output.keys()
-                        and actor_output["action"].shape[-1]
-                        == self.env.action_spec.shape[-1]
+                        and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
                     )
                     actor_action = actor_output["action"] if has_actor_action else None
             else:
@@ -243,9 +221,7 @@ class Trainer:
         next_td = self.env.step(action_td)
         td_next = get_inner(next_td)
 
-        rewards, dones = extract_reward_and_done(
-            td_next, self.cfg.num_envs, self.device
-        )
+        rewards, dones = extract_reward_and_done(td_next, self.cfg.num_envs, self.device)
 
         # if dones.any():
         #     self._debug_on_done(actions, actions_step, actor_output, td_next)
@@ -253,7 +229,6 @@ class Trainer:
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
 
-        # Ensure we have a batch dimension even if num_envs=1 and batch_size is empty
         if pixels.ndim == 3:
             pixels = pixels.unsqueeze(0)
         if next_pixels.ndim == 3:
@@ -290,7 +265,6 @@ class Trainer:
                     print(f"{key}:", td_next[key])
 
     def _handle_episode_end(self, rewards, dones):
-        # Ensure tensors are on the same device as current_episode_return
         rewards = rewards.to(self.current_episode_return.device)
         dones = dones.to(self.current_episode_return.device)
         self.current_episode_return += rewards
@@ -310,10 +284,7 @@ class Trainer:
                 reset_td = self.env.reset()
                 self.current_td = (
                     reset_td["next"]
-                    if (
-                        "next" in reset_td.keys()
-                        and "pixels" in reset_td["next"].keys()
-                    )
+                    if ("next" in reset_td.keys() and "pixels" in reset_td["next"].keys())
                     else reset_td
                 )
             except Exception:
@@ -322,41 +293,31 @@ class Trainer:
                 idx = dones.to(self.current_episode_return.device)
                 self.current_episode_return[idx] = 0.0
             except Exception:
-                self.current_episode_return = torch.zeros_like(
-                    self.current_episode_return
-                )
+                self.current_episode_return = torch.zeros_like(self.current_episode_return)
 
     # ===== Updates =====
     def _do_update(self):
-        # Handle visual encoder freezing/unfreezing logic
         if self._freeze_encoder_steps > 0:
-            if (
-                self.total_steps < self._freeze_encoder_steps
-                and not self._encoder_frozen
-            ):
+            if self.total_steps < self._freeze_encoder_steps and not self._encoder_frozen:
                 self._set_encoder_requires_grad(False)
                 self._encoder_frozen = True
                 print(
                     f"[INFO] Visual encoder frozen (step {self.total_steps} < {self._freeze_encoder_steps})"
                 )
-            elif (
-                self.total_steps >= self._freeze_encoder_steps and self._encoder_frozen
-            ):
+            elif self.total_steps >= self._freeze_encoder_steps and self._encoder_frozen:
                 self._set_encoder_requires_grad(True)
                 self._encoder_frozen = False
                 print(
                     f"[INFO] Visual encoder unfrozen (step {self.total_steps} >= {self._freeze_encoder_steps})"
                 )
 
-        # Sample with return_info=True to get indices for priority updates
+        # sample with return_info=True to get indices for priority updates
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
 
-        # Extract indices from info dict
         batch_indices = info.get("index", None)
 
         pixels_b = batch["pixels"]
 
-        # Debug: print sampled batch shape
         if self.total_steps % 500 == 0:
             print(f"[DEBUG] pixels_b from batch shape: {pixels_b.shape}")
 
@@ -373,9 +334,7 @@ class Trainer:
         rewards_b = batch["reward"].to(self.device).view(-1, 1)
 
         next_pixels_b = batch["next_pixels"]
-        if isinstance(next_pixels_b, torch.Tensor) and not torch.is_floating_point(
-            next_pixels_b
-        ):
+        if isinstance(next_pixels_b, torch.Tensor) and not torch.is_floating_point(next_pixels_b):
             next_pixels_b = unpack_pixels(next_pixels_b).to(self.device)
         else:
             next_pixels_b = next_pixels_b.to(self.device)
@@ -384,10 +343,7 @@ class Trainer:
 
         # ===== Critic Update =====
         with torch.no_grad():
-            # Sample actions from current policy for next states
-            next_td = TensorDict(
-                {"pixels": next_pixels_b}, batch_size=next_pixels_b.shape[0]
-            )
+            next_td = TensorDict({"pixels": next_pixels_b}, batch_size=next_pixels_b.shape[0])
             next_out = self.actor(next_td)
             next_actions = fix_action_shape(
                 next_out["action"],
@@ -397,29 +353,23 @@ class Trainer:
             next_log_prob = next_out["action_log_prob"]
             next_log_prob = next_log_prob.view(-1, 1)
 
-            # Compute target Q-values using target networks (clipped double-Q)
             next_q1 = self.q1_target(next_pixels_b, next_actions).view(-1, 1)
             next_q2 = self.q2_target(next_pixels_b, next_actions).view(-1, 1)
             next_min_q = torch.min(next_q1, next_q2)
 
-            alpha = (
-                self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
-            )
+            alpha = self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
 
             # V(s') = min_i Q_i(s', a') - α * log π(a'|s')
-            next_v = next_min_q - alpha * (
-                next_log_prob if next_log_prob is not None else 0.0
-            )
+            next_v = next_min_q - alpha * (next_log_prob if next_log_prob is not None else 0.0)
 
             q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
 
             # clip Q-targets to prevent divergence (critical for stability)
-            # Range based on expected discounted returns [-1000, 1000]
             min_q = float(getattr(self.cfg, "min_q_target", -1000.0))
             max_q = float(getattr(self.cfg, "max_q_target", 1000.0))
             q_target = torch.clamp(q_target, min=min_q, max=max_q)
 
-        # Compute current Q-values
+        # current Q-values
         actions_b = fix_action_shape(
             actions_b, pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
         )
@@ -469,9 +419,7 @@ class Trainer:
         if self._updates_count % self._actor_update_delay == 0:
             # store old policy for KL penalty
             with torch.no_grad():
-                td_in_old = TensorDict(
-                    {"pixels": pixels_b}, batch_size=pixels_b.shape[0]
-                )
+                td_in_old = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
                 out_old = self.actor(td_in_old)
                 old_loc = out_old["loc"].detach()
                 old_scale = out_old["scale"].detach()
@@ -487,12 +435,8 @@ class Trainer:
 
             log_prob_new = out["action_log_prob"]
             if log_prob_new is None:
-                print(
-                    f"WARNING: No log_prob returned! Actor output keys: {list(out.keys())}"
-                )
-                log_prob_new = torch.zeros(
-                    (new_actions.shape[0], 1), device=self.device
-                )
+                print(f"WARNING: No log_prob returned! Actor output keys: {list(out.keys())}")
+                log_prob_new = torch.zeros((new_actions.shape[0], 1), device=self.device)
 
             if log_prob_new.ndim == 1:
                 log_prob_new = log_prob_new.view(-1, 1)
@@ -520,8 +464,7 @@ class Trainer:
             new_scale = out["scale"]
             kl_div = (
                 torch.log(old_scale / new_scale)
-                + (new_scale.pow(2) + (new_loc - old_loc).pow(2))
-                / (2 * old_scale.pow(2))
+                + (new_scale.pow(2) + (new_loc - old_loc).pow(2)) / (2 * old_scale.pow(2))
                 - 0.5
             ).sum(dim=-1, keepdim=True)
 
@@ -541,21 +484,18 @@ class Trainer:
             )
 
             # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
-            # Equivalently: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
+            # or: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
             actor_loss = (alpha.detach() * log_prob_new - min_q_new + kl_penalty).mean()
 
             self.actor_opt.zero_grad()
             actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.actor.parameters(), self.cfg.max_grad_norm
-            )
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
             self.actor_opt.step()
 
             # ===== Alpha (Temperature) Update =====
             alpha_loss = None
             if self.log_alpha is not None and self.alpha_opt is not None:
-                # Tune alpha to maintain target entropy
-                # We want: E[-log π(a|s)] ≈ target_entropy
+                # we want: E[-log π(a|s)] ≈ target_entropy
                 with torch.no_grad():
                     entropy_error = log_prob_new + self.target_entropy
                 alpha_loss = -(self.log_alpha * entropy_error).mean()
@@ -565,7 +505,6 @@ class Trainer:
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
         else:
-            # skipped actor update; set dummy values for logging if needed
             actor_loss = None
             alpha_loss = None
             log_prob_new = None
@@ -579,23 +518,15 @@ class Trainer:
 
         # ===== Logging =====
         try:
-            current_entropy = (
-                -log_prob_new.mean().item() if log_prob_new is not None else 0.0
-            )
+            current_entropy = -log_prob_new.mean().item() if log_prob_new is not None else 0.0
             log_dict = {
                 "loss/critic_loss": critic_loss.item(),
                 "loss/q1_loss": q1_loss.item(),
                 "loss/q2_loss": q2_loss.item(),
-                "loss/actor_loss": (
-                    actor_loss.item() if actor_loss is not None else 0.0
-                ),
-                "loss/kl_penalty": (
-                    kl_penalty.mean().item() if kl_penalty is not None else 0.0
-                ),
+                "loss/actor_loss": (actor_loss.item() if actor_loss is not None else 0.0),
+                "loss/kl_penalty": (kl_penalty.mean().item() if kl_penalty is not None else 0.0),
                 #
-                "critic/mean_q_value": (
-                    min_q_new.mean().item() if min_q_new is not None else 0.0
-                ),
+                "critic/mean_q_value": (min_q_new.mean().item() if min_q_new is not None else 0.0),
                 "critic/q_target_mean": q_target.mean().item(),
                 "critic/next_v_mean": next_v.mean().item(),
                 "critic/q1_explained_variance": q1_explained_var.item(),
@@ -608,12 +539,8 @@ class Trainer:
                 "actor/target_entropy": self.target_entropy,
                 "actor/entropy_gap": current_entropy - self.target_entropy,
                 "actor/alpha": alpha.item(),
-                "actor/alpha_loss": (
-                    alpha_loss.item() if alpha_loss is not None else 0.0
-                ),
-                "actor/kl_divergence": (
-                    kl_div.mean().item() if kl_div is not None else 0.0
-                ),
+                "actor/alpha_loss": (alpha_loss.item() if alpha_loss is not None else 0.0),
+                "actor/kl_divergence": (kl_div.mean().item() if kl_div is not None else 0.0),
                 "actor/beta_kl": beta_kl,
                 #
                 "reward/rewards_per_step_mean": rewards_b.mean().item(),
@@ -639,29 +566,19 @@ class Trainer:
         tau = self.cfg.tau
 
         # update value target
-        for param, target_param in zip(
-            self.value.parameters(), self.value_target.parameters()
-        ):
+        for param, target_param in zip(self.value.parameters(), self.value_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
         # update Q1 target
-        for param, target_param in zip(
-            self.q1.parameters(), self.q1_target.parameters()
-        ):
+        for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
         # update Q2 target
-        for param, target_param in zip(
-            self.q2.parameters(), self.q2_target.parameters()
-        ):
+        for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
     def _maybe_log_and_save(self):
-        # Log if we've advanced at least `log_interval` steps since last log.
-        if (
-            self.total_steps - getattr(self, "_last_log_steps", 0)
-            >= self.cfg.log_interval
-        ):
+        if self.total_steps - getattr(self, "_last_log_steps", 0) >= self.cfg.log_interval:
             elapsed = time.time() - self.start_time
             last = self.episode_returns[-100:]
             if len(last) > 0:
@@ -695,11 +612,7 @@ class Trainer:
             # record last log
             self._last_log_steps = self.total_steps
 
-        # Save if we've advanced at least `save_interval` steps since last save.
-        if (
-            self.total_steps - getattr(self, "_last_save_steps", 0)
-            >= self.cfg.save_interval
-        ):
+        if self.total_steps - getattr(self, "_last_save_steps", 0) >= self.cfg.save_interval:
             torch.save(
                 {
                     "actor_state": self.actor.state_dict(),
@@ -713,9 +626,7 @@ class Trainer:
                     "config": {
                         "use_noisy": getattr(self.cfg, "use_noisy", False),
                         "num_cells": getattr(self.cfg, "num_cells", 256),
-                        "vae_checkpoint_path": getattr(
-                            self.cfg, "vae_checkpoint_path", None
-                        ),
+                        "vae_checkpoint_path": getattr(self.cfg, "vae_checkpoint_path", None),
                     },
                 },
                 f".\\models\\sac_checkpoint_{self.total_steps}.pt",
@@ -726,6 +637,7 @@ class Trainer:
             self._last_save_steps = self.total_steps
 
             # * i dont have enough wandb storage to do this sooo
+            # TODO: add option in config for ts
             # if self.cfg and getattr(self.cfg, "wandb", False) and WANDB_AVAILABLE:
             #     try:
             #         wandb.save(f".\\models\\sac_checkpoint_{self.total_steps}.pt")

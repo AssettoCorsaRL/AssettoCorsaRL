@@ -69,6 +69,5 @@ if __name__ == "__main__":
     td = env.reset()
     print("Initial time step:", td)
 
-    # multiple resets will now use the same track (seed=42)
     td2 = env.reset()
     print("Reset again; track should be identical:", td2)

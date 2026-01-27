@@ -75,28 +75,21 @@ def cli_command(
     """
 
     def decorator(func: Callable) -> Callable:
-        # Get command name from function name if not provided
         cmd_name = name or func.__name__.replace("_", "-")
         if cmd_name == "main":
-            # If function is called "main", try to infer from module
             import inspect
 
             module = inspect.getmodule(func)
             if module and module.__name__ != "__main__":
-                # Use module name as command name
                 parts = module.__name__.split(".")
                 cmd_name = parts[-1].replace("_", "-")
 
-        # Get help text from docstring if not provided
         cmd_help = help
         if cmd_help is None and func.__doc__:
-            # Extract first line of docstring
             cmd_help = func.__doc__.strip().split("\n")[0]
 
-        # Extract options from decorated function
         options = getattr(func, "_cli_options", [])
 
-        # Register the command
         if group not in _COMMAND_REGISTRY:
             _COMMAND_REGISTRY[group] = []
 

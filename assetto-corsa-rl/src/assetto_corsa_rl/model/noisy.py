@@ -173,9 +173,7 @@ class FactorisedNoisyLayer(AbstractNoisyLayer):
         out_features: int,
         sigma: float = 0.5,
     ):
-        super().__init__(
-            in_features=in_features, out_features=out_features, sigma=sigma
-        )
+        super().__init__(in_features=in_features, out_features=out_features, sigma=sigma)
 
     def register_noise_buffers(self) -> None:
         """
@@ -183,9 +181,7 @@ class FactorisedNoisyLayer(AbstractNoisyLayer):
         output noise components with dimensions matching input and output features.
         """
         self.register_buffer(name="epsilon_input", tensor=torch.empty(self.in_features))
-        self.register_buffer(
-            name="epsilon_output", tensor=torch.empty(self.out_features)
-        )
+        self.register_buffer(name="epsilon_output", tensor=torch.empty(self.out_features))
 
     def _calculate_bound(self) -> float:
         """
@@ -239,18 +235,10 @@ class FactorisedNoisyLayer(AbstractNoisyLayer):
         Resets cached weights and biases to ensure fresh computation with new noise.
         """
         with torch.no_grad():
-            epsilon_input = torch.randn(
-                self.in_features, device=self.epsilon_input.device
-            )
-            epsilon_output = torch.randn(
-                self.out_features, device=self.epsilon_output.device
-            )
-            self.epsilon_input.copy_(
-                epsilon_input.sign() * torch.sqrt(torch.abs(epsilon_input))
-            )
-            self.epsilon_output.copy_(
-                epsilon_output.sign() * torch.sqrt(torch.abs(epsilon_output))
-            )
+            epsilon_input = torch.randn(self.in_features, device=self.epsilon_input.device)
+            epsilon_output = torch.randn(self.out_features, device=self.epsilon_output.device)
+            self.epsilon_input.copy_(epsilon_input.sign() * torch.sqrt(torch.abs(epsilon_input)))
+            self.epsilon_output.copy_(epsilon_output.sign() * torch.sqrt(torch.abs(epsilon_output)))
         self.cached_weight = None
         self.cached_bias = None
 
@@ -286,12 +274,12 @@ class NoisyLazyLinear(nn.Module):
         self._layer = None
 
     def forward(self, x: torch.Tensor):
-        # Lazily create the underlying noisy layer using the observed input size
+        # lazily create the underlying noisy layer using the observed input size
         if self._layer is None:
             in_features = x.shape[-1]
-            self._layer = FactorisedNoisyLayer(
-                in_features, self.out_features, sigma=self.sigma
-            ).to(self.device if self.device is not None else x.device)
+            self._layer = FactorisedNoisyLayer(in_features, self.out_features, sigma=self.sigma).to(
+                self.device if self.device is not None else x.device
+            )
         return self._layer(x)
 
     def sample_noise(self) -> None:

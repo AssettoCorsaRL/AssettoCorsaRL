@@ -44,14 +44,11 @@ def unpack_pixels(x):
     if x.dtype == torch.int8:
         return x.to(torch.float32) / 127.0
 
-    # Default: convert to float32 assuming already in [0,1]
     return x.to(torch.float32)
 
 
 def sample_random_actions(num_envs, device=None):
-    device = device or (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    )
+    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
     steer = torch.empty(num_envs, 1, device=device).uniform_(-1, 1)
     gas = torch.empty(num_envs, 1, device=device).uniform_(0, 1)
     brake = torch.empty(num_envs, 1, device=device).uniform_(0, 1)

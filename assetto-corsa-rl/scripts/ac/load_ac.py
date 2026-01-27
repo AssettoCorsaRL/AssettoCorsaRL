@@ -116,7 +116,7 @@ def main(ckpt, episodes, device, racing_line, deterministic, config_path):
     print("Loading Trained SAC Agent for Assetto Corsa")
     print("=" * 60)
 
-    # Load input config from YAML if provided
+    # load input config from YAML if provided
     input_config = None
     if config_path:
         try:

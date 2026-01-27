@@ -15,17 +15,17 @@ from assetto_corsa_rl.cli_registry import get_registered_commands
 
 
 def _find_scripts_dir():
-    # 1. Development mode - scripts at repo root
+    # 1. dev mode - scripts at repo root
     dev_scripts = Path(__file__).parent.parent.parent / "scripts"
     if dev_scripts.exists():
         return dev_scripts
 
-    # 2. Installed via pip - check sys.prefix/share
+    # 2. via pip - check sys.prefix/share
     installed_scripts = Path(sys.prefix) / "share" / "assetto_corsa_rl" / "scripts"
     if installed_scripts.exists():
         return installed_scripts
 
-    # 3. Check in package directory (if copied during install)
+    # 3. check in package directory (if copied during install)
     package_scripts = Path(__file__).parent / "scripts"
     if package_scripts.exists():
         return package_scripts
@@ -103,15 +103,12 @@ def cli():
 
 def build_cli():
     """Build the CLI by registering all decorated commands."""
-    # Discover and import all scripts
     discover_commands()
 
-    # Get registered commands
     all_commands = get_registered_commands()
 
-    # Create groups and commands dynamically
     for group_name, commands in all_commands.items():
-        # Create the group with proper closure
+
         def make_group_factory(gname):
             @cli.group(name=gname)
             def group():
@@ -127,13 +124,10 @@ def build_cli():
             return group
 
         current_group = make_group_factory(group_name)
-
-        # Add each command to the group
         for cmd_def in commands:
             original_func = cmd_def["func"]
             options = cmd_def.get("options", [])
 
-            # Create a wrapper function for each command
             def make_cmd_func(func):
                 def wrapper(**kwargs):
                     return func(**kwargs)
@@ -144,14 +138,12 @@ def build_cli():
             cmd_func.__name__ = cmd_def["name"].replace("-", "_")
             cmd_func.__doc__ = cmd_def.get("help") or original_func.__doc__
 
-            # Apply click.command decorator
             cmd_func = current_group.command(
                 name=cmd_def["name"],
                 help=cmd_def.get("help"),
                 short_help=cmd_def.get("short_help"),
             )(cmd_func)
 
-            # Apply options in reverse order (click stacks them)
             for opt in reversed(options):
                 cmd_func = click.option(*opt.param_decls, **opt.attrs)(cmd_func)
 

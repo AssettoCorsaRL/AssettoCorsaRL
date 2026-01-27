@@ -1,10 +1,11 @@
 """Pretrain SAC actor using behavioral cloning on recorded demonstrations.
 
 This script loads recorded human demonstrations and pretrains the SAC actor
-to imitate the human policy before starting RL training.
+to imitate the human policy before starting RL training. CRSfD (Conservative
+Reward Shaping from Demonstrations) is always enabled.
 
 Usage:
-    acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1031.ckpt
+acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1031.ckpt --demo-gamma 0.99 --target-gamma 0.995 --ood-weight 0.5
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ import wandb
 from tensordict import TensorDict
 from typing import Tuple
 
-# Add src to path
 repo_root = Path(__file__).resolve().parents[2]
 src_path = str(repo_root / "src")
 if src_path not in sys.path:
@@ -55,7 +55,12 @@ class DemonstrationDataset(Dataset):
 
         if self.augment:
             self.transform = T.Compose(
-                [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05)]
+                [
+                    T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+                    T.RandomAdjustSharpness(sharpness_factor=2),
+                    T.ElasticTransform(),
+                    T.RandomPosterize(),
+                ]
             )
         else:
             self.transform = None
@@ -113,16 +118,13 @@ class DemonstrationDataset(Dataset):
         return len(self.frames)
 
     def __getitem__(self, idx):
-        # frames: (N, H, W) uint8 -> (N, H, W) float32 [0, 1]
+        # (N, H, W) uint8 -> (N, H, W) float32 [0, 1]
         frames = self.frames[idx].astype(np.float32) / 255.0
         actions = self.actions[idx].astype(np.float32)
 
         frames_tensor = torch.from_numpy(frames)
 
-        # Apply augmentation if enabled (apply to all frames in stack)
         if self.augment and self.transform is not None:
-            # Stack frames temporarily for augmentation
-            # frames_tensor is (frame_stack, H, W), need (1, frame_stack, H, W) for transforms
             frames_stacked = frames_tensor.unsqueeze(0)  # (1, frame_stack, H, W)
             frames_stacked = self.transform(frames_stacked)
             frames_tensor = frames_stacked.squeeze(0)  # (frame_stack, H, W)
@@ -136,6 +138,183 @@ class DemonstrationDataset(Dataset):
         return result
 
 
+class ValueFunction(nn.Module):
+    """Value function network for estimating V_M0 from demonstrations.
+
+    Used in Conservative Reward Shaping from Demonstrations (CRSfD).
+    """
+
+    def __init__(
+        self, obs_dim: int, hidden_dim: int = 256, num_layers: int = 3, dropout: float = 0.3
+    ):
+        super().__init__()
+
+        layers = []
+        input_dim = obs_dim
+
+        for i in range(num_layers):
+            layers.extend(
+                [
+                    nn.Linear(input_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.ReLU(),
+                    (
+                        nn.Dropout(dropout) if i < num_layers - 1 else nn.Identity()
+                    ),  # Dropout between layers
+                ]
+            )
+            input_dim = hidden_dim
+
+        layers.append(nn.Linear(hidden_dim, 1))  # single value
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """Estimate value for given observations.
+
+        Args:
+            obs: Observations (B, obs_dim) or frames (B, C, H, W)
+
+        Returns:
+            values: Estimated values (B, 1)
+        """
+        if obs.dim() > 2:
+            obs = obs.flatten(start_dim=1)
+
+        return self.network(obs)
+
+
+class ConservativeValueTrainer:
+    """Trainer for conservative value function estimation from demonstrations.
+
+    Implements Algorithm 1 from CRSfD paper:
+    - Monte-Carlo policy evaluation on demonstrations
+    - Regress OOD states to 0 for conservativeness
+    """
+
+    def __init__(
+        self,
+        value_fn: nn.Module,
+        device: torch.device,
+        lr: float = 3e-4,
+        demo_gamma: float = 0.99,
+        ood_weight: float = 0.5,
+    ):
+        self.value_fn = value_fn
+        self.device = device
+        self.demo_gamma = demo_gamma
+        self.ood_weight = ood_weight
+
+        self.optimizer = torch.optim.AdamW(value_fn.parameters(), lr=lr, weight_decay=1e-4)
+        self.mc_returns = {}  # cache for Monte-Carlo returns
+
+    def compute_mc_returns(self, dataset: DemonstrationDataset, gamma: float) -> dict:
+        """Compute Monte-Carlo returns for all demonstration states.
+
+        Args:
+            dataset: Demonstration dataset
+            gamma: Discount factor for computing returns
+
+        Returns:
+            Dictionary mapping indices to MC returns
+        """
+        print("Computing Monte-Carlo returns from demonstrations...")
+
+        mc_returns = {}
+
+        idx = 0
+        for batch_file in dataset.batch_files:
+            data = np.load(batch_file, allow_pickle=True)
+            frames_batch = data["frames"]
+
+            rewards = data["rewards"]
+
+            returns = np.zeros(len(rewards))
+            running_return = 0.0
+
+            for t in reversed(range(len(rewards))):
+                running_return = rewards[t] + gamma * running_return
+                returns[t] = running_return
+
+            for i, ret in enumerate(returns):
+                mc_returns[idx + i] = ret
+
+            idx += len(frames_batch)
+
+        print(f"  Computed {len(mc_returns)} MC returns")
+        print(f"  Mean return: {np.mean(list(mc_returns.values())):.4f}")
+        print(f"  Max return: {np.max(list(mc_returns.values())):.4f}")
+
+        self.mc_returns = mc_returns
+        return mc_returns
+
+    def sample_ood_states(self, batch_size: int, obs_shape: tuple) -> torch.Tensor:
+        """Sample out-of-distribution states from observation space.
+
+        For image observations, sample random pixel values.
+
+        Args:
+            batch_size: Number of OOD samples
+            obs_shape: Shape of observations (C, H, W)
+
+        Returns:
+            Random observations
+        """
+        ood_states = torch.rand(batch_size, *obs_shape, device=self.device)
+        return ood_states
+
+    def train_step(
+        self,
+        demo_batch: dict,
+        demo_indices: list,
+        obs_shape: tuple,
+    ) -> dict:
+        """Perform one training step of conservative value function.
+
+        Args:
+            demo_batch: Batch from demonstration dataset
+            demo_indices: Original indices in dataset
+            obs_shape: Shape of observations
+
+        Returns:
+            Training metrics
+        """
+        demo_obs = demo_batch["frames"].to(self.device)
+        batch_size = demo_obs.shape[0]
+
+        demo_returns = torch.tensor(
+            [self.mc_returns.get(idx.item(), 0.0) for idx in demo_indices],
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(1)
+
+        demo_values = self.value_fn(demo_obs)
+
+        # Loss 1: regress demo states to MC returns
+        demo_loss = F.mse_loss(demo_values, demo_returns)
+
+        # Loss 2: regress OOD states to 0 (conservative)
+        ood_obs = self.sample_ood_states(batch_size, obs_shape)
+        ood_values = self.value_fn(ood_obs)
+        ood_targets = torch.zeros_like(ood_values)
+        ood_loss = F.mse_loss(ood_values, ood_targets)
+
+        total_loss = demo_loss + self.ood_weight * ood_loss
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value_fn.parameters(), max_norm=1.0)
+        self.optimizer.step()
+
+        return {
+            "value_loss": total_loss.item(),
+            "demo_loss": demo_loss.item(),
+            "ood_loss": ood_loss.item(),
+            "mean_demo_value": demo_values.mean().item(),
+            "mean_ood_value": ood_values.mean().item(),
+        }
+
+
 class BehavioralCloningTrainer:
     """Trainer for behavioral cloning pretraining."""
 
@@ -144,19 +323,18 @@ class BehavioralCloningTrainer:
         actor: nn.Module,
         device: torch.device,
         lr: float = 1e-4,
-        weight_decay: float = 1e-5,
+        weight_decay: float = 1e-3,  # Increased from 1e-5 to reduce overfitting
     ):
         self.actor = actor
         self.device = device
 
-        # Only optimize actor parameters
+        # only optimize actor parameters
         self.optimizer = torch.optim.AdamW(
             actor.parameters(),
             lr=lr,
             weight_decay=weight_decay,
         )
 
-        # Learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
             mode="min",
@@ -172,11 +350,9 @@ class BehavioralCloningTrainer:
         total_samples = 0
 
         for batch_idx, batch in enumerate(dataloader):
-            # Handle both old tuple format and new dict format
             if isinstance(batch, dict):
                 frames = batch["frames"].to(self.device)
                 actions = batch["actions"].to(self.device)
-                # observations available but not used in BC training (vision-based)
             else:
                 frames, actions = batch
                 frames = frames.to(self.device)
@@ -184,21 +360,16 @@ class BehavioralCloningTrainer:
 
             batch_size = frames.shape[0]
 
-            # Forward pass through actor
             td_in = TensorDict({"pixels": frames}, batch_size=[batch_size])
             td_out = self.actor(td_in)
 
-            # Get predicted action distribution
             pred_loc = td_out["loc"]  # (B, action_dim)
 
-            # Use MSE loss between predicted mean and target actions
             loss = F.mse_loss(pred_loc, actions)
 
-            # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
 
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
 
             self.optimizer.step()
@@ -221,7 +392,6 @@ class BehavioralCloningTrainer:
 
         with torch.no_grad():
             for batch in dataloader:
-                # Handle both old tuple format and new dict format
                 if isinstance(batch, dict):
                     frames = batch["frames"].to(self.device)
                     actions = batch["actions"].to(self.device)
@@ -268,6 +438,7 @@ class BehavioralCloningTrainer:
 @cli_option("--num-workers", default=4, help="Data loader workers")
 @cli_option("--num-cells", default=256, help="Hidden layer size")
 @cli_option("--augment", is_flag=True, help="Enable data augmentation")
+@cli_option("--dropout", default=0.0, type=float, help="Dropout probability for actor MLP")
 @cli_option(
     "--vae-checkpoint",
     type=click.Path(exists=True),
@@ -276,6 +447,21 @@ class BehavioralCloningTrainer:
 )
 @cli_option("--wandb-project", default="AssetoCorsaRL-BC", help="WandB project name")
 @cli_option("--wandb-offline", is_flag=True, help="Run WandB offline")
+@cli_option(
+    "--demo-gamma",
+    default=0.99,
+    type=float,
+    help="Discount factor for demo value function (gamma_0)",
+)
+@cli_option(
+    "--target-gamma",
+    default=0.995,
+    type=float,
+    help="Discount factor for target task (gamma_k > gamma_0)",
+)
+@cli_option("--ood-weight", default=0.5, type=float, help="Weight for OOD regression loss (lambda)")
+@cli_option("--value-hidden-dim", default=256, help="Hidden dimension for value function network")
+@cli_option("--value-lr", default=3e-4, type=float, help="Learning rate for value function")
 def main(
     data_dir,
     output_path,
@@ -286,20 +472,23 @@ def main(
     num_workers,
     num_cells,
     augment,
+    dropout,
     vae_checkpoint,
     wandb_project,
     wandb_offline,
+    demo_gamma,
+    target_gamma,
+    ood_weight,
+    value_hidden_dim,
+    value_lr,
 ):
-    # Convert paths
     data_dir = Path(data_dir)
     output_path = Path(output_path)
     vae_checkpoint = Path(vae_checkpoint) if vae_checkpoint else None
 
-    # Setup device
     device = get_device()
     print(f"Using device: {device}")
 
-    # Initialize WandB
     wandb_mode = "offline" if wandb_offline else "online"
     try:
         wandb.init(
@@ -314,8 +503,14 @@ def main(
                 "num_workers": num_workers,
                 "num_cells": num_cells,
                 "augment": augment,
+                "dropout": dropout,
                 "vae_checkpoint": str(vae_checkpoint) if vae_checkpoint else None,
                 "wandb_project": wandb_project,
+                "demo_gamma": demo_gamma,
+                "target_gamma": target_gamma,
+                "ood_weight": ood_weight,
+                "value_hidden_dim": value_hidden_dim,
+                "value_lr": value_lr,
             },
             mode=wandb_mode,
         )
@@ -323,12 +518,10 @@ def main(
         print(f"Warning: WandB initialization failed: {e}")
         print("Continuing without WandB logging...")
 
-    # Image configuration
     IMAGE_HEIGHT = 84
     IMAGE_WIDTH = 84
     FRAME_STACK = 4
 
-    # Load dataset
     dataset = DemonstrationDataset(
         data_dir,
         image_shape=(IMAGE_HEIGHT, IMAGE_WIDTH),
@@ -336,7 +529,6 @@ def main(
         augment=augment,
     )
 
-    # Split into train/val
     n_samples = len(dataset)
     n_val = int(n_samples * val_split)
     n_train = n_samples - n_val
@@ -360,7 +552,6 @@ def main(
         pin_memory=True,
     )
 
-    # Create actor
     mock_env = create_mock_env(device)
 
     vae_path = str(vae_checkpoint) if vae_checkpoint else None
@@ -369,10 +560,10 @@ def main(
         num_cells=num_cells,
         device=device,
         use_noisy=False,
+        actor_dropout=dropout,
         vae_checkpoint_path=vae_path,
     )
 
-    # Initialize lazy layers with a dummy forward pass
     dummy_frames = torch.zeros(1, FRAME_STACK, IMAGE_HEIGHT, IMAGE_WIDTH, device=device)
 
     with torch.no_grad():
@@ -382,14 +573,43 @@ def main(
     actor = agent.actor
     print(f"Actor parameters: {sum(p.numel() for p in actor.parameters()):,}")
 
-    # Create trainer
     trainer = BehavioralCloningTrainer(
         actor=actor,
         device=device,
         lr=lr,
     )
 
-    # Training loop
+    # CRSfD is always enabled
+    print("\n" + "=" * 50)
+    print("Initializing Conservative Reward Shaping from Demonstrations (CRSfD)")
+    print("=" * 50)
+
+    obs_dim = FRAME_STACK * IMAGE_HEIGHT * IMAGE_WIDTH
+    value_fn = ValueFunction(
+        obs_dim=obs_dim,
+        hidden_dim=value_hidden_dim,
+        num_layers=3,
+        dropout=0.3,
+    ).to(device)
+
+    print(f"Value function parameters: {sum(p.numel() for p in value_fn.parameters()):,}")
+
+    value_trainer = ConservativeValueTrainer(
+        value_fn=value_fn,
+        device=device,
+        lr=value_lr,
+        demo_gamma=demo_gamma,
+        ood_weight=ood_weight,
+    )
+
+    # Monte-Carlo returns from demonstrations
+    value_trainer.compute_mc_returns(dataset, gamma=demo_gamma)
+
+    print(f"Demo discount factor (γ₀): {demo_gamma}")
+    print(f"Target discount factor (γₖ): {target_gamma}")
+    print(f"OOD regression weight (λ): {ood_weight}")
+    print("=" * 50 + "\n")
+
     best_val_mse = float("inf")
     patience_counter = 0
     EARLY_STOP_PATIENCE = 10
@@ -400,50 +620,83 @@ def main(
     print("=" * 50)
 
     for epoch in range(epochs):
-        # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
 
-        # Validate
+        # (CRSfD)
+        value_metrics = {
+            "value_loss": 0.0,
+            "demo_loss": 0.0,
+            "ood_loss": 0.0,
+            "mean_demo_value": 0.0,
+            "mean_ood_value": 0.0,
+        }
+
+        for batch_idx, batch in enumerate(train_loader):
+            indices = torch.arange(
+                batch_idx * batch_size, min((batch_idx + 1) * batch_size, n_train)
+            )
+
+            obs_shape = (FRAME_STACK, IMAGE_HEIGHT, IMAGE_WIDTH)
+            step_metrics = value_trainer.train_step(
+                batch,
+                indices,
+                obs_shape,
+            )
+
+            for k, v in step_metrics.items():
+                value_metrics[k] += v
+
+        num_batches = len(train_loader)
+        for k in value_metrics:
+            value_metrics[k] /= num_batches
+
         val_metrics = trainer.validate(val_loader)
 
-        # Update scheduler
         trainer.step_scheduler(val_metrics["val_mse"])
 
-        # Logging
         metrics = {
             "epoch": epoch,
             "train/loss": train_metrics["loss"],
             "val/mse": val_metrics["val_mse"],
             "lr": trainer.optimizer.param_groups[0]["lr"],
+            "train/value_loss": value_metrics["value_loss"],
+            "train/demo_loss": value_metrics["demo_loss"],
+            "train/ood_loss": value_metrics["ood_loss"],
         }
+
         try:
             wandb.log(metrics)
         except:
-            pass  # Continue if wandb logging fails
+            pass
 
-        print(
+        log_str = (
             f"Epoch {epoch + 1}/{epochs} | "
             f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Val MSE: {val_metrics['val_mse']:.6f}"
+            f"Val MSE: {val_metrics['val_mse']:.6f} | "
+            f"Value Loss: {value_metrics['value_loss']:.6f}"
         )
 
-        # Save best model
+        print(log_str)
+
         if val_metrics["val_mse"] < best_val_mse:
             best_val_mse = val_metrics["val_mse"]
             patience_counter = 0
             try:
-                torch.save(
-                    {
-                        "actor_state": actor.state_dict(),
-                        "epoch": epoch,
-                        "val_mse": best_val_mse,
-                        "config": {
-                            "num_cells": num_cells,
-                            "vae_checkpoint_path": vae_path,
-                        },
+                checkpoint = {
+                    "actor_state": actor.state_dict(),
+                    "value_fn_state": value_fn.state_dict(),
+                    "epoch": epoch,
+                    "val_mse": best_val_mse,
+                    "config": {
+                        "num_cells": num_cells,
+                        "vae_checkpoint_path": vae_path,
+                        "demo_gamma": demo_gamma,
+                        "target_gamma": target_gamma,
+                        "value_hidden_dim": value_hidden_dim,
                     },
-                    output_path,
-                )
+                }
+
+                torch.save(checkpoint, output_path)
                 print(f"  ✓ Saved best model (val_mse: {best_val_mse:.6f})")
             except Exception as e:
                 print(f"  ✗ Failed to save model: {e}")
@@ -453,21 +706,23 @@ def main(
                 print(f"\nEarly stopping after {epoch + 1} epochs")
                 break
 
-    # Final save
     final_path = output_path.with_stem(output_path.stem + "_final")
     try:
-        torch.save(
-            {
-                "actor_state": actor.state_dict(),
-                "epoch": epoch,
-                "val_mse": val_metrics["val_mse"],
-                "config": {
-                    "num_cells": num_cells,
-                    "vae_checkpoint_path": vae_path,
-                },
+        final_checkpoint = {
+            "actor_state": actor.state_dict(),
+            "value_fn_state": value_fn.state_dict(),
+            "epoch": epoch,
+            "val_mse": val_metrics["val_mse"],
+            "config": {
+                "num_cells": num_cells,
+                "vae_checkpoint_path": vae_path,
+                "demo_gamma": demo_gamma,
+                "target_gamma": target_gamma,
+                "value_hidden_dim": value_hidden_dim,
             },
-            final_path,
-        )
+        }
+
+        torch.save(final_checkpoint, final_path)
     except Exception as e:
         print(f"Failed to save final model: {e}")
 

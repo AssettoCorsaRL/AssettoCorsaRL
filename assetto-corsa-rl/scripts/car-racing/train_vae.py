@@ -25,6 +25,12 @@ try:
 except Exception:
     from assetto_corsa_rl.model.vae import ConvVAE  # type: ignore
 
+try:
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
+except Exception:
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+
+
 import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import WandbLogger

@@ -103,9 +103,7 @@ class Telemetry:
             return
 
         self._receiver_running = True
-        self._receiver_thread = threading.Thread(
-            target=self._receiver_loop, daemon=True
-        )
+        self._receiver_thread = threading.Thread(target=self._receiver_loop, daemon=True)
         self._receiver_thread.start()
 
     def stop_receiver(self) -> None:
@@ -198,7 +196,7 @@ class Telemetry:
 
             screenshot = self._sct.grab(monitor)
             img = np.array(screenshot)[:, :, :3]
-            # Convert to grayscale using standard luminance formula
+            # -> grayscale using luminance formula
             img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
             return img
@@ -223,9 +221,7 @@ class Telemetry:
             return
 
         self._image_running = True
-        self._image_thread = threading.Thread(
-            target=self._image_capture_loop, daemon=True
-        )
+        self._image_thread = threading.Thread(target=self._image_capture_loop, daemon=True)
         self._image_thread.start()
         print("✓ Started image capture")
 

@@ -94,7 +94,6 @@ def save_stack_npz(stack: np.ndarray, out_dir: Path, prefix: str, counter: int) 
 
 
 def save_stack_png(stack: np.ndarray, out_dir: Path, prefix: str, counter: int) -> Path:
-    # Create a horizontal concatenation for visualization
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     fname = out_dir / f"{prefix}_{counter:06d}_{ts}.png"
@@ -111,7 +110,7 @@ from typing import Tuple
 
 def key_loop(telemetry: Telemetry, args) -> None:
     try:
-        import msvcrt  # Windows-only non-blocking keypress
+        import msvcrt  # windows-only non-blocking keypress
     except ImportError:
         msvcrt = None
 
@@ -137,7 +136,6 @@ def key_loop(telemetry: Telemetry, args) -> None:
                 print("👋 Quitting...")
                 break
 
-        # Always poll latest image to update buffer
         latest = telemetry.get_latest_image()
         if latest is not None:
             try:

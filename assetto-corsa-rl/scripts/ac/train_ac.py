@@ -209,7 +209,7 @@ def train():
                 print(f"✓ Loaded BC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})")
             else:
                 print("Warning: No actor_state found in BC checkpoint")
-            # Initialize target networks fresh (no critic pretraining from BC)
+            # init target networks fresh (no critic pretraining from BC)
             value_target.load_state_dict(value.state_dict())
             q1_target.load_state_dict(q1.state_dict())
             q2_target.load_state_dict(q2.state_dict())

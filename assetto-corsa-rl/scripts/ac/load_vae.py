@@ -178,11 +178,10 @@ def main(ckpt, env, frames, image_shape, device):
         if make_ac_env is None:
             raise RuntimeError("Assetto Corsa env not available (failed to import).")
 
-        # create AC environment: returns gym-style obs dicts
         env = make_ac_env(include_image=True, observation_image_shape=(img_h, img_w))
         obs, info = env.reset()
 
-        # initialize frame buffer with the initial frame repeated
+        # init frame buffer with the initial frame repeated
         initial_img = obs["image"]  # H, W, 1 uint8
         frame_buf = deque(maxlen=frames)
         fr = torch.from_numpy(initial_img[..., 0].astype(np.float32) / 255.0)
