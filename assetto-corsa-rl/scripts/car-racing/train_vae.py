@@ -196,34 +196,6 @@ def make_dataloaders(
     return train_loader, val_loader
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--steps-per-epoch", type=int, default=1000)
-    p.add_argument("--val-steps", type=int, default=200)
-    p.add_argument("--z-dim", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--beta", type=float, default=1.0)
-    p.add_argument("--warmup-steps", type=int, default=500, help="Linear LR warmup steps")
-    p.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value")
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--gpus", type=int, default=0)
-    p.add_argument("--ckpt-dir", type=str, default="checkpoints")
-    p.add_argument(
-        "--frames",
-        type=int,
-        default=4,
-        help="Number of consecutive frames to stack as input",
-    )
-    p.add_argument("--wandb-project", type=str, default="assetto_corsa_rl_vae")
-    p.add_argument("--wandb-entity", type=str, default=None)
-    p.add_argument("--wandb-name", type=str, default=None)
-    p.add_argument("--wandb-offline", action="store_true", help="Run wandb in offline mode")
-    return p.parse_args()
-
-
 @cli_command(group="car-racing", name="train-vae", help="Train VAE on CarRacing environment")
 @cli_option("--epochs", default=10, help="Number of epochs")
 @cli_option("--batch-size", default=32, help="Batch size")
@@ -288,7 +260,6 @@ def main(
 
     pl.seed_everything(args.seed, workers=True)
 
-    # Create dataloaders
     train_loader, val_loader = make_dataloaders(
         batch_size=args.batch_size,
         steps_per_epoch=args.steps_per_epoch,

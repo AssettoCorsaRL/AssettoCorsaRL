@@ -201,20 +201,35 @@ def train():
             print(f"Warning: Failed to load pretrained model: {e}")
             value_target.load_state_dict(value.state_dict())
     elif bc_pretrained_path:
-        print(f"Loading BC pretrained actor from {bc_pretrained_path}...")
+        print(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
         try:
             checkpoint = torch.load(bc_pretrained_path, map_location=device)
             if "actor_state" in checkpoint:
                 actor.load_state_dict(checkpoint["actor_state"])
-                print(f"✓ Loaded BC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})")
+                print(
+                    f"✓ Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
+                )
             else:
-                print("Warning: No actor_state found in BC checkpoint")
-            # init target networks fresh (no critic pretraining from BC)
+                print("Warning: No actor_state found in BC-SAC checkpoint")
+
+            # Load Q-networks if available (BC-SAC trains critics too)
+            if "q1_state" in checkpoint:
+                q1.load_state_dict(checkpoint["q1_state"])
+                print("✓ Loaded BC-SAC pretrained Q1")
+            if "q2_state" in checkpoint:
+                q2.load_state_dict(checkpoint["q2_state"])
+                print("✓ Loaded BC-SAC pretrained Q2")
+            if "q1_target_state" in checkpoint:
+                q1_target.load_state_dict(checkpoint["q1_target_state"])
+                print("✓ Loaded BC-SAC pretrained Q1 target")
+            if "q2_target_state" in checkpoint:
+                q2_target.load_state_dict(checkpoint["q2_target_state"])
+                print("✓ Loaded BC-SAC pretrained Q2 target")
+
+            # Initialize value target from current value
             value_target.load_state_dict(value.state_dict())
-            q1_target.load_state_dict(q1.state_dict())
-            q2_target.load_state_dict(q2.state_dict())
         except Exception as e:
-            print(f"Warning: Failed to load BC pretrained model: {e}")
+            print(f"Warning: Failed to load BC-SAC pretrained model: {e}")
             value_target.load_state_dict(value.state_dict())
     else:
         value_target.load_state_dict(value.state_dict())

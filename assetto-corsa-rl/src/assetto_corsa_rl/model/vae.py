@@ -9,6 +9,9 @@ import lpips
 import sys
 import os
 
+import wandb
+import torchvision
+
 
 class ConvBlock(nn.Module):
     """Convolutional building block: Conv2d -> BatchNorm2d -> LeakyReLU"""
@@ -434,8 +437,6 @@ class ConvVAE(pl.LightningModule):
             return
 
         try:
-            import wandb
-            import torchvision
 
             imgs = torch.cat([x[:4], recon[:4]], dim=0)
             grid = torchvision.utils.make_grid(imgs, nrow=4, normalize=True)
@@ -473,6 +474,7 @@ def load_vae_encoder(
     in_channels: int = 4,
     trainable: bool = True,
     verbose: bool = True,
+    im_size: Tuple[int, int] = (84, 84),
 ) -> Tuple[nn.Module, int]:
     """Load a VAE encoder from checkpoint with automatic parameter detection.
 
@@ -535,10 +537,11 @@ def load_vae_encoder(
 
     # handle channel mismatch with adapter if needed
     needs_adapter = vae_in_channels != in_channels
-    if needs_adapter and verbose:
-        print(
-            f"VAE: {vae_in_channels}ch→adapter→{in_channels}ch, z_dim={z_dim}, {'trainable' if trainable else 'frozen'}"
-        )
+    if needs_adapter:
+        if verbose:
+            print(
+                f"VAE: {vae_in_channels}ch→adapter→{in_channels}ch, z_dim={z_dim}, {'trainable' if trainable else 'frozen'}"
+            )
         encoder_module = nn.Sequential(
             nn.Conv2d(
                 in_channels,
@@ -561,7 +564,10 @@ def load_vae_encoder(
             nn.Flatten(start_dim=1),
         )
 
-    output_size = 256 * 4 * 4
+    with torch.no_grad():
+        dummy_input = torch.zeros(1, in_channels, im_size[0], im_size[1], device=device)
+        dummy_output = encoder_module(dummy_input)
+        output_size = dummy_output.shape[1]
 
     return encoder_module, output_size
 

@@ -377,28 +377,6 @@ def play(
         pass
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Load a pretrained SAC model and play episodes")
-    parser.add_argument("--model", type=str, required=True, help="Path to pretrained model (.pt)")
-    parser.add_argument(
-        "--device", type=str, default=None, help="Device to use (e.g., cuda:0, cpu)"
-    )
-    parser.add_argument("--episodes", type=int, default=5, help="Number of episodes to play")
-    parser.add_argument("--max-steps", type=int, default=1000, help="Max steps per episode")
-    parser.add_argument("--render", action="store_true", help="Render environment to screen")
-    parser.add_argument(
-        "--deterministic", action="store_true", help="Use deterministic (mean) actions"
-    )
-    parser.add_argument("--seed", type=int, default=None, help="Optional random seed")
-    parser.add_argument(
-        "--video",
-        type=str,
-        default=None,
-        help="Path to save video recording (e.g., agent.mp4)",
-    )
-    return parser.parse_args()
-
-
 @cli_command(group="car-racing", name="test", help="Test a trained SAC agent in CarRacing")
 @cli_option("--model", required=True, help="Path to pretrained model (.pt)")
 @cli_option("--device", default=None, help="Device to use (e.g., cuda:0, cpu)")
@@ -409,16 +387,15 @@ def parse_args():
 @cli_option("--seed", default=None, type=int, help="Optional random seed")
 @cli_option("--video", default=None, help="Path to save video recording (e.g., agent.mp4)")
 def main(model, device, episodes, max_steps, render, deterministic, seed, video):
-    args = parse_args()
     play(
-        model_path=args.model,
-        device=args.device,
-        episodes=args.episodes,
-        max_steps=args.max_steps,
-        render=args.render,
-        deterministic=args.deterministic,
-        seed=args.seed,
-        video_path=args.video,
+        model_path=model,
+        device=device,
+        episodes=episodes,
+        max_steps=max_steps,
+        render=render,
+        deterministic=deterministic,
+        seed=seed,
+        video_path=video,
     )
 
 

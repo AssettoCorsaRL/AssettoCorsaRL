@@ -32,7 +32,6 @@ src/assetto_corsa_rl/ac_telemetry_helper.py
 src/assetto_corsa_rl/cli.py
 src/assetto_corsa_rl/cli_registry.py
 src/assetto_corsa_rl/env_helper.py
-src/assetto_corsa_rl/load.py
 src/assetto_corsa_rl.egg-info/PKG-INFO
 src/assetto_corsa_rl.egg-info/SOURCES.txt
 src/assetto_corsa_rl.egg-info/dependency_links.txt
@@ -46,9 +45,3 @@ src/assetto_corsa_rl/model/vae.py
 src/assetto_corsa_rl/train/__init__.py
 src/assetto_corsa_rl/train/train_core.py
 src/assetto_corsa_rl/train/train_utils.py
-tests/test_ac_env.py
-tests/test_ac_reward.py
-tests/test_env.py
-tests/test_sac.py
-tests/test_xbox_buttons.py
-tests/test_xbox_controller.py

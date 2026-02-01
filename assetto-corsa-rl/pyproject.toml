@@ -58,10 +58,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/assetto-corsa-rl"
-Repository = "https://github.com/yourusername/assetto-corsa-rl"
-Documentation = "https://github.com/yourusername/assetto-corsa-rl#readme"
-"Bug Tracker" = "https://github.com/yourusername/assetto-corsa-rl/issues"
+Homepage = "https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/docs/"
+Repository = "https://github.com/AssettoCorsaRL/AssettoCorsaRL"
+Documentation = "https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/docs/"
+"Bug Tracker" = "https://github.com/AssettoCorsaRL/AssettoCorsaRL/issues"
 
 [project.scripts]
 acrl = "assetto_corsa_rl.cli:main"

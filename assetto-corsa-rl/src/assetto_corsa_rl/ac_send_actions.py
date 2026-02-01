@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Optional
+import vgamepad as vg
 
 
 class XboxController:
@@ -10,7 +11,6 @@ class XboxController:
         self._init_gamepad()
 
     def _init_gamepad(self):
-        from pyvjoystick import vigem as vg  # type: ignore
 
         self._vg = vg
         self._gamepad = vg.VX360Gamepad()
@@ -43,30 +43,12 @@ class XboxController:
     def left_joystick_float(self, x_value_float: float, y_value_float: float):
         # float [-1.0, 1.0]
 
-        max_int = 32767
-        xi = int(max(-1.0, min(1.0, x_value_float)) * max_int)
-        yi = int(max(-1.0, min(1.0, y_value_float)) * max_int)
-        if hasattr(self._gamepad, "left_joystick_float"):
-            try:
-                self._gamepad.left_joystick_float(
-                    x_value_float=x_value_float, y_value_float=y_value_float
-                )
-                return
-            except Exception:
-                pass
-        self._gamepad.left_joystick(x_value=xi, y_value=yi)
+        self._gamepad.left_joystick_float(x_value_float=x_value_float, y_value_float=y_value_float)
 
     def right_trigger_float(self, value_float: float):
         # float [0.0, 1.0]
 
-        vi = int(max(0.0, min(1.0, value_float)) * 255.0)
-        if hasattr(self._gamepad, "right_trigger_float"):
-            try:
-                self._gamepad.right_trigger_float(value_float=value_float)
-                return
-            except Exception:
-                pass
-        self._gamepad.right_trigger(value=vi)
+        self._gamepad.right_trigger_float(value_float=value_float)
 
     def left_trigger_float(self, value_float: float):
         # float [0.0, 1.0]

@@ -1,17 +1,19 @@
-"""Pretrain SAC actor using behavioral cloning on recorded demonstrations.
+"""Train SAC policy using BC-SAC: Behavioral Cloning + Soft Actor-Critic.
 
-This script loads recorded human demonstrations and pretrains the SAC actor
-to imitate the human policy before starting RL training. CRSfD (Conservative
-Reward Shaping from Demonstrations) is always enabled.
+BC-SAC from "Imitation Is Not Enough: Robustifying Imitation with Reinforcement Learning for Challenging Driving Scenarios" (Waymo, 2023).
+
+- Actor objective: E[Q(s,a) + H(π(·|s))] + λ * E[log π(a|s)]
+- Critic objective: Standard SAC Bellman error
 
 Usage:
-acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1031.ckpt --demo-gamma 0.99 --target-gamma 0.995 --ood-weight 0.5
+acrl ac train-bc --data-dir datasets/demonstrations2 --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1050.ckpt --bc-weight 1.0 --dropout 0.3 --augment
 """
 
 from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import Tuple, Optional
 
 import numpy as np
 import torch
@@ -19,10 +21,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
+from tensordict import TensorDict
+
 import click
 import wandb
-from tensordict import TensorDict
-from typing import Tuple
 
 repo_root = Path(__file__).resolve().parents[2]
 src_path = str(repo_root / "src")
@@ -56,10 +58,12 @@ class DemonstrationDataset(Dataset):
         if self.augment:
             self.transform = T.Compose(
                 [
-                    T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-                    T.RandomAdjustSharpness(sharpness_factor=2),
-                    T.ElasticTransform(),
-                    T.RandomPosterize(),
+                    T.RandomApply(
+                        [T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.02)],
+                        p=0.5,
+                    ),
+                    T.RandomApply([T.RandomAdjustSharpness(sharpness_factor=1.5)], p=0.3),
+                    T.RandomApply([T.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.2),
                 ]
             )
         else:
@@ -71,41 +75,51 @@ class DemonstrationDataset(Dataset):
 
         self.frames = []
         self.actions = []
-        self.observations = []  # store observations if available
-        self.has_observations = False
+        self.rewards = []
+        self.observations = []
         self.observation_keys = None
 
         print(f"Loading {len(self.batch_files)} demonstration batches...")
         for batch_file in self.batch_files:
             try:
                 data = np.load(batch_file, allow_pickle=True)
-                if "frames" not in data or "actions" not in data:
-                    raise ValueError(f"Missing required keys in {batch_file}")
                 self.frames.append(data["frames"])
                 self.actions.append(data["actions"])
-
-                if "observations" in data:
-                    self.observations.append(data["observations"])
-                    if not self.has_observations and "observation_keys" in data:
-                        self.observation_keys = data["observation_keys"].tolist()
-                    self.has_observations = True
+                self.rewards.append(data["rewards"])
+                self.observations.append(data["observations"])
+                if self.observation_keys is None and "observation_keys" in data:
+                    self.observation_keys = data["observation_keys"].tolist()
             except Exception as e:
                 raise RuntimeError(f"Failed to load {batch_file}: {e}")
 
         self.frames = np.concatenate(self.frames, axis=0)
         self.actions = np.concatenate(self.actions, axis=0)
+        self.rewards = np.concatenate(self.rewards, axis=0)
+        self.observations = np.concatenate(self.observations, axis=0)
 
-        if self.has_observations and self.observations:
-            self.observations = np.concatenate(self.observations, axis=0)
-            print(f"✓ Loaded {len(self.frames)} demonstration samples with observations")
-            print(f"  Observations shape: {self.observations.shape}")
-            if self.observation_keys:
-                print(
-                    f"  Observation keys ({len(self.observation_keys)}): {', '.join(self.observation_keys[:5])}..."
-                )
-        else:
-            self.observations = None
-            print(f"✓ Loaded {len(self.frames)} demonstration samples (no observations)")
+        print(
+            f"  Rewards: min={self.rewards.min():.4f}, max={self.rewards.max():.4f}, mean={self.rewards.mean():.4f}"
+        )
+
+        self.obs_min = self.observations.min(axis=0, keepdims=True).astype(np.float32)
+        self.obs_max = self.observations.max(axis=0, keepdims=True).astype(np.float32)
+        self.obs_mean = self.observations.mean(axis=0, keepdims=True).astype(np.float32)
+        self.obs_range = self.obs_max - self.obs_min
+        self.obs_range = np.where(self.obs_range < 1e-6, 1.0, self.obs_range)
+
+        self.obs_normalizations_values = {}
+        print(f"  {'Key':<25} {'Min':>12} {'Max':>12} {'Mean':>12} {'Range':>12}")
+        print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
+        for i, key in enumerate(self.observation_keys):
+            min_val = float(self.obs_min[0, i])
+            max_val = float(self.obs_max[0, i])
+            mean_val = float(self.obs_mean[0, i])
+            range_val = float(self.obs_range[0, i])
+            key_short = key[:24] if len(key) > 24 else key
+            self.obs_normalizations_values[key] = (min_val, range_val)
+            print(
+                f"  {key_short:<25} {min_val:>12.4f} {max_val:>12.4f} {mean_val:>12.4f} {range_val:>12.4f}"
+            )
 
         print(f"  Frames shape: {self.frames.shape}")
         print(f"  Actions shape: {self.actions.shape}")
@@ -114,280 +128,276 @@ class DemonstrationDataset(Dataset):
         assert self.actions.ndim == 2, f"Expected 2D actions, got {self.actions.ndim}D"
         print(f"  Action dim: {self.actions.shape[1]}")
 
+        steering = self.actions[:, 0]
+        throttle = self.actions[:, 1]
+        brake = self.actions[:, 2]
+        print(f"\n  Action Statistics:")
+        print(
+            f"    Steering: mean={steering.mean():.4f}, std={steering.std():.4f}, min={steering.min():.4f}, max={steering.max():.4f}"
+        )
+        print(
+            f"    Throttle: mean={throttle.mean():.4f}, std={throttle.std():.4f}, min={throttle.min():.4f}, max={throttle.max():.4f}"
+        )
+        print(
+            f"    Brake:    mean={brake.mean():.4f}, std={brake.std():.4f}, min={brake.min():.4f}, max={brake.max():.4f}"
+        )
+
+        left_turns = (steering < -0.03).sum()
+        right_turns = (steering > 0.03).sum()
+        straight = ((steering >= -0.03) & (steering <= 0.03)).sum()
+        print(f"    Left turns: {left_turns} ({100*left_turns/len(steering):.1f}%)")
+        print(f"    Right turns: {right_turns} ({100*right_turns/len(steering):.1f}%)")
+        print(f"    Straight: {straight} ({100*straight/len(steering):.1f}%)")
+
+        # build valid indices for consecutive frame pairs (s, a, s')
+        # exclude last frame of each batch to avoid cross-batch transitions
+        self.valid_indices = list(range(len(self.frames) - 1))
+
     def __len__(self):
-        return len(self.frames)
+        return len(self.valid_indices)
+
+    def set_augment(self, augment: bool):
+        """Enable or disable augmentation."""
+        self.augment = augment
 
     def __getitem__(self, idx):
+        actual_idx = self.valid_indices[idx]
+        next_idx = actual_idx + 1
+
         # (N, H, W) uint8 -> (N, H, W) float32 [0, 1]
-        frames = self.frames[idx].astype(np.float32) / 255.0
-        actions = self.actions[idx].astype(np.float32)
+        frames = self.frames[actual_idx].astype(np.float32) / 255.0
+        next_frames = self.frames[next_idx].astype(np.float32) / 255.0
+        actions = self.actions[actual_idx].astype(np.float32).copy()
 
         frames_tensor = torch.from_numpy(frames)
+        next_frames_tensor = torch.from_numpy(next_frames)
 
+        # apply color augmentation to each frame individually (before stacking)
         if self.augment and self.transform is not None:
-            frames_stacked = frames_tensor.unsqueeze(0)  # (1, frame_stack, H, W)
-            frames_stacked = self.transform(frames_stacked)
-            frames_tensor = frames_stacked.squeeze(0)  # (frame_stack, H, W)
+            augmented_frames = []
+            for i in range(frames_tensor.shape[0]):
+                frame = frames_tensor[i : i + 1]  # (1, H, W)
+                frame = self.transform(frame)
+                augmented_frames.append(frame)
+            frames_tensor = torch.cat(augmented_frames, dim=0)  # (frame_stack, H, W)
 
-        result = {"frames": frames_tensor, "actions": torch.from_numpy(actions)}
+            augmented_next_frames = []
+            for i in range(next_frames_tensor.shape[0]):
+                frame = next_frames_tensor[i : i + 1]  # (1, H, W)
+                frame = self.transform(frame)
+                augmented_next_frames.append(frame)
+            next_frames_tensor = torch.cat(augmented_next_frames, dim=0)
 
-        if self.has_observations and self.observations is not None:
-            observations = self.observations[idx].astype(np.float32)
-            result["observations"] = torch.from_numpy(observations)
+        # horizontal flip (50% chance) to balance left/right turns
+        #! HIGHLY EXPIREMENTAL
+        if self.augment and np.random.rand() < 0.5:
+            frames_tensor = torch.flip(frames_tensor, dims=[-1])  # flip width
+            next_frames_tensor = torch.flip(next_frames_tensor, dims=[-1])
+            actions[0] = -actions[0]  # invert steering
+
+        result = {
+            "frames": frames_tensor,
+            "next_frames": next_frames_tensor,
+            "actions": torch.from_numpy(actions),
+            "rewards": torch.tensor(self.rewards[actual_idx].astype(np.float32)).reshape(1),
+        }
+
+        # norm observations
+        obs = self.observations[actual_idx].astype(np.float32)
+        normalized_obs = np.zeros_like(obs)
+        for i, key in enumerate(self.observation_keys):
+            min_val, range_val = self.obs_normalizations_values[key]
+            normalized_obs[i] = (obs[i] - min_val) / range_val
+        result["observations"] = torch.from_numpy(normalized_obs)
 
         return result
 
 
-class ValueFunction(nn.Module):
-    """Value function network for estimating V_M0 from demonstrations.
+class BCSACTrainer:
+    """BC-SAC: Combine Behavioral Cloning with Soft Actor-Critic.
 
-    Used in Conservative Reward Shaping from Demonstrations (CRSfD).
+    Implements the approach from Waymo's "Imitation Is Not Enough" paper.
+    Trains both critics (with Bellman updates) and actor (with Q-values + BC loss).
     """
-
-    def __init__(
-        self, obs_dim: int, hidden_dim: int = 256, num_layers: int = 3, dropout: float = 0.3
-    ):
-        super().__init__()
-
-        layers = []
-        input_dim = obs_dim
-
-        for i in range(num_layers):
-            layers.extend(
-                [
-                    nn.Linear(input_dim, hidden_dim),
-                    nn.LayerNorm(hidden_dim),
-                    nn.ReLU(),
-                    (
-                        nn.Dropout(dropout) if i < num_layers - 1 else nn.Identity()
-                    ),  # Dropout between layers
-                ]
-            )
-            input_dim = hidden_dim
-
-        layers.append(nn.Linear(hidden_dim, 1))  # single value
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Estimate value for given observations.
-
-        Args:
-            obs: Observations (B, obs_dim) or frames (B, C, H, W)
-
-        Returns:
-            values: Estimated values (B, 1)
-        """
-        if obs.dim() > 2:
-            obs = obs.flatten(start_dim=1)
-
-        return self.network(obs)
-
-
-class ConservativeValueTrainer:
-    """Trainer for conservative value function estimation from demonstrations.
-
-    Implements Algorithm 1 from CRSfD paper:
-    - Monte-Carlo policy evaluation on demonstrations
-    - Regress OOD states to 0 for conservativeness
-    """
-
-    def __init__(
-        self,
-        value_fn: nn.Module,
-        device: torch.device,
-        lr: float = 3e-4,
-        demo_gamma: float = 0.99,
-        ood_weight: float = 0.5,
-    ):
-        self.value_fn = value_fn
-        self.device = device
-        self.demo_gamma = demo_gamma
-        self.ood_weight = ood_weight
-
-        self.optimizer = torch.optim.AdamW(value_fn.parameters(), lr=lr, weight_decay=1e-4)
-        self.mc_returns = {}  # cache for Monte-Carlo returns
-
-    def compute_mc_returns(self, dataset: DemonstrationDataset, gamma: float) -> dict:
-        """Compute Monte-Carlo returns for all demonstration states.
-
-        Args:
-            dataset: Demonstration dataset
-            gamma: Discount factor for computing returns
-
-        Returns:
-            Dictionary mapping indices to MC returns
-        """
-        print("Computing Monte-Carlo returns from demonstrations...")
-
-        mc_returns = {}
-
-        idx = 0
-        for batch_file in dataset.batch_files:
-            data = np.load(batch_file, allow_pickle=True)
-            frames_batch = data["frames"]
-
-            rewards = data["rewards"]
-
-            returns = np.zeros(len(rewards))
-            running_return = 0.0
-
-            for t in reversed(range(len(rewards))):
-                running_return = rewards[t] + gamma * running_return
-                returns[t] = running_return
-
-            for i, ret in enumerate(returns):
-                mc_returns[idx + i] = ret
-
-            idx += len(frames_batch)
-
-        print(f"  Computed {len(mc_returns)} MC returns")
-        print(f"  Mean return: {np.mean(list(mc_returns.values())):.4f}")
-        print(f"  Max return: {np.max(list(mc_returns.values())):.4f}")
-
-        self.mc_returns = mc_returns
-        return mc_returns
-
-    def sample_ood_states(self, batch_size: int, obs_shape: tuple) -> torch.Tensor:
-        """Sample out-of-distribution states from observation space.
-
-        For image observations, sample random pixel values.
-
-        Args:
-            batch_size: Number of OOD samples
-            obs_shape: Shape of observations (C, H, W)
-
-        Returns:
-            Random observations
-        """
-        ood_states = torch.rand(batch_size, *obs_shape, device=self.device)
-        return ood_states
-
-    def train_step(
-        self,
-        demo_batch: dict,
-        demo_indices: list,
-        obs_shape: tuple,
-    ) -> dict:
-        """Perform one training step of conservative value function.
-
-        Args:
-            demo_batch: Batch from demonstration dataset
-            demo_indices: Original indices in dataset
-            obs_shape: Shape of observations
-
-        Returns:
-            Training metrics
-        """
-        demo_obs = demo_batch["frames"].to(self.device)
-        batch_size = demo_obs.shape[0]
-
-        demo_returns = torch.tensor(
-            [self.mc_returns.get(idx.item(), 0.0) for idx in demo_indices],
-            dtype=torch.float32,
-            device=self.device,
-        ).unsqueeze(1)
-
-        demo_values = self.value_fn(demo_obs)
-
-        # Loss 1: regress demo states to MC returns
-        demo_loss = F.mse_loss(demo_values, demo_returns)
-
-        # Loss 2: regress OOD states to 0 (conservative)
-        ood_obs = self.sample_ood_states(batch_size, obs_shape)
-        ood_values = self.value_fn(ood_obs)
-        ood_targets = torch.zeros_like(ood_values)
-        ood_loss = F.mse_loss(ood_values, ood_targets)
-
-        total_loss = demo_loss + self.ood_weight * ood_loss
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.value_fn.parameters(), max_norm=1.0)
-        self.optimizer.step()
-
-        return {
-            "value_loss": total_loss.item(),
-            "demo_loss": demo_loss.item(),
-            "ood_loss": ood_loss.item(),
-            "mean_demo_value": demo_values.mean().item(),
-            "mean_ood_value": ood_values.mean().item(),
-        }
-
-
-class BehavioralCloningTrainer:
-    """Trainer for behavioral cloning pretraining."""
 
     def __init__(
         self,
         actor: nn.Module,
+        q1: nn.Module,
+        q2: nn.Module,
+        q1_target: nn.Module,
+        q2_target: nn.Module,
         device: torch.device,
-        lr: float = 1e-4,
-        weight_decay: float = 1e-3,  # Increased from 1e-5 to reduce overfitting
+        actor_lr: float = 1e-4,
+        critic_lr: float = 1e-4,
+        bc_weight: float = 1.0,
+        gamma: float = 0.92,
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        weight_decay: float = 1e-5,
     ):
         self.actor = actor
+        self.q1 = q1
+        self.q2 = q2
+        self.q1_target = q1_target
+        self.q2_target = q2_target
         self.device = device
+        self.bc_weight = bc_weight
+        self.gamma = gamma
+        self.tau = tau
+        self.alpha = alpha
 
-        # only optimize actor parameters
-        self.optimizer = torch.optim.AdamW(
+        self.actor_optimizer = torch.optim.AdamW(
             actor.parameters(),
-            lr=lr,
+            lr=actor_lr,
+            weight_decay=weight_decay,
+        )
+        self.critic_optimizer = torch.optim.AdamW(
+            list(q1.parameters()) + list(q2.parameters()),
+            lr=critic_lr,
             weight_decay=weight_decay,
         )
 
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
+        self.actor_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.actor_optimizer,
+            mode="min",
+            factor=0.5,
+            patience=5,
+        )
+        self.critic_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.critic_optimizer,
             mode="min",
             factor=0.5,
             patience=5,
         )
 
-    def train_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
-        """Train for one epoch."""
-        self.actor.train()
+        self._update_target_network(tau=1.0)
 
-        total_loss = 0.0
+    def _update_target_network(self, tau: Optional[float] = None):
+        """Soft update of target network parameters."""
+        if tau is None:
+            tau = self.tau
+
+        with torch.no_grad():
+            for target_param, param in zip(self.q1_target.parameters(), self.q1.parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+            for target_param, param in zip(self.q2_target.parameters(), self.q2.parameters()):
+                target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
+
+    def train_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
+        """Train for one epoch with BC-SAC."""
+        self.actor.train()
+        self.q1.train()
+        self.q2.train()
+
+        total_critic_loss = 0.0
+        total_actor_loss = 0.0
+        total_bc_loss = 0.0
+        total_q_loss = 0.0
         total_samples = 0
 
-        for batch_idx, batch in enumerate(dataloader):
-            if isinstance(batch, dict):
-                frames = batch["frames"].to(self.device)
-                actions = batch["actions"].to(self.device)
-            else:
-                frames, actions = batch
-                frames = frames.to(self.device)
-                actions = actions.to(self.device)
+        for batch in dataloader:
+            frames = batch["frames"].to(self.device)
+            actions = batch["actions"].to(self.device)
+            next_frames = batch["next_frames"].to(self.device)
+            rewards = batch["rewards"].to(self.device)
+            if rewards.dim() == 1:
+                rewards = rewards.unsqueeze(1)
+
+            # dones = 0 is fine here for now cuz we dont crash into any walls when recording (hopefully)
+            # TODO: save dones in record_demonstrations
+            dones = torch.zeros(frames.shape[0], 1, device=self.device)
 
             batch_size = frames.shape[0]
 
+            # ========== Train Critic ==========
+            # get target Q-values using target network
+            with torch.no_grad():
+                next_td = TensorDict({"pixels": next_frames}, batch_size=[batch_size])
+                next_actor_out = self.actor(next_td)
+                next_actions = next_actor_out["loc"]
+                next_log_probs = next_actor_out.get(
+                    "log_prob", torch.zeros(batch_size, 1, device=self.device)
+                )
+
+                next_target_td = TensorDict(
+                    {"pixels": next_frames, "action": next_actions}, batch_size=[batch_size]
+                )
+                next_q1_target = self.q1_target(next_target_td)["state_action_value"]
+                next_q2_target = self.q2_target(next_target_td)["state_action_value"]
+                next_q_target = torch.min(next_q1_target, next_q2_target)
+
+                target_q = rewards + (1.0 - dones) * self.gamma * (
+                    next_q_target - self.alpha * next_log_probs
+                )
+
+            current_td = TensorDict({"pixels": frames, "action": actions}, batch_size=[batch_size])
+            current_q1 = self.q1(current_td)["state_action_value"]
+            current_q2 = self.q2(current_td)["state_action_value"]
+
+            # twin Q-learning
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+
+            # critic updates
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.q1.parameters()) + list(self.q2.parameters()), max_norm=1.0
+            )
+            self.critic_optimizer.step()
+
+            # ========== Train Actor ==========
             td_in = TensorDict({"pixels": frames}, batch_size=[batch_size])
-            td_out = self.actor(td_in)
+            actor_out = self.actor(td_in)
+            pred_actions = actor_out["loc"]
+            log_probs = actor_out.get("log_prob", torch.zeros(batch_size, 1, device=self.device))
 
-            pred_loc = td_out["loc"]  # (B, action_dim)
+            # BC loss: match expert actions
+            bc_loss = F.mse_loss(pred_actions, actions)
 
-            loss = F.mse_loss(pred_loc, actions)
+            actor_td = TensorDict(
+                {"pixels": frames, "action": pred_actions}, batch_size=[batch_size]
+            )
+            actor_q1 = self.q1(actor_td)["state_action_value"]
+            actor_q2 = self.q2(actor_td)["state_action_value"]
+            actor_q = torch.min(actor_q1, actor_q2)
 
-            self.optimizer.zero_grad()
-            loss.backward()
+            # RL loss: maximize Q-value + entropy
+            q_loss = -(actor_q - self.alpha * log_probs).mean()
 
+            actor_loss = self.bc_weight * bc_loss + q_loss
+
+            # actor updates
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+            self.actor_optimizer.step()
 
-            self.optimizer.step()
+            # ========== Soft update target network ==========
+            self._update_target_network()
 
-            total_loss += loss.item() * batch_size
+            total_critic_loss += critic_loss.item() * batch_size
+            total_actor_loss += actor_loss.item() * batch_size
+            total_bc_loss += bc_loss.item() * batch_size
+            total_q_loss += q_loss.item() * batch_size
             total_samples += batch_size
 
-        avg_loss = total_loss / total_samples
-
         return {
-            "loss": avg_loss,
+            "critic_loss": total_critic_loss / total_samples,
+            "actor_loss": total_actor_loss / total_samples,
+            "bc_loss": total_bc_loss / total_samples,
+            "q_loss": total_q_loss / total_samples,
         }
 
     def validate(self, dataloader: DataLoader) -> dict:
         """Validate on held-out data."""
         self.actor.eval()
+        self.q1.eval()
+        self.q2.eval()
 
         total_mse = 0.0
+        total_q_value = 0.0
         total_samples = 0
 
         with torch.no_grad():
@@ -404,36 +414,46 @@ class BehavioralCloningTrainer:
 
                 td_in = TensorDict({"pixels": frames}, batch_size=[batch_size])
                 td_out = self.actor(td_in)
-
                 pred_loc = td_out["loc"]
 
                 mse = F.mse_loss(pred_loc, actions)
 
+                q_td = TensorDict({"pixels": frames, "action": pred_loc}, batch_size=[batch_size])
+                q1_val = self.q1(q_td)["state_action_value"]
+                q2_val = self.q2(q_td)["state_action_value"]
+                q_value = torch.min(q1_val, q2_val).mean()
+
                 total_mse += mse.item() * batch_size
+                total_q_value += q_value.item() * batch_size
                 total_samples += batch_size
 
-        avg_mse = total_mse / total_samples
-
         return {
-            "val_mse": avg_mse,
+            "val_mse": total_mse / total_samples,
+            "val_q_value": total_q_value / total_samples,
         }
 
     def step_scheduler(self, val_loss: float):
-        """Step the learning rate scheduler."""
-        self.scheduler.step(val_loss)
+        """Step the learning rate schedulers."""
+        self.actor_scheduler.step(val_loss)
+        self.critic_scheduler.step(val_loss)
 
 
-@cli_command(group="ac", name="train-bc", help="Pretrain SAC actor using behavioral cloning")
+@cli_command(group="ac", name="train-bc", help="Train SAC policy using BC-SAC")
 @cli_option(
     "--data-dir",
     type=click.Path(exists=True),
     required=True,
     help="Directory with demonstrations",
 )
-@cli_option("--output-path", default="models/bc_pretrained.pt", help="Output model path")
+@cli_option("--output-path", default="models/bc_sac_pretrained.pt", help="Output model path")
 @cli_option("--epochs", default=50, help="Number of training epochs")
 @cli_option("--batch-size", default=64, help="Batch size")
-@cli_option("--lr", default=1e-4, type=float, help="Learning rate")
+@cli_option("--actor-lr", default=1e-4, type=float, help="Actor learning rate")
+@cli_option("--critic-lr", default=1e-4, type=float, help="Critic learning rate")
+@cli_option("--bc-weight", default=1.0, type=float, help="Weight for BC loss (λ)")
+@cli_option("--gamma", default=0.92, type=float, help="Discount factor")
+@cli_option("--tau", default=0.005, type=float, help="Target network update rate")
+@cli_option("--alpha", default=0.2, type=float, help="SAC entropy coefficient")
 @cli_option("--val-split", default=0.1, type=float, help="Validation split ratio")
 @cli_option("--num-workers", default=4, help="Data loader workers")
 @cli_option("--num-cells", default=256, help="Hidden layer size")
@@ -445,29 +465,19 @@ class BehavioralCloningTrainer:
     default=None,
     help="VAE checkpoint path",
 )
-@cli_option("--wandb-project", default="AssetoCorsaRL-BC", help="WandB project name")
+@cli_option("--wandb-project", default="AssetoCorsaRL-BCSAC", help="WandB project name")
 @cli_option("--wandb-offline", is_flag=True, help="Run WandB offline")
-@cli_option(
-    "--demo-gamma",
-    default=0.99,
-    type=float,
-    help="Discount factor for demo value function (gamma_0)",
-)
-@cli_option(
-    "--target-gamma",
-    default=0.995,
-    type=float,
-    help="Discount factor for target task (gamma_k > gamma_0)",
-)
-@cli_option("--ood-weight", default=0.5, type=float, help="Weight for OOD regression loss (lambda)")
-@cli_option("--value-hidden-dim", default=256, help="Hidden dimension for value function network")
-@cli_option("--value-lr", default=3e-4, type=float, help="Learning rate for value function")
 def main(
     data_dir,
     output_path,
     epochs,
     batch_size,
-    lr,
+    actor_lr,
+    critic_lr,
+    bc_weight,
+    gamma,
+    tau,
+    alpha,
     val_split,
     num_workers,
     num_cells,
@@ -476,11 +486,6 @@ def main(
     vae_checkpoint,
     wandb_project,
     wandb_offline,
-    demo_gamma,
-    target_gamma,
-    ood_weight,
-    value_hidden_dim,
-    value_lr,
 ):
     data_dir = Path(data_dir)
     output_path = Path(output_path)
@@ -498,7 +503,12 @@ def main(
                 "output_path": str(output_path),
                 "epochs": epochs,
                 "batch_size": batch_size,
-                "lr": lr,
+                "actor_lr": actor_lr,
+                "critic_lr": critic_lr,
+                "bc_weight": bc_weight,
+                "gamma": gamma,
+                "tau": tau,
+                "alpha": alpha,
                 "val_split": val_split,
                 "num_workers": num_workers,
                 "num_cells": num_cells,
@@ -506,11 +516,6 @@ def main(
                 "dropout": dropout,
                 "vae_checkpoint": str(vae_checkpoint) if vae_checkpoint else None,
                 "wandb_project": wandb_project,
-                "demo_gamma": demo_gamma,
-                "target_gamma": target_gamma,
-                "ood_weight": ood_weight,
-                "value_hidden_dim": value_hidden_dim,
-                "value_lr": value_lr,
             },
             mode=wandb_mode,
         )
@@ -522,18 +527,30 @@ def main(
     IMAGE_WIDTH = 84
     FRAME_STACK = 4
 
-    dataset = DemonstrationDataset(
+    train_dataset_full = DemonstrationDataset(
         data_dir,
         image_shape=(IMAGE_HEIGHT, IMAGE_WIDTH),
         frame_stack=FRAME_STACK,
         augment=augment,
     )
 
-    n_samples = len(dataset)
+    val_dataset_full = DemonstrationDataset(
+        data_dir,
+        image_shape=(IMAGE_HEIGHT, IMAGE_WIDTH),
+        frame_stack=FRAME_STACK,
+        augment=False,  # no augmentation for validation
+    )
+
+    n_samples = len(train_dataset_full)
     n_val = int(n_samples * val_split)
     n_train = n_samples - n_val
 
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [n_train, n_val])
+    indices = torch.randperm(n_samples).tolist()
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+
+    train_dataset = torch.utils.data.Subset(train_dataset_full, train_indices)
+    val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices)
 
     print(f"Train samples: {n_train}, Val samples: {n_val}")
 
@@ -570,98 +587,66 @@ def main(
         init_td = TensorDict({"pixels": dummy_frames}, batch_size=[1])
         agent.actor(init_td)
 
-    actor = agent.actor
+    modules = agent.modules()
+    actor = modules["actor"]
+    q1 = modules["q1"]
+    q2 = modules["q2"]
+    q1_target = modules["q1_target"]
+    q2_target = modules["q2_target"]
+
     print(f"Actor parameters: {sum(p.numel() for p in actor.parameters()):,}")
+    print(f"Q1 parameters: {sum(p.numel() for p in q1.parameters()):,}")
+    print(f"Q2 parameters: {sum(p.numel() for p in q2.parameters()):,}")
 
-    trainer = BehavioralCloningTrainer(
-        actor=actor,
-        device=device,
-        lr=lr,
-    )
-
-    # CRSfD is always enabled
     print("\n" + "=" * 50)
-    print("Initializing Conservative Reward Shaping from Demonstrations (CRSfD)")
+    print("Initializing BC-SAC Trainer")
     print("=" * 50)
-
-    obs_dim = FRAME_STACK * IMAGE_HEIGHT * IMAGE_WIDTH
-    value_fn = ValueFunction(
-        obs_dim=obs_dim,
-        hidden_dim=value_hidden_dim,
-        num_layers=3,
-        dropout=0.3,
-    ).to(device)
-
-    print(f"Value function parameters: {sum(p.numel() for p in value_fn.parameters()):,}")
-
-    value_trainer = ConservativeValueTrainer(
-        value_fn=value_fn,
-        device=device,
-        lr=value_lr,
-        demo_gamma=demo_gamma,
-        ood_weight=ood_weight,
-    )
-
-    # Monte-Carlo returns from demonstrations
-    value_trainer.compute_mc_returns(dataset, gamma=demo_gamma)
-
-    print(f"Demo discount factor (γ₀): {demo_gamma}")
-    print(f"Target discount factor (γₖ): {target_gamma}")
-    print(f"OOD regression weight (λ): {ood_weight}")
+    print(f"BC weight (λ): {bc_weight}")
+    print(f"Discount factor (γ): {gamma}")
+    print(f"Target network tau (τ): {tau}")
+    print(f"SAC entropy alpha (α): {alpha}")
     print("=" * 50 + "\n")
+
+    trainer = BCSACTrainer(
+        actor=actor,
+        q1=q1,
+        q2=q2,
+        q1_target=q1_target,
+        q2_target=q2_target,
+        device=device,
+        actor_lr=actor_lr,
+        critic_lr=critic_lr,
+        bc_weight=bc_weight,
+        gamma=gamma,
+        tau=tau,
+        alpha=alpha,
+    )
 
     best_val_mse = float("inf")
     patience_counter = 0
-    EARLY_STOP_PATIENCE = 10
+    EARLY_STOP_PATIENCE = 50
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 50)
-    print("Starting Behavioral Cloning Training")
+    print("Starting BC-SAC Training")
     print("=" * 50)
 
     for epoch in range(epochs):
         train_metrics = trainer.train_epoch(train_loader, epoch)
-
-        # (CRSfD)
-        value_metrics = {
-            "value_loss": 0.0,
-            "demo_loss": 0.0,
-            "ood_loss": 0.0,
-            "mean_demo_value": 0.0,
-            "mean_ood_value": 0.0,
-        }
-
-        for batch_idx, batch in enumerate(train_loader):
-            indices = torch.arange(
-                batch_idx * batch_size, min((batch_idx + 1) * batch_size, n_train)
-            )
-
-            obs_shape = (FRAME_STACK, IMAGE_HEIGHT, IMAGE_WIDTH)
-            step_metrics = value_trainer.train_step(
-                batch,
-                indices,
-                obs_shape,
-            )
-
-            for k, v in step_metrics.items():
-                value_metrics[k] += v
-
-        num_batches = len(train_loader)
-        for k in value_metrics:
-            value_metrics[k] /= num_batches
-
         val_metrics = trainer.validate(val_loader)
 
         trainer.step_scheduler(val_metrics["val_mse"])
 
         metrics = {
             "epoch": epoch,
-            "train/loss": train_metrics["loss"],
+            "train/critic_loss": train_metrics["critic_loss"],
+            "train/actor_loss": train_metrics["actor_loss"],
+            "train/bc_loss": train_metrics["bc_loss"],
+            "train/q_loss": train_metrics["q_loss"],
             "val/mse": val_metrics["val_mse"],
-            "lr": trainer.optimizer.param_groups[0]["lr"],
-            "train/value_loss": value_metrics["value_loss"],
-            "train/demo_loss": value_metrics["demo_loss"],
-            "train/ood_loss": value_metrics["ood_loss"],
+            "val/q_value": val_metrics["val_q_value"],
+            "lr/actor": trainer.actor_optimizer.param_groups[0]["lr"],
+            "lr/critic": trainer.critic_optimizer.param_groups[0]["lr"],
         }
 
         try:
@@ -671,9 +656,10 @@ def main(
 
         log_str = (
             f"Epoch {epoch + 1}/{epochs} | "
-            f"Train Loss: {train_metrics['loss']:.6f} | "
-            f"Val MSE: {val_metrics['val_mse']:.6f} | "
-            f"Value Loss: {value_metrics['value_loss']:.6f}"
+            f"Critic Loss: {train_metrics['critic_loss']:.6f} | "
+            f"Actor Loss: {train_metrics['actor_loss']:.6f} | "
+            f"BC Loss: {train_metrics['bc_loss']:.6f} | "
+            f"Val MSE: {val_metrics['val_mse']:.6f}"
         )
 
         print(log_str)
@@ -684,15 +670,19 @@ def main(
             try:
                 checkpoint = {
                     "actor_state": actor.state_dict(),
-                    "value_fn_state": value_fn.state_dict(),
+                    "q1_state": q1.state_dict(),
+                    "q2_state": q2.state_dict(),
+                    "q1_target_state": q1_target.state_dict(),
+                    "q2_target_state": q2_target.state_dict(),
                     "epoch": epoch,
                     "val_mse": best_val_mse,
                     "config": {
                         "num_cells": num_cells,
                         "vae_checkpoint_path": vae_path,
-                        "demo_gamma": demo_gamma,
-                        "target_gamma": target_gamma,
-                        "value_hidden_dim": value_hidden_dim,
+                        "bc_weight": bc_weight,
+                        "gamma": gamma,
+                        "tau": tau,
+                        "alpha": alpha,
                     },
                 }
 
@@ -710,15 +700,19 @@ def main(
     try:
         final_checkpoint = {
             "actor_state": actor.state_dict(),
-            "value_fn_state": value_fn.state_dict(),
+            "q1_state": q1.state_dict(),
+            "q2_state": q2.state_dict(),
+            "q1_target_state": q1_target.state_dict(),
+            "q2_target_state": q2_target.state_dict(),
             "epoch": epoch,
             "val_mse": val_metrics["val_mse"],
             "config": {
                 "num_cells": num_cells,
                 "vae_checkpoint_path": vae_path,
-                "demo_gamma": demo_gamma,
-                "target_gamma": target_gamma,
-                "value_hidden_dim": value_hidden_dim,
+                "bc_weight": bc_weight,
+                "gamma": gamma,
+                "tau": tau,
+                "alpha": alpha,
             },
         }
 
@@ -732,7 +726,7 @@ def main(
         pass
 
     print("\n" + "=" * 50)
-    print("Behavioral Cloning Training Complete!")
+    print("BC-SAC Training Complete!")
     print(f"Best Val MSE: {best_val_mse:.6f}")
     print(f"Best model saved to: {output_path}")
     print(f"Final model saved to: {final_path}")

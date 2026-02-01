@@ -36,7 +36,12 @@ import os
 
 
 class ACImageStackDataset(Dataset):
-    """Loads .npz stacks saved by save_image_dataset.py (stack shape: (F,H,W))."""
+    """Loads .npz stacks saved by save_image_dataset.py.
+
+    Handles two formats:
+    - Single stack: (F, H, W) - one stack per file
+    - Batch format: (N, F, H, W) - multiple stacks per file
+    """
 
     def __init__(
         self,
@@ -52,10 +57,29 @@ class ACImageStackDataset(Dataset):
         if len(self.files) == 0:
             raise RuntimeError(f"No .npz files found in {self.input_dir}")
 
-    def __len__(self):
-        return len(self.files)
+        self.index = []
+        for file_idx, file_path in enumerate(self.files):
+            d = np.load(str(file_path))
+            key = "stack" if "stack" in d else d.files[0]
+            stack = np.asarray(d[key])
+            d.close()
 
-    def _load_stack(self, p: Path) -> np.ndarray:
+            if stack.ndim == 3:
+                # single stack (v1.0.2 or below): (F, H, W)
+                self.index.append((file_idx, None))
+            elif stack.ndim == 4:
+                # batch format (v1.0.3 or above): (N, F, H, W)
+                for i in range(stack.shape[0]):
+                    self.index.append((file_idx, i))
+            else:
+                raise ValueError(f"Unexpected shape in {file_path}: {stack.shape}")
+
+        print(f"Loaded {len(self.index)} stacks from {len(self.files)} files")
+
+    def __len__(self):
+        return len(self.index)
+
+    def _load_stack(self, p: Path, sample_idx: int | None = None) -> np.ndarray:
         d = np.load(str(p))
         if "stack" in d:
             stack = d["stack"]
@@ -63,9 +87,17 @@ class ACImageStackDataset(Dataset):
             keys = [k for k in d.files]
             stack = d[keys[0]]
         stack = np.asarray(stack).astype(np.uint8)
-        if stack.ndim != 3:
-            raise ValueError(f"Expected (F,H,W) in {p}, got {stack.shape}")
-        return stack
+
+        if stack.ndim == 3:
+            # single stack (v1.0.2 or below): (F, H, W)
+            return stack
+        elif stack.ndim == 4:
+            # batch format (v1.0.3 or above): (N, F, H, W)
+            if sample_idx is None:
+                raise ValueError(f"sample_idx required for batch format in {p}")
+            return stack[sample_idx]
+        else:
+            raise ValueError(f"Expected (F,H,W) or (N,F,H,W) in {p}, got {stack.shape}")
 
     def _resize_frame(self, fr: np.ndarray) -> np.ndarray:
         h, w = self.image_shape
@@ -77,8 +109,9 @@ class ACImageStackDataset(Dataset):
         return fr
 
     def __getitem__(self, idx):
-        p = self.files[idx]
-        stack = self._load_stack(p)  # (F, H, W)
+        file_idx, sample_idx = self.index[idx]
+        p = self.files[file_idx]
+        stack = self._load_stack(p, sample_idx)  # (F, H, W)
 
         if self.frames is not None and stack.shape[0] > self.frames:
             stack = stack[-self.frames :]  # keep most recent frames

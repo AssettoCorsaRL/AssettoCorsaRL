@@ -200,20 +200,6 @@ def run_visualization(
     plt.close()
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Visualize VAE reconstructions with interactive control"
-    )
-    parser.add_argument(
-        "--model", type=str, required=True, help="Path to trained VAE checkpoint (.pth)"
-    )
-    parser.add_argument("--z-dim", type=int, default=32, help="Latent dimension of VAE")
-    parser.add_argument("--frames", type=int, default=4, help="Number of stacked frames")
-    parser.add_argument("--device", type=str, default=None, help="Device (cuda/cpu)")
-    parser.add_argument("--max-steps", type=int, default=10000, help="Maximum total steps")
-    return parser.parse_args()
-
-
 @cli_command(
     group="car-racing", name="load-vae", help="Load and visualize VAE reconstructions in real-time"
 )

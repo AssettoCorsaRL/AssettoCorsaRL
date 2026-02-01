@@ -123,7 +123,6 @@ def load_cfg_from_yaml(root: Path = None):
 
 @cli_command(group="car-racing", name="train", help="Train SAC agent in CarRacing environment")
 def train():
-
     cfg = load_cfg_from_yaml()
 
     torch.manual_seed(cfg.seed)

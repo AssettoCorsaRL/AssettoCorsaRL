@@ -180,7 +180,19 @@ class AssettoCorsa(gym.Env):
         elif key == "rpm":
             return float(data.get("car", {}).get("rpm", 0.0))
         elif key == "gear":
-            return float(data.get("car", {}).get("gear", 0.0))
+            gear = data.get("car", {}).get("gear", 0)
+            # Handle string gears: 'N' = 0, 'R' = -1, numbers = int(gear)
+            if isinstance(gear, str):
+                if gear == "N":
+                    return 0.0
+                elif gear == "R":
+                    return -1.0
+                else:
+                    try:
+                        return float(gear)
+                    except ValueError:
+                        return 0.0
+            return float(gear)
         elif key == "velocity_x":
             vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
             return float(vel[0] if len(vel) > 0 else 0.0)
@@ -290,17 +302,30 @@ class AssettoCorsa(gym.Env):
         elif key == "tyre_slip_ratio_avg":
             tyres = data.get("tyres", [])
             if tyres:
-                slip_vals = [
-                    t.get("slip_ratio", 0.0) for t in tyres if t.get("slip_ratio") is not None
-                ]
+                slip_vals = []
+                for t in tyres:
+                    val = t.get("slip_ratio")
+                    if val is not None:
+                        if isinstance(val, (list, tuple, np.ndarray)):
+                            val = float(np.mean(val)) if len(val) > 0 else 0.0
+                        else:
+                            val = float(val)
+                        slip_vals.append(val)
                 return float(np.mean(slip_vals) if slip_vals else 0.0)
             return 0.0
         elif key == "tyre_slip_angle_avg":
             tyres = data.get("tyres", [])
             if tyres:
-                slip_vals = [
-                    t.get("slip_angle", 0.0) for t in tyres if t.get("slip_angle") is not None
-                ]
+                slip_vals = []
+                for t in tyres:
+                    val = t.get("slip_angle")
+                    if val is not None:
+                        # Handle case where slip_angle might be an array
+                        if isinstance(val, (list, tuple, np.ndarray)):
+                            val = float(np.mean(val)) if len(val) > 0 else 0.0
+                        else:
+                            val = float(val)
+                        slip_vals.append(val)
                 return float(np.mean(slip_vals) if slip_vals else 0.0)
             return 0.0
 

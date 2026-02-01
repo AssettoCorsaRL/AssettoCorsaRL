@@ -4,7 +4,7 @@ This script records image observations and user inputs (steering, throttle, brak
 from Assetto Corsa to create a dataset for pretraining the SAC actor.
 
 Usage:
-    acrl ac record-demonstrations --output-dir datasets/demonstrations2 --duration 999999999999
+    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations2 --duration 999999999999 --display --display-scale 5.0
 
 Controls:
     - Press Ctrl+C to stop recording early
@@ -89,6 +89,9 @@ class DemonstrationRecorder:
             self._env_helper._meters_advanced = 0.0
             self._env_helper._last_speed = 0.0
             self._env_helper._current_racing_line_index = 0
+            # Track last reset time to avoid repeated resets
+            self._last_reset_time = 0.0
+            self._reset_cooldown_seconds = 2.0
             print(f"✓ Using environment reward function with racing line")
         except Exception as e:
             print(f"Warning: Could not load racing line: {e}")
@@ -112,6 +115,40 @@ class DemonstrationRecorder:
         if self.telemetry:
             self.telemetry.close()
             self.telemetry = None
+
+    def _handle_lap_reset(self):
+        """Handle environment reset when a lap threshold is reached.
+
+        Saves any pending batch, clears buffers, and resets environment helper state
+        so recording can continue fresh on the next lap.
+        """
+        print("Lap count reached 2 — saving batch and resetting environment state")
+        try:
+            self._save_batch()
+        except Exception as e:
+            print(f"Warning: Failed to save batch during lap reset: {e}")
+
+        self.frame_buffer = []
+
+        try:
+            self._env_helper._meters_advanced = 0.0
+            self._env_helper._last_speed = 0.0
+            self._env_helper._current_racing_line_index = 0
+        except Exception:
+            pass
+
+        try:
+            if self.telemetry:
+                self.telemetry.send_reset()
+                try:
+                    self.telemetry.clear_queue()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"Warning: failed to send telemetry reset: {e}")
+
+        self._last_reset_time = time.time()
 
     def _preprocess_image(self, img: np.ndarray) -> np.ndarray:
         """Resize and normalize image."""
@@ -210,9 +247,38 @@ class DemonstrationRecorder:
         processed = self._preprocess_image(img)
         stacked = self._get_stacked_frames(processed)
 
+        # avoids saving samples that contain padding frames at start or
+        # frames where the capture failed and returned an empty image.
+        if np.any(np.all(stacked == 0, axis=(1, 2))):
+            return (False, None, None) if return_frame else False
+
         action = self._extract_action(data)
         if action is None:
             return (False, None, None) if return_frame else False
+
+        # save and reset
+        lap_count = None
+        lap_info = data.get("lap") if isinstance(data, dict) else None
+        if isinstance(lap_info, dict):
+            lap_count = (
+                lap_info.get("get_lap_count") or lap_info.get("lap_count") or lap_info.get("count")
+            )
+        if lap_count is None:
+            lap_count = data.get("lap_count") if isinstance(data, dict) else None
+
+        try:
+            if lap_count is not None and int(lap_count) == 2:
+                # Avoid repeated resets by enforcing a cooldown
+                if time.time() - getattr(self, "_last_reset_time", 0.0) > getattr(
+                    self, "_reset_cooldown_seconds", 2.0
+                ):
+                    self._handle_lap_reset()
+                    return (False, None, None) if return_frame else False
+                else:
+                    # recently reset; skip recording this frame
+                    return (False, None, None) if return_frame else False
+        except Exception:
+            pass
 
         observation = self._extract_observation(data)
 
@@ -278,22 +344,6 @@ class DemonstrationRecorder:
 
     def finalize(self):
         """Save any remaining data and session info."""
-        if len(self.frames) > 0:
-            self._save_batch()
-
-        session_info = {
-            "session_start": (self.session_start.isoformat() if self.session_start else None),
-            "session_end": datetime.now().isoformat(),
-            "total_samples": self.saved_samples,
-            "image_shape": list(self.image_shape),
-            "frame_stack": self.frame_stack,
-            "min_speed_mph": self.min_speed_mph,
-        }
-
-        info_path = self.output_dir / "session_info.json"
-        with open(info_path, "w") as f:
-            json.dump(session_info, f, indent=2)
-
         print(f"\n{'=' * 50}")
         print(f"Recording complete!")
         print(f"Total samples: {self.saved_samples}")
@@ -367,7 +417,7 @@ def parse_args():
 )
 @cli_option(
     "--racing-line-path",
-    default=None,
+    default="racing_lines.json",
     help="Path to racing line JSON (enables env reward function)",
 )
 def main(
@@ -492,15 +542,42 @@ def main(
             if display and success and stacked_frame is not None and action is not None:
                 frame_to_show = stacked_frame[-1]
                 vis = cv2.cvtColor(frame_to_show, cv2.COLOR_GRAY2BGR)
-                text = f"{action[0]:.2f} {action[1]:.2f} {action[2]:.2f}"
-                cv2.putText(
-                    vis, text, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA
-                )
+
+                # Resize first so text scales appropriately and remains legible
                 if display_scale and display_scale != 1.0:
                     h, w = vis.shape[:2]
                     new_w = max(1, int(w * display_scale))
                     new_h = max(1, int(h * display_scale))
                     vis = cv2.resize(vis, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+                # Render action text with font size proportional to display scale
+                text = f"{action[0]:.2f} {action[1]:.2f} {action[2]:.2f}"
+                base_font = 0.5
+                font_scale = base_font * max(1.0, display_scale)
+                thickness = max(1, int(round(font_scale * 2)))
+
+                (text_w, text_h), baseline = cv2.getTextSize(
+                    text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+                )
+                pad = 6
+                rect_x1, rect_y1 = 8, 8
+                rect_x2, rect_y2 = rect_x1 + text_w + pad, rect_y1 + text_h + pad
+
+                # draw semi-opaque background for readability
+                cv2.rectangle(vis, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), cv2.FILLED)
+
+                text_org = (rect_x1 + pad // 2, rect_y1 + text_h + pad // 2 - baseline)
+                cv2.putText(
+                    vis,
+                    text,
+                    text_org,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale,
+                    (0, 255, 0),
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
                 cv2.imshow(window_name, vis)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
