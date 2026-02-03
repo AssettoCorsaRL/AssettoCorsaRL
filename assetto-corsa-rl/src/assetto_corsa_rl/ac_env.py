@@ -444,7 +444,10 @@ class AssettoCorsa(gym.Env):
 
         self._meters_advanced = current_meters
 
-        current_speed = data["car"]["speed_mph"]
+        velocity = data.get("car", {}).get("velocity", [0, 0, 0])
+        current_speed = np.linalg.norm(
+            velocity
+        )  # hacky fix until i do unit conversions which i dont wanna do so
 
         speed_change = current_speed - self._last_speed
         reward += self.final_speed_reward_per_m_per_s * speed_change
@@ -549,10 +552,6 @@ class AssettoCorsa(gym.Env):
         }
 
         return obs, reward, terminated, truncated, info
-
-    def render(self):
-        """Rendering is handled by Assetto Corsa itself."""
-        pass
 
     def close(self):
         """Clean up resources."""
@@ -719,11 +718,9 @@ def create_mock_env(device: Optional[torch.device] = None):
     class MockEnv:
         def __init__(self, device):
             self.device = device
-            # Match AssettoCorsa action space: [steering, throttle, brake]
             self.action_spec = BoundedTensorSpec(
                 low=-1.0, high=1.0, shape=(3,), dtype=torch.float32, device=device
             )
-            # Vision-based observation: 4 stacked 84x84 grayscale frames
             self.observation_spec = CompositeSpec(
                 pixels=UnboundedContinuousTensorSpec(
                     shape=(4, 84, 84), dtype=torch.float32, device=device
