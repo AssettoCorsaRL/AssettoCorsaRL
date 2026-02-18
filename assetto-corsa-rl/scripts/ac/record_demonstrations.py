@@ -89,7 +89,6 @@ class DemonstrationRecorder:
             self._env_helper._meters_advanced = 0.0
             self._env_helper._last_speed = 0.0
             self._env_helper._current_racing_line_index = 0
-            # Track last reset time to avoid repeated resets
             self._last_reset_time = 0.0
             self._reset_cooldown_seconds = 2.0
             print(f"✓ Using environment reward function with racing line")
@@ -268,7 +267,6 @@ class DemonstrationRecorder:
 
         try:
             if lap_count is not None and int(lap_count) == 2:
-                # Avoid repeated resets by enforcing a cooldown
                 if time.time() - getattr(self, "_last_reset_time", 0.0) > getattr(
                     self, "_reset_cooldown_seconds", 2.0
                 ):
@@ -543,14 +541,12 @@ def main(
                 frame_to_show = stacked_frame[-1]
                 vis = cv2.cvtColor(frame_to_show, cv2.COLOR_GRAY2BGR)
 
-                # Resize first so text scales appropriately and remains legible
                 if display_scale and display_scale != 1.0:
                     h, w = vis.shape[:2]
                     new_w = max(1, int(w * display_scale))
                     new_h = max(1, int(h * display_scale))
                     vis = cv2.resize(vis, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-                # Render action text with font size proportional to display scale
                 text = f"{action[0]:.2f} {action[1]:.2f} {action[2]:.2f}"
                 base_font = 0.5
                 font_scale = base_font * max(1.0, display_scale)

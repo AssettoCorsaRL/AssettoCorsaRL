@@ -683,6 +683,7 @@ def main(
                         "gamma": gamma,
                         "tau": tau,
                         "alpha": alpha,
+                        "use_noisy": False,  # BC pretraining always uses regular linear layers
                     },
                 }
 
@@ -713,6 +714,7 @@ def main(
                 "gamma": gamma,
                 "tau": tau,
                 "alpha": alpha,
+                "use_noisy": False,  # BC pretraining always uses regular linear layers
             },
         }
 

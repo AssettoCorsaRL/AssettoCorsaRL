@@ -1,3 +1,5 @@
+# NOTE: all arguments for this script are the .yamls
+
 import time
 import math
 import sys
@@ -135,7 +137,7 @@ def train():
         print("Warning: WandB init failed, continuing without logging:", e)
 
     env = create_transformed_env(
-        racing_line_path="racing_lines.json",
+        racing_line_path=getattr(cfg, "racing_line_path", "racing_lines.json"),
         device=device,
         image_shape=(84, 84),
         frame_stack=4,
@@ -204,29 +206,57 @@ def train():
         print(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
         try:
             checkpoint = torch.load(bc_pretrained_path, map_location=device)
-            if "actor_state" in checkpoint:
-                actor.load_state_dict(checkpoint["actor_state"])
+
+            # check if BC model was trained with different noisy setting
+            bc_use_noisy = checkpoint.get("config", {}).get("use_noisy", False)
+            current_use_noisy = cfg.use_noisy
+
+            if bc_use_noisy != current_use_noisy:
                 print(
-                    f"✓ Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
+                    f"  Note: BC model was trained with use_noisy={bc_use_noisy}, "
+                    f"current model has use_noisy={current_use_noisy}"
                 )
+                print("  Loading with strict=False to handle architecture mismatch...")
+                strict = False
+            else:
+                strict = True
+
+            if "actor_state" in checkpoint:
+                try:
+                    actor.load_state_dict(checkpoint["actor_state"], strict=strict)
+                    print(
+                        f"✓ Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
+                    )
+                except Exception as e:
+                    print(f"  Warning: Partial actor load: {e}")
             else:
                 print("Warning: No actor_state found in BC-SAC checkpoint")
 
-            # Load Q-networks if available (BC-SAC trains critics too)
             if "q1_state" in checkpoint:
-                q1.load_state_dict(checkpoint["q1_state"])
-                print("✓ Loaded BC-SAC pretrained Q1")
+                try:
+                    q1.load_state_dict(checkpoint["q1_state"], strict=strict)
+                    print("✓ Loaded BC-SAC pretrained Q1")
+                except Exception as e:
+                    print(f"  Warning: Partial Q1 load: {e}")
             if "q2_state" in checkpoint:
-                q2.load_state_dict(checkpoint["q2_state"])
-                print("✓ Loaded BC-SAC pretrained Q2")
+                try:
+                    q2.load_state_dict(checkpoint["q2_state"], strict=strict)
+                    print("✓ Loaded BC-SAC pretrained Q2")
+                except Exception as e:
+                    print(f"  Warning: Partial Q2 load: {e}")
             if "q1_target_state" in checkpoint:
-                q1_target.load_state_dict(checkpoint["q1_target_state"])
-                print("✓ Loaded BC-SAC pretrained Q1 target")
+                try:
+                    q1_target.load_state_dict(checkpoint["q1_target_state"], strict=strict)
+                    print("✓ Loaded BC-SAC pretrained Q1 target")
+                except Exception as e:
+                    print(f"  Warning: Partial Q1 target load: {e}")
             if "q2_target_state" in checkpoint:
-                q2_target.load_state_dict(checkpoint["q2_target_state"])
-                print("✓ Loaded BC-SAC pretrained Q2 target")
+                try:
+                    q2_target.load_state_dict(checkpoint["q2_target_state"], strict=strict)
+                    print("✓ Loaded BC-SAC pretrained Q2 target")
+                except Exception as e:
+                    print(f"  Warning: Partial Q2 target load: {e}")
 
-            # Initialize value target from current value
             value_target.load_state_dict(value.state_dict())
         except Exception as e:
             print(f"Warning: Failed to load BC-SAC pretrained model: {e}")
@@ -257,6 +287,38 @@ def train():
         storage=storage,
         batch_size=cfg.batch_size,
     )
+
+    replay_buffer_path = getattr(cfg, "replay_buffer_path", None)
+    if replay_buffer_path and Path(replay_buffer_path).exists():
+        print(f"Loading replay buffer from {replay_buffer_path}...")
+        try:
+            import pickle
+
+            with open(replay_buffer_path, "rb") as f:
+                rb_state = pickle.load(f)
+
+            if "buffer" in rb_state:
+                rb._storage._storage = rb_state["buffer"]
+                print(
+                    f"✓ Loaded {rb_state.get('buffer_size', 'unknown')} transitions from replay buffer"
+                )
+
+            if "sampler_state" in rb_state:
+                sampler_state = rb_state["sampler_state"]
+                if sampler_state.get("alpha") is not None and hasattr(rb._sampler, "_alpha"):
+                    rb._sampler._alpha = sampler_state["alpha"]
+                if sampler_state.get("beta") is not None and hasattr(rb._sampler, "_beta"):
+                    rb._sampler._beta = sampler_state["beta"]
+                print(
+                    f"✓ Restored sampler state (alpha={sampler_state.get('alpha')}, beta={sampler_state.get('beta')})"
+                )
+
+            print(f"Replay buffer loaded from step {rb_state.get('total_steps', 'unknown')}")
+        except Exception as e:
+            print(f"Warning: Failed to load replay buffer: {e}")
+            print("Starting with empty replay buffer")
+    elif replay_buffer_path:
+        print(f"Warning: Replay buffer path specified but file not found: {replay_buffer_path}")
 
     total_steps = 0
     episode_returns = []

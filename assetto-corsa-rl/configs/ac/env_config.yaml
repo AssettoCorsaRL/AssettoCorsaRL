@@ -1,8 +1,10 @@
 environment:
   num_envs: 1 # ac env doesn't support parallel envs
   frames_per_batch: 1024
+  racing_line_path: "racing_lines.json" # path to racing line data file
 
-  # Model inputs configuration - set to true to include in observation vector
+  # model observation inputs
+  # set to true to include in observation vector
   inputs:
     # car dynamics
     speed_kmh: true

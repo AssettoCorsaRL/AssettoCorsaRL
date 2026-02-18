@@ -15,17 +15,14 @@ from assetto_corsa_rl.cli_registry import get_registered_commands
 
 
 def _find_scripts_dir():
-    # 1. dev mode - scripts at repo root
     dev_scripts = Path(__file__).parent.parent.parent / "scripts"
     if dev_scripts.exists():
         return dev_scripts
 
-    # 2. via pip - check sys.prefix/share
     installed_scripts = Path(sys.prefix) / "share" / "assetto_corsa_rl" / "scripts"
     if installed_scripts.exists():
         return installed_scripts
 
-    # 3. check in package directory (if copied during install)
     package_scripts = Path(__file__).parent / "scripts"
     if package_scripts.exists():
         return package_scripts
@@ -49,11 +46,9 @@ def discover_commands():
         )
         return
 
-    # Add scripts directory to path for imports
     if str(_scripts_dir) not in sys.path:
         sys.path.insert(0, str(_scripts_dir))
 
-    # Import all AC scripts
     ac_scripts_dir = _scripts_dir / "ac"
     if ac_scripts_dir.exists():
         for script_file in ac_scripts_dir.glob("*.py"):

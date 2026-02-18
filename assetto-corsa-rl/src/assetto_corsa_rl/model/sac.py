@@ -87,7 +87,6 @@ class SACPolicy:
             def forward(self, x):
                 # x shape: [batch, 2*action_dim]
                 loc, scale_raw = x.chunk(2, dim=-1)
-                # Use sigmoid to bound between [min_scale, max_scale] per dimension
                 scale = self.min_scale + torch.sigmoid(scale_raw) * self.scale_range
                 return {"loc": loc, "scale": scale}
 
@@ -124,8 +123,6 @@ class SACPolicy:
 
         # g = gym.make("CarRacing-v3")
         # print("gym action_bounds:", g.action_space.low, g.action_space.high)
-
-        # NOTE: i hate mysefl this was the issue for the freaking ac thing THIS IS WHY IT DOESN'T TURN!!!!!
 
         # TODO: remove hardcoded bounds and use env specs directly
         low = [-1.0, 0.0, 0.0]  # env.action_spec_unbatched.space.low

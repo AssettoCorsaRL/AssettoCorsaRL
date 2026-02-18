@@ -1,6 +1,6 @@
 """
 Usage:
-    acrl ac test --checkpoint models/bc_sac_pretrained.pt --vae-checkpoint loss=0.1050.ckpt
+    acrl ac test --checkpoint models\sac_checkpoint_501760.pt --vae-checkpoint loss=0.1050.ckpt
 """
 
 import warnings
@@ -148,7 +148,7 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
             obs, reward, done, truncated, info = gym_env.step(action_np)
 
             pixels = torch.from_numpy(obs["image"]).to(device).permute(2, 0, 1).float() / 255.0
-            current_pixels = td["pixels"].squeeze(0)  # Remove batch dim
+            current_pixels = td["pixels"].squeeze(0)
             if current_pixels.shape[0] == 4:
                 new_pixels = torch.cat([current_pixels[1:], pixels], dim=0)
             else:

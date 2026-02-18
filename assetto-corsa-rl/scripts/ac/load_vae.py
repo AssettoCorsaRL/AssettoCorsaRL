@@ -34,7 +34,6 @@ except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
 
 
-# optional AC env
 try:
     from assetto_corsa_rl.ac_env import make_env as make_ac_env  # type: ignore
 except Exception:

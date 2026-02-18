@@ -78,6 +78,7 @@ class Trainer:
 
         self._last_log_steps = 0
         self._last_save_steps = 0
+        self._last_save_rb_steps = 0
 
         self._steps_since_update = 0
         self._update_every = getattr(cfg, "update_every", cfg.num_envs)
@@ -146,6 +147,9 @@ class Trainer:
     # ===== Main loop =====
     def run(self, total_steps=0):
         self.total_steps = total_steps
+        self._pending_updates = 0  # track updates to do during reset
+
+        max_pending = getattr(self.cfg, "max_pending_updates", 10000)
 
         while self.total_steps < self.cfg.total_steps:
             for _ in range(self.cfg.frames_per_batch):
@@ -154,13 +158,27 @@ class Trainer:
                 self._steps_since_update += self.cfg.num_envs
                 if self._steps_since_update >= self._update_every:
                     num_base_updates = max(1, self._steps_since_update // self._update_every)
-                    for _ in range(num_base_updates * self._updates_per_step):
-                        if len(self.rb) >= self.cfg.batch_size:
-                            self._do_update()
+                    self._pending_updates += num_base_updates * self._updates_per_step
                     self._steps_since_update = 0
+
+                #  if too many pending updates, do some now to avoid memory issues
+                if self._pending_updates >= max_pending:
+                    self._do_pending_updates()
 
             self._maybe_log_and_save()
         print("Training finished")
+
+    def _do_pending_updates(self):
+        """Execute all pending updates - called during resets when car isn't being controlled."""
+        if self._pending_updates <= 0 or len(self.rb) < self.cfg.batch_size:
+            return
+
+        updates_to_do = self._pending_updates
+        self._pending_updates = 0
+
+        for _ in range(updates_to_do):
+            if len(self.rb) >= self.cfg.batch_size:
+                self._do_update()
 
     def _step_and_store(self):
         target_batch = self.current_td.batch_size
@@ -280,6 +298,9 @@ class Trainer:
         if "next" in td_next.keys() and "pixels" in td_next["next"].keys():
             self.current_td = td_next["next"]
         if dones.any():
+            # do all pending gradient updates during reset when car isn't being controlled
+            self._do_pending_updates()
+
             try:
                 reset_td = self.env.reset()
                 self.current_td = (
@@ -317,9 +338,6 @@ class Trainer:
         batch_indices = info.get("index", None)
 
         pixels_b = batch["pixels"]
-
-        if self.total_steps % 500 == 0:
-            print(f"[DEBUG] pixels_b from batch shape: {pixels_b.shape}")
 
         # NOTE: Do NOT sample noise during gradient updates
         # Noisy networks should only resample during environment rollout
@@ -511,6 +529,7 @@ class Trainer:
             min_q_new = None
             kl_div = None
             kl_penalty = None
+            new_actions = None
             beta_kl = getattr(self.cfg, "beta_kl", 0.001)
 
         # ===== Soft Update Target Networks =====
@@ -548,8 +567,12 @@ class Trainer:
                 "reward/rewards_per_step_min": rewards_b.min().item(),
                 #
                 "actions/actions_std": actions_b.std().item(),
-                "actions/sampled_action_mean": new_actions.mean().item(),
-                "actions/sampled_action_std": new_actions.std().item(),
+                "actions/sampled_action_mean": (
+                    new_actions.mean().item() if new_actions is not None else 0.0
+                ),
+                "actions/sampled_action_std": (
+                    new_actions.std().item() if new_actions is not None else 0.0
+                ),
                 #
                 "per/td_error_mean": td_errors.mean().item(),
                 "per/td_error_max": td_errors.max().item(),
@@ -635,6 +658,74 @@ class Trainer:
 
             # record last save
             self._last_save_steps = self.total_steps
+
+        # save replay buffer periodically
+        rb_save_interval = getattr(
+            self.cfg, "save_interval_replaybuffer", self.cfg.save_interval * 2
+        )
+        if self.total_steps - getattr(self, "_last_save_rb_steps", 0) >= rb_save_interval:
+            import pickle
+            from pathlib import Path
+            import shutil
+
+            rb_dir = Path("./models")
+            rb_dir.mkdir(parents=True, exist_ok=True)
+            rb_path = rb_dir / f"replay_buffer_{self.total_steps}.pkl"
+
+            try:
+                min_free_space_gb = getattr(self.cfg, "min_free_space_gb", 10)
+                min_free_space_bytes = min_free_space_gb * 1024 * 1024 * 1024
+
+                stat = shutil.disk_usage(rb_dir)
+                available_space = stat.free
+
+                existing_buffers = sorted(rb_dir.glob("replay_buffer_*.pkl"))
+
+                # clean up old replay buffers if needed to maintain free space
+                while existing_buffers and available_space < min_free_space_bytes:
+                    oldest_buffer = existing_buffers.pop(0)
+                    buffer_size = oldest_buffer.stat().st_size
+                    oldest_buffer.unlink()
+                    available_space += buffer_size
+                    print(
+                        f"Deleted old replay buffer: {oldest_buffer.name} (freed {buffer_size / (1024**3):.2f} GB)"
+                    )
+
+                stat = shutil.disk_usage(rb_dir)
+                if stat.free < min_free_space_bytes:
+                    print(
+                        f"Warning: Low disk space ({stat.free / (1024**3):.2f} GB free). Skipping replay buffer save."
+                    )
+                else:
+                    rb_state = {
+                        "buffer": self.rb._storage._storage,
+                        "sampler_state": {
+                            "alpha": (
+                                self.rb._sampler._alpha
+                                if hasattr(self.rb._sampler, "_alpha")
+                                else None
+                            ),
+                            "beta": (
+                                self.rb._sampler._beta
+                                if hasattr(self.rb._sampler, "_beta")
+                                else None
+                            ),
+                        },
+                        "total_steps": self.total_steps,
+                        "buffer_size": len(self.rb),
+                    }
+                    with open(rb_path, "wb") as f:
+                        pickle.dump(rb_state, f)
+
+                    saved_size = rb_path.stat().st_size
+                    remaining_space = shutil.disk_usage(rb_dir).free
+                    print(
+                        f"Saved replay buffer at step {self.total_steps} ({len(self.rb)} transitions, "
+                        f"{saved_size / (1024**3):.2f} GB, {remaining_space / (1024**3):.2f} GB free)"
+                    )
+                    self._last_save_rb_steps = self.total_steps
+            except Exception as e:
+                print(f"Warning: Failed to save replay buffer: {e}")
 
             # * i dont have enough wandb storage to do this sooo
             # TODO: add option in config for ts

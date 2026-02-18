@@ -2,6 +2,9 @@ train:
   total_steps: 10_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
   save_interval: 250_000 # how often (in steps) to save model checkpoints
+  save_interval_replaybuffer: 500_000 # how often (in steps) to save the replay buffer
+
+  min_free_space_gb: 10 # minimum free disk space to maintain (in GB)
 
   seed: 6741
   device: null # null = auto-select (GPU if available, else CPU) use gpu:id or cpu to force

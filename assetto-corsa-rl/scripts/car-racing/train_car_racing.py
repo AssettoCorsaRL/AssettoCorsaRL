@@ -184,12 +184,10 @@ def train():
         try:
             checkpoint = torch.load(pretrained_path, map_location=device)
 
-            # load actor state
             if "actor_state" in checkpoint:
                 actor.load_state_dict(checkpoint["actor_state"])
                 print("Loaded actor state from pretrained model")
 
-            # load critic states
             if "q1_state" in checkpoint:
                 q1.load_state_dict(checkpoint["q1_state"])
                 print("Loaded Q1 state from pretrained model")
@@ -197,7 +195,6 @@ def train():
                 q2.load_state_dict(checkpoint["q2_state"])
                 print("Loaded Q2 state from pretrained model")
 
-            # load value state
             if "value_state" in checkpoint:
                 value.load_state_dict(checkpoint["value_state"])
                 print("Loaded value state from pretrained model")

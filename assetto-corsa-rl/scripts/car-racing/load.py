@@ -358,7 +358,7 @@ def play(
 
                 for frame in frames:
                     if isinstance(frame, np.ndarray):
-                        # Convert RGB to BGR for OpenCV
+                        # convert RGB to BGR for OpenCV
                         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                         out.write(frame_bgr)
 

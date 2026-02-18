@@ -221,7 +221,6 @@ class ConvVAE(pl.LightningModule):
         in_channels: int = 3,
         warmup_steps: int = 500,
         im_shape: Tuple[int, int] = (64, 64),
-        # New architecture parameters
         base_channels: int = 32,
         channel_multipliers: Tuple[int, ...] = (1, 2, 4),
         num_res_blocks: int = 2,
@@ -352,7 +351,6 @@ class ConvVAE(pl.LightningModule):
         target_scaled = target * 2.0 - 1.0
         lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
 
-        # Add MSE loss if weight > 0
         if self.mse_weight > 0:
             mse_loss = F.mse_loss(recon, target, reduction="mean")
             loss = lpips_loss + self.mse_weight * mse_loss
@@ -391,7 +389,7 @@ class ConvVAE(pl.LightningModule):
             self.log("train/lpips", lpips_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log("train/mse", mse_loss, on_step=True, on_epoch=True, sync_dist=True)
 
-        # Log images every 500 steps
+        # log images every 500 steps
         if self.global_step > 0 and self.global_step % 500 == 0:
             self.log_images(target, recon)
 
