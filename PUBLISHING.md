@@ -80,15 +80,7 @@ pip install dist/assetto_corsa_rl-0.1.0-py3-none-any.whl
 
 ## Publishing
 
-### Option 1: Test PyPI (Recommended First)
 
-```bash
-python -m twine upload --repository testpypi dist/*
-
-pip install --index-url https://test.pypi.org/simple/ assetto-corsa-rl
-```
-
-### Option 2: Production PyPI
 
 ```bash
 python -m twine upload dist/*

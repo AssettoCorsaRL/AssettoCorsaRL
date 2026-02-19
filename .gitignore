@@ -25,3 +25,4 @@
 /datasets2
 /clean.ps1
 /loss=0.1050.ckpt
+/test_env

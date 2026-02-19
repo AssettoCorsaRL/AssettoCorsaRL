@@ -487,7 +487,16 @@ def load_vae_encoder(
         Tuple of (encoder_module, output_size) where encoder_module handles
         channel adaptation if needed and output_size is the flattened feature size
     """
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    except FileNotFoundError:
+        warnings.warn(f"VAE checkpoint file not found: '{checkpoint_path}'", RuntimeWarning)
+        raise
+    except Exception as e:
+        warnings.warn(
+            f"Failed to load VAE checkpoint from '{checkpoint_path}': {e}", RuntimeWarning
+        )
+        raise
 
     if isinstance(checkpoint, dict):
         hparams = checkpoint.get("hyper_parameters", {})
@@ -522,10 +531,23 @@ def load_vae_encoder(
             sys.stdout.close()
             sys.stdout = old_stdout
 
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        vae.load_state_dict(checkpoint["state_dict"])
-    else:
-        vae.load_state_dict(checkpoint)
+    try:
+        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+            vae.load_state_dict(checkpoint["state_dict"])
+        else:
+            vae.load_state_dict(checkpoint)
+    except RuntimeError as e:
+        print(
+            f"Failed to load VAE model parameters from '{checkpoint_path}' — "
+            f"architecture mismatch or corrupted weights: {e}",
+            RuntimeWarning,
+        )
+        raise
+    except Exception as e:
+        print(
+            f"Unexpected error loading VAE state dict from '{checkpoint_path}': {e}", RuntimeWarning
+        )
+        raise
 
     vae = vae.to(device)
 

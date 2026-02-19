@@ -1,7 +1,7 @@
 """Visualize saved frame-stack datasets (.npz) from Assetto Corsa.
 
 Usage:
-    acrl ac vis-dataset --input-dir datasets/demonstrations2
+    acrl ac vis-dataset --input-dir datasets/demonstrations
 
 Controls (when window active):
  - n : next sample
@@ -171,40 +171,19 @@ def make_action_img(action: np.ndarray | None, size=(200, 300)) -> np.ndarray:
         return canvas
 
     labels = ["steer", "gas", "brake"]
-    colors = [(200, 200, 0), (0, 200, 0), (0, 0, 200)]
-
-    bar_w = w - 40
-    y = 20
+    y = 40
     for i, lbl in enumerate(labels):
         val = float(action[i]) if i < len(action) else 0.0
-        # steer is in [-1,1], map to center line
-        if lbl == "steer":
-            cx = 20 + bar_w // 2
-            half = bar_w // 2
-            fill = int((val + 1.0) / 2.0 * half)
-            # background bar
-            cv2.rectangle(canvas, (20, y), (20 + bar_w, y + 24), (50, 50, 50), -1)
-            # center line
-            cv2.line(canvas, (cx, y), (cx, y + 24), (100, 100, 100), 1)
-            if val >= 0:
-                cv2.rectangle(canvas, (cx, y), (cx + fill, y + 24), colors[i], -1)
-            else:
-                cv2.rectangle(canvas, (cx + fill, y), (cx, y + 24), colors[i], -1)
-        else:
-            # gas/brake in [0,1]
-            fill = int(max(0.0, min(1.0, val)) * bar_w)
-            cv2.rectangle(canvas, (20, y), (20 + bar_w, y + 24), (50, 50, 50), -1)
-            cv2.rectangle(canvas, (20, y), (20 + fill, y + 24), colors[i], -1)
         cv2.putText(
             canvas,
             f"{lbl}: {val:.2f}",
-            (24 + bar_w + 4, y + 18),
+            (20, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.8,
             (200, 200, 200),
-            1,
+            2,
         )
-        y += 34
+        y += 40
 
     return canvas
 

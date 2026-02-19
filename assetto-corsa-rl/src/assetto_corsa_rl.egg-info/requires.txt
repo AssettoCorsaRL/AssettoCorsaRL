@@ -10,6 +10,11 @@ click>=8.1.0
 PyYAML>=6.0
 lightning>=2.0.0
 wandb>=0.15.0
+vgamepad>=0.1.0
+mss>=10.0.0
+pywin32>=223
+lpips>=0.1.4
+torchinfo>=1.8.0
 
 [dev]
 pytest>=7.4.0

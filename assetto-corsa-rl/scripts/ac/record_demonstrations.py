@@ -4,7 +4,7 @@ This script records image observations and user inputs (steering, throttle, brak
 from Assetto Corsa to create a dataset for pretraining the SAC actor.
 
 Usage:
-    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations2 --duration 999999999999 --display --display-scale 5.0
+    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations --duration 999999999999 --display --display-scale 5.0 --reset-interval 15
 
 Controls:
     - Press Ctrl+C to stop recording early
@@ -18,8 +18,8 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
-import json
+from typing import Optional, Dict, Any, Tuple
+import threading
 
 import numpy as np
 import cv2
@@ -76,6 +76,14 @@ class DemonstrationRecorder:
 
         self.telemetry: Optional[Telemetry] = None
 
+        # Prefetcher (background reader) state
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop: threading.Event = threading.Event()
+        self._latest_lock: threading.Lock = threading.Lock()
+        self._latest_data: Optional[Dict[str, Any]] = None
+        self._latest_processed_img: Optional[np.ndarray] = None
+        self._reader_fetches: int = 0
+
         from assetto_corsa_rl.ac_env import AssettoCorsa
 
         self._env_helper = AssettoCorsa.__new__(AssettoCorsa)
@@ -95,8 +103,59 @@ class DemonstrationRecorder:
         except Exception as e:
             print(f"Warning: Could not load racing line: {e}")
 
+    def _reader_loop(self):
+        """Background loop: poll telemetry, preprocess image, store latest sample."""
+        while not self._reader_stop.is_set():
+            if self.telemetry is None:
+                time.sleep(0.01)
+                continue
+            try:
+                data = self.telemetry.get_latest()
+                img = self.telemetry.get_latest_image()
+                processed = None
+                if img is not None:
+                    # preprocess in background (resize + grayscale) to offload main loop
+                    processed = self._preprocess_image(img)
+                with self._latest_lock:
+                    self._latest_data = data
+                    # store processed image copy (or None)
+                    self._latest_processed_img = processed.copy() if processed is not None else None
+                    self._reader_fetches += 1
+            except Exception:
+                # keep reader alive on transient erros
+                time.sleep(0.005)
+                continue
+            time.sleep(0.001)
+
+    def _start_reader(self):
+        if self._reader_thread and self._reader_thread.is_alive():
+            return
+        self._reader_stop.clear()
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _stop_reader(self):
+        self._reader_stop.set()
+        if self._reader_thread:
+            self._reader_thread.join(timeout=1.0)
+            self._reader_thread = None
+
+    def get_latest_prefetched(
+        self,
+    ) -> Optional[Tuple[Optional[Dict[str, Any]], Optional[np.ndarray]]]:
+        """Return and clear the latest prefetched (data, processed_img)."""
+        with self._latest_lock:
+            if self._latest_data is None and self._latest_processed_img is None:
+                return None
+            data = self._latest_data
+            img = None if self._latest_processed_img is None else self._latest_processed_img.copy()
+            # clear so next call gets a fresh sample
+            self._latest_data = None
+            self._latest_processed_img = None
+            return data, img
+
     def start(self):
-        """Initialize telemetry connection."""
+        """Initialize telemetry connection and start prefetcher."""
         self.telemetry = Telemetry(
             host="127.0.0.1",
             send_port=9877,
@@ -104,13 +163,19 @@ class DemonstrationRecorder:
             timeout=0.1,
             auto_start_receiver=True,
             capture_images=True,
-            image_capture_rate=0.02,  # 50 FPS capture
         )
         self.session_start = datetime.now()
+        # start background reader that prefetches + preprocesses frames
+        self._start_reader()
         print(f"✓ Telemetry started, recording to {self.output_dir}")
 
     def stop(self):
         """Stop recording and cleanup."""
+        # stop reader first to avoid it touching telemetry during/after close
+        try:
+            self._stop_reader()
+        except Exception:
+            pass
         if self.telemetry:
             self.telemetry.close()
             self.telemetry = None
@@ -230,20 +295,40 @@ class DemonstrationRecorder:
 
         return True
 
-    def record_frame(self, return_frame: bool = False):
-        """Record a single frame. Optionally returns (success, stacked_frame, action)."""
-        if self.telemetry is None:
+    def record_frame(
+        self,
+        return_frame: bool = False,
+        data: Optional[Dict[str, Any]] = None,
+        processed_img: Optional[np.ndarray] = None,
+    ):
+        """Record a single frame. Optionally returns (success, stacked_frame, action).
+
+        If (data, processed_img) are provided they are used directly (prefetched path).
+        Otherwise falls back to polling self.telemetry (original behavior).
+        """
+        # if caller provided prefetched data we can skip telemetry checks
+        if data is None and processed_img is None and self.telemetry is None:
             return (False, None, None) if return_frame else False
 
-        data = self.telemetry.get_latest()
-        if not self._should_record(data):
-            return (False, None, None) if return_frame else False
+        # --- obtain data + processed image ---
+        if data is None and processed_img is None:
+            data = self.telemetry.get_latest()
+            if not self._should_record(data):
+                return (False, None, None) if return_frame else False
 
-        img = self.telemetry.get_latest_image()
-        if img is None:
-            return (False, None, None) if return_frame else False
+            img = self.telemetry.get_latest_image()
+            if img is None:
+                return (False, None, None) if return_frame else False
 
-        processed = self._preprocess_image(img)
+            processed = self._preprocess_image(img)
+        else:
+            # prefetched path: require both data + processed_img present
+            if data is None or processed_img is None:
+                return (False, None, None) if return_frame else False
+            if not self._should_record(data):
+                return (False, None, None) if return_frame else False
+            processed = processed_img
+
         stacked = self._get_stacked_frames(processed)
 
         # avoids saving samples that contain padding frames at start or
@@ -407,11 +492,17 @@ def parse_args():
 @cli_option("--frame-stack", default=4, help="Number of frames to stack")
 @cli_option("--save-interval", default=500, help="Save batch every N frames")
 @cli_option("--min-speed", default=5.0, type=float, help="Minimum speed (mph) to record")
-@cli_option("--target-fps", default=20.0, type=float, help="Target recording FPS")
+@cli_option("--target-fps", default=30.0, type=float, help="Target recording FPS")
 @cli_option("--display", is_flag=True, help="Show live frames and input values in a window")
 @cli_option("--display-scale", default=2.0, type=float, help="Scale factor for display window")
 @cli_option(
     "--config-path", default=None, help="Path to env config YAML (loads input configuration)"
+)
+@cli_option(
+    "--reset-interval",
+    default=-1,
+    type=float,
+    help="Reset the environment every N seconds (-1 to disable)",
 )
 @cli_option(
     "--racing-line-path",
@@ -430,6 +521,7 @@ def main(
     display_scale,
     config_path,
     racing_line_path,
+    reset_interval,
 ):
     try:
         parsed_image_shape = parse_image_shape(image_shape)
@@ -478,14 +570,21 @@ def main(
         print(f"Duration: {duration} seconds")
     else:
         print("Duration: Until Ctrl+C")
+    if reset_interval > 0:
+        print(f"Reset interval: {reset_interval}s")
+    else:
+        print("Reset interval: disabled")
     print("=" * 50)
 
     input("\nPress Enter when Assetto Corsa is running and you're ready to record...")
 
+    # start recorder (reader thread starts inside)
     recorder.start()
+
     frame_interval = 1.0 / target_fps
     start_time = time.time()
     last_frame_time = start_time
+    last_interval_reset_time = start_time
 
     window_name = "AC Demo Recorder" if display else None
     if display and window_name:
@@ -501,7 +600,7 @@ def main(
                 print("\nDuration reached, stopping...")
                 break
 
-            # raet limiting
+            # rate limiting
             elapsed = current_time - last_frame_time
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
@@ -528,8 +627,23 @@ def main(
                         print("\nCleared unsaved batch")
                 continue
 
-            # record frame
-            result = recorder.record_frame(return_frame=display)
+            # periodic environment reset
+            if reset_interval > 0 and (current_time - last_interval_reset_time) >= reset_interval:
+                print(f"\nPeriodic reset triggered (every {reset_interval}s)")
+                recorder._handle_lap_reset()
+                last_interval_reset_time = current_time
+                continue
+
+            # Prefer prefetched sample (non-blocking). fall back to original telemetry poll.
+            prefetched = recorder.get_latest_prefetched()
+            if prefetched is not None:
+                data, processed_img = prefetched
+                result = recorder.record_frame(
+                    return_frame=display, data=data, processed_img=processed_img
+                )
+            else:
+                result = recorder.record_frame(return_frame=display)
+
             if display:
                 success, stacked_frame, action = (
                     result if isinstance(result, tuple) else (False, None, None)
@@ -559,7 +673,6 @@ def main(
                 rect_x1, rect_y1 = 8, 8
                 rect_x2, rect_y2 = rect_x1 + text_w + pad, rect_y1 + text_h + pad
 
-                # draw semi-opaque background for readability
                 cv2.rectangle(vis, (rect_x1, rect_y1), (rect_x2, rect_y2), (0, 0, 0), cv2.FILLED)
 
                 text_org = (rect_x1 + pad // 2, rect_y1 + text_h + pad // 2 - baseline)
