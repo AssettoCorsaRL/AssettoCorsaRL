@@ -6,7 +6,7 @@ BC-SAC from "Imitation Is Not Enough: Robustifying Imitation with Reinforcement 
 - Critic objective: Standard SAC Bellman error
 
 Usage:
-acrl ac train-bc --data-dir datasets/demonstrations2 --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1050.ckpt --bc-weight 1.0 --dropout 0.3 --augment
+acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1050.ckpt --bc-weight 1.0 --dropout 0.3 --augment
 """
 
 from __future__ import annotations

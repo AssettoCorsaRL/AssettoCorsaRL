@@ -707,9 +707,9 @@ def create_mock_env(device: Optional[torch.device] = None):
         Mock environment object with action_spec and observation_spec
     """
     from torchrl.data import (
-        BoundedTensorSpec,
-        CompositeSpec,
-        UnboundedContinuousTensorSpec,
+        Bounded,  # replaces BoundedTensorSpec
+        Composite,  # still valid in 0.11, but will move to Composite later
+        UnboundedContinuous,
     )
 
     if device is None:
@@ -718,13 +718,11 @@ def create_mock_env(device: Optional[torch.device] = None):
     class MockEnv:
         def __init__(self, device):
             self.device = device
-            self.action_spec = BoundedTensorSpec(
+            self.action_spec = Bounded(
                 low=-1.0, high=1.0, shape=(3,), dtype=torch.float32, device=device
             )
-            self.observation_spec = CompositeSpec(
-                pixels=UnboundedContinuousTensorSpec(
-                    shape=(4, 84, 84), dtype=torch.float32, device=device
-                )
+            self.observation_spec = Composite(
+                pixels=UnboundedContinuous(shape=(4, 84, 84), dtype=torch.float32, device=device)
             )
 
     return MockEnv(device)
