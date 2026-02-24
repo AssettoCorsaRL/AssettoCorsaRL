@@ -75,6 +75,52 @@ class Telemetry:
     def send_reset(self) -> None:
         self.send_command({"reset": True})
 
+    def send_ctrl_c(self) -> bool:
+        """Send Ctrl+C to the Assetto Corsa window.
+
+        Finds the AC window handle (reusing the cached one if available),
+        focuses it, then sends WM_KEYDOWN/WM_KEYUP messages for Ctrl+C.
+
+        Returns:
+            True if the keypress was sent successfully, False otherwise.
+        """
+        import pydirectinput
+        import win32process
+        import win32api
+        import win32con
+
+        try:
+            if self._ac_window_handle is None or not win32gui.IsWindow(self._ac_window_handle):
+                self._ac_window_handle = self._find_ac_window()
+
+            if self._ac_window_handle is None:
+                print("Warning: Could not find Assetto Corsa window to send Ctrl+C.")
+                return False
+
+            win32process.AttachThreadInput(
+                win32api.GetCurrentThreadId(),
+                win32process.GetWindowThreadProcessId(self._ac_window_handle)[0],
+                True,
+            )
+            hwnd = self._ac_window_handle
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.BringWindowToTop(hwnd)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+            pydirectinput.keyDown("ctrl")
+            pydirectinput.press("c")
+            pydirectinput.keyUp("ctrl")
+
+            return True
+
+        except Exception as e:
+            print(f"Warning: Failed to send Ctrl+C to Assetto Corsa: {e}")
+            return False
+
     def receive_once(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
         if timeout is not None:
             old_timeout = self.recv_socket.gettimeout()
@@ -232,9 +278,11 @@ class Telemetry:
             self._image_thread.join(timeout=2.0)
             self._image_thread = None
 
-        if self._sct:
-            self._sct.close()
-            self._sct = None
+        self._sct = None
+
+        # if self._sct:
+        #     self._sct.close()
+        #     self._sct = None
 
     def get_latest_image(self) -> Optional[np.ndarray]:
         """Get latest captured image.

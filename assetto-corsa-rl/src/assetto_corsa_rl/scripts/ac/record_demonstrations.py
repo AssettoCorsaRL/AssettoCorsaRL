@@ -4,7 +4,7 @@ This script records image observations and user inputs (steering, throttle, brak
 from Assetto Corsa to create a dataset for pretraining the SAC actor.
 
 Usage:
-    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations --duration 999999999999 --display --display-scale 5.0 --reset-interval 15
+    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations4 --duration 999999999999 --display --display-scale 5.0 --reset-interval -1
 
 Controls:
     - Press Ctrl+C to stop recording early
@@ -45,7 +45,7 @@ class DemonstrationRecorder:
         self,
         output_dir: Path,
         image_shape: tuple = (84, 84),
-        frame_stack: int = 4,
+        frame_stack: int = 3,
         save_interval: int = 100,
         min_speed_mph: float = 5.0,
         input_config: Optional[Dict[str, bool]] = None,
@@ -96,6 +96,7 @@ class DemonstrationRecorder:
             self._env_helper.ms_per_action = 20.0
             self._env_helper._meters_advanced = 0.0
             self._env_helper._last_speed = 0.0
+            self._env_helper._last_centerline_idx = 0
             self._env_helper._current_racing_line_index = 0
             self._last_reset_time = 0.0
             self._reset_cooldown_seconds = 2.0
@@ -164,6 +165,13 @@ class DemonstrationRecorder:
             auto_start_receiver=True,
             capture_images=True,
         )
+        # TODO: add this cntrl c behavior into the telemetry, with the ai_racer argument
+        try:
+            if not self.telemetry.send_ctrl_c():
+                print("Warning: send_ctrl_c did not succeed at start")
+        except Exception as e:
+            print(f"Warning: exception sending ctrl+c at start: {e}")
+
         self.session_start = datetime.now()
         # start background reader that prefetches + preprocesses frames
         self._start_reader()
@@ -197,13 +205,24 @@ class DemonstrationRecorder:
         try:
             self._env_helper._meters_advanced = 0.0
             self._env_helper._last_speed = 0.0
+            self._env_helper._last_centerline_idx = 0
             self._env_helper._current_racing_line_index = 0
         except Exception:
             pass
 
         try:
             if self.telemetry:
+                # reset the sim and also make sure we take back control from the
+                # AC AI by sending a Ctrl+C keystroke (same behaviour as
+                # AssettoCorsa.reset()).  The user reported recently that
+                # during recording the game window would not respond to Ctrl+C
+                # which prevented regaining control after a lap reset.
                 self.telemetry.send_reset()
+                try:
+                    if not self.telemetry.send_ctrl_c():
+                        print("Warning: send_ctrl_c did not succeed during lap reset")
+                except Exception as e:
+                    print(f"Warning: exception sending ctrl+c during lap reset: {e}")
                 try:
                     self.telemetry.clear_queue()
                 except Exception:
@@ -306,11 +325,9 @@ class DemonstrationRecorder:
         If (data, processed_img) are provided they are used directly (prefetched path).
         Otherwise falls back to polling self.telemetry (original behavior).
         """
-        # if caller provided prefetched data we can skip telemetry checks
         if data is None and processed_img is None and self.telemetry is None:
             return (False, None, None) if return_frame else False
 
-        # --- obtain data + processed image ---
         if data is None and processed_img is None:
             data = self.telemetry.get_latest()
             if not self._should_record(data):
@@ -322,7 +339,6 @@ class DemonstrationRecorder:
 
             processed = self._preprocess_image(img)
         else:
-            # prefetched path: require both data + processed_img present
             if data is None or processed_img is None:
                 return (False, None, None) if return_frame else False
             if not self._should_record(data):
@@ -358,7 +374,6 @@ class DemonstrationRecorder:
                     self._handle_lap_reset()
                     return (False, None, None) if return_frame else False
                 else:
-                    # recently reset; skip recording this frame
                     return (False, None, None) if return_frame else False
         except Exception:
             pass
@@ -457,7 +472,7 @@ def parse_args():
     parser.add_argument(
         "--frame-stack",
         type=int,
-        default=4,
+        default=3,
         help="Number of frames to stack",
     )
     parser.add_argument(
@@ -489,9 +504,9 @@ def parse_args():
 @cli_option("--output-dir", default="datasets/demonstrations", help="Output directory")
 @cli_option("--duration", default=0, help="Recording duration in seconds (0 = until Ctrl+C)")
 @cli_option("--image-shape", default="84x84", help="Image shape HxW")
-@cli_option("--frame-stack", default=4, help="Number of frames to stack")
+@cli_option("--frame-stack", default=3, help="Number of frames to stack")
 @cli_option("--save-interval", default=500, help="Save batch every N frames")
-@cli_option("--min-speed", default=5.0, type=float, help="Minimum speed (mph) to record")
+@cli_option("--min-speed", default=12.5, type=float, help="Minimum speed (mph) to record")
 @cli_option("--target-fps", default=30.0, type=float, help="Target recording FPS")
 @cli_option("--display", is_flag=True, help="Show live frames and input values in a window")
 @cli_option("--display-scale", default=2.0, type=float, help="Scale factor for display window")
@@ -634,7 +649,6 @@ def main(
                 last_interval_reset_time = current_time
                 continue
 
-            # Prefer prefetched sample (non-blocking). fall back to original telemetry poll.
             prefetched = recorder.get_latest_prefetched()
             if prefetched is not None:
                 data, processed_img = prefetched
@@ -661,7 +675,8 @@ def main(
                     new_h = max(1, int(h * display_scale))
                     vis = cv2.resize(vis, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-                text = f"{action[0]:.2f} {action[1]:.2f} {action[2]:.2f}"
+                reward_val = recorder.metadata[-1]["reward"] if recorder.metadata else 0.0
+                text = f"{reward_val:.3f}"
                 base_font = 0.5
                 font_scale = base_font * max(1.0, display_scale)
                 thickness = max(1, int(round(font_scale * 2)))

@@ -139,8 +139,26 @@ def build_cli():
                 short_help=cmd_def.get("short_help"),
             )(cmd_func)
 
+            # register options after wrapping the command (order doesn't matter for functionality)
             for opt in reversed(options):
                 cmd_func = click.option(*opt.param_decls, **opt.attrs)(cmd_func)
+
+            # allow calling the command with underscores as an alias when the
+            # registered name contains hyphens.  click itself treats names
+            # literally, so without an alias users typing record_racing_line
+            # would get "No such command" errors.  This helper makes the CLI
+            # more forgiving and matches the default name conversion behavior
+            # used by ``cli_command`` (which replaces underscores with
+            # hyphens when inferring a name).
+            alias_name = cmd_def["name"].replace("-", "_")
+            if alias_name != cmd_def["name"]:
+                try:
+                    # ``add_command`` will not override an existing entry if
+                    # there happens to already be a command with the alias;
+                    # in that case we simply ignore the alias (should be rare).
+                    current_group.add_command(cmd_func, name=alias_name)
+                except Exception:
+                    pass
 
 
 def main():

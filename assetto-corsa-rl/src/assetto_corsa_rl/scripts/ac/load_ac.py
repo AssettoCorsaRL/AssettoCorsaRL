@@ -1,6 +1,6 @@
 """
 Usage:
-    acrl ac test --checkpoint models\sac_checkpoint_501760.pt --vae-checkpoint loss=0.1050.ckpt
+    acrl ac test --checkpoint models\bc_sac_pretrained --vae-checkpoint loss=0.1050.ckpt
 """
 
 import warnings
@@ -21,6 +21,7 @@ from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 import click
 import numpy as np
+from torchrl.envs.utils import step_mdp
 
 repo_root = Path(__file__).resolve().parents[2]
 src_path = str(repo_root / "src")
@@ -85,7 +86,7 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
         racing_line_path="racing_lines.json",
         device=device,
         image_shape=(84, 84),
-        frame_stack=4,
+        frame_stack=3,
     )
 
     print("\nInitializing policy...")
@@ -117,14 +118,10 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
     td = env.reset()
 
     input("Press Enter when in position...")
-
     for episode in range(episodes):
-        print(f"\n{'='*60}")
-        print(f"Episode {episode + 1}/{episodes}")
-        print(f"{'='*60}")
+        print(f"\n{'='*60}\nEpisode {episode + 1}/{episodes}\n{'='*60}")
 
-        if episode > 0:
-            td = env.reset()
+        td = env.reset()
 
         episode_reward = 0.0
         steps = 0
@@ -133,42 +130,29 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
         while not done and steps < max_steps:
             with torch.no_grad():
                 if td.batch_size == torch.Size([]):
-                    td = td.unsqueeze(0)
+                    curr_td = td.unsqueeze(0)
+                else:
+                    curr_td = td
 
-                actor_out = actor(td)
-                action_batched = actor_out["loc"]  # mean action (deterministic)
+                actor_out = actor(curr_td)
+                action = actor_out["loc"]
 
-                action_unbatched = (
-                    action_batched.squeeze(0) if action_batched.shape[0] == 1 else action_batched
-                )
+            td.set("action", action)
+            td = env.step(td)
 
-            action_np = action_unbatched.cpu().numpy()
-
-            gym_env = env.base_env._env
-            obs, reward, done, truncated, info = gym_env.step(action_np)
-
-            pixels = torch.from_numpy(obs["image"]).to(device).permute(2, 0, 1).float() / 255.0
-            current_pixels = td["pixels"].squeeze(0)
-            if current_pixels.shape[0] == 4:
-                new_pixels = torch.cat([current_pixels[1:], pixels], dim=0)
-            else:
-                new_pixels = pixels
-
-            td["pixels"] = new_pixels.unsqueeze(0)
-
+            reward = td.get(("next", "reward")).item()
+            done = td.get(("next", "done")).any().item()
             episode_reward += reward
             steps += 1
 
+            td = step_mdp(td)
+
             if steps % 100 == 0:
-                print(f"  Step {steps}: reward={episode_reward:.2f} action={action_np}")
+                print(f"  Step {steps}: reward={episode_reward:.2f} action={action}")
 
         episode_rewards.append(episode_reward)
         episode_lengths.append(steps)
-
-        print(f"\nEpisode {episode + 1} finished:")
-        print(f"  Total reward: {episode_reward:.2f}")
-        print(f"  Steps: {steps}")
-
+        print(f"\nEpisode {episode + 1} finished: Reward: {episode_reward:.2f}, Steps: {steps}")
     print(f"\n{'='*60}")
     print("Evaluation Summary")
     print(f"{'='*60}")

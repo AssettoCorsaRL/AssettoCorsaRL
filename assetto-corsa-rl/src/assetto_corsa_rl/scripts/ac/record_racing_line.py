@@ -5,7 +5,7 @@ to a file when each lap completes. The script waits for a new lap to start
 before beginning recording.
 
 Usage:
-    acrl ac record-racing-line --output racing_lines.json --track monza
+    acrl ac record-racing-line --output racing_lines_brazil.json --track brazil
 """
 
 import sys
@@ -269,4 +269,11 @@ def main(output, track, laps, sample_rate, host, port):
 
 
 if __name__ == "__main__":
-    main()
+    main(
+        output="racing_lines_brazil.json",
+        track="Brazil",
+        laps=2,
+        sample_rate=0.05,
+        host="127.0.0.1",
+        port=9876,
+    )

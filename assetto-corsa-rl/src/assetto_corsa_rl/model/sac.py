@@ -51,7 +51,14 @@ class SACPolicy:
 
         action_dim = int(env.action_spec.shape[-1])
 
-        in_channels = 4
+        # if "pixels" in env.observation_spec.keys():
+        #     in_channels = env.observation_spec["pixels"].shape[-3]
+        #     print(f"Found: in_channels. Current Value: {in_channels}")
+        # else:
+        #     print(f"Couldn't Find: in_channels. Defaulting to 3.")
+        #     in_channels = 3
+
+        in_channels = 3
 
         if vae_checkpoint_path:
             from .vae import load_vae_encoder

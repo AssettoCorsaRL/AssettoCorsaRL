@@ -94,7 +94,7 @@ def load_vae_model(checkpoint_path: str, z_dim: int, in_channels: int, device: t
 def run_visualization(
     model_path: str,
     z_dim: int = 32,
-    frames: int = 4,
+    frames: int = 3,
     device: str = None,
     max_steps: int = 10000,
 ):

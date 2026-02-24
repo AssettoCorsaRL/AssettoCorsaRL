@@ -46,6 +46,12 @@ See `scripts/ac/example_command.py` for a complete example.
 
 ### `@cli_command(group, name=None, help=None, short_help=None)`
 
+The command name is used verbatim when the CLI is built.  Hyphens are
+preferred (they look nicer and match click's conventions), but the
+registration code automatically adds an *underscore* alias when a
+hyphenated name is used.  This means ``acrl ac record-racing-line`` and
+``acrl ac record_racing_line`` are both valid.
+
 Registers a function as a CLI command.
 
 - `group`: Command group ("ac" or "car-racing")

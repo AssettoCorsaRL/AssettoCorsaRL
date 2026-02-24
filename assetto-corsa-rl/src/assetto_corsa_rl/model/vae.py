@@ -469,7 +469,7 @@ class VAEEncoder(nn.Module):
 def load_vae_encoder(
     checkpoint_path: str,
     device,
-    in_channels: int = 4,
+    in_channels: int = 3,
     trainable: bool = True,
     verbose: bool = True,
     im_size: Tuple[int, int] = (84, 84),
@@ -493,9 +493,7 @@ def load_vae_encoder(
         warnings.warn(f"VAE checkpoint file not found: '{checkpoint_path}'", RuntimeWarning)
         raise
     except Exception as e:
-        warnings.warn(
-            f"Failed to load VAE checkpoint from '{checkpoint_path}': {e}", RuntimeWarning
-        )
+        print(f"Failed to load VAE checkpoint from '{checkpoint_path}': {e}", RuntimeWarning)
         raise
 
     if isinstance(checkpoint, dict):

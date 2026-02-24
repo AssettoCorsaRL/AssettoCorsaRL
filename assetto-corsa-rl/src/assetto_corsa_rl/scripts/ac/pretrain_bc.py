@@ -6,7 +6,7 @@ BC-SAC from "Imitation Is Not Enough: Robustifying Imitation with Reinforcement 
 - Critic objective: Standard SAC Bellman error
 
 Usage:
-acrl ac train-bc --data-dir datasets/demonstrations --epochs 250 --batch-size 64 --vae-checkpoint loss=0.1050.ckpt --bc-weight 1.0 --dropout 0.3 --augment
+acrl ac train-bc --data-dir datasets/demonstrations4 --epochs 250 --batch-size 128 --vae-checkpoint loss=0.1050.ckpt --bc-weight 1.0 --dropout 0.3 --augment
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ class DemonstrationDataset(Dataset):
         self,
         data_dir: Path,
         image_shape: Tuple[int, int] = (84, 84),
-        frame_stack: int = 4,
+        frame_stack: int = 3,
         augment: bool = True,
     ):
         self.data_dir = Path(data_dir)
@@ -149,9 +149,22 @@ class DemonstrationDataset(Dataset):
         print(f"    Right turns: {right_turns} ({100*right_turns/len(steering):.1f}%)")
         print(f"    Straight: {straight} ({100*straight/len(steering):.1f}%)")
 
-        # build valid indices for consecutive frame pairs (s, a, s')
-        # exclude last frame of each batch to avoid cross-batch transitions
-        self.valid_indices = list(range(len(self.frames) - 1))
+        self.valid_indices = []
+
+        current_pos = 0
+        for batch_file in self.batch_files:
+            try:
+                data = np.load(batch_file)
+                batch_len = len(data["frames"])
+
+                indices = list(range(current_pos, current_pos + batch_len - 1))
+                self.valid_indices.extend(indices)
+
+                current_pos += batch_len
+            except Exception:
+                continue
+
+        print(f"Created {len(self.valid_indices)} valid transitions for training.")
 
     def __len__(self):
         return len(self.valid_indices)
@@ -164,7 +177,6 @@ class DemonstrationDataset(Dataset):
         actual_idx = self.valid_indices[idx]
         next_idx = actual_idx + 1
 
-        # (N, H, W) uint8 -> (N, H, W) float32 [0, 1]
         frames = self.frames[actual_idx].astype(np.float32) / 255.0
         next_frames = self.frames[next_idx].astype(np.float32) / 255.0
         actions = self.actions[actual_idx].astype(np.float32).copy()
@@ -172,45 +184,44 @@ class DemonstrationDataset(Dataset):
         frames_tensor = torch.from_numpy(frames)
         next_frames_tensor = torch.from_numpy(next_frames)
 
-        # apply color augmentation to each frame individually (before stacking)
         if self.augment and self.transform is not None:
+            state = torch.get_rng_state()
+
             augmented_frames = []
             for i in range(frames_tensor.shape[0]):
-                frame = frames_tensor[i : i + 1]  # (1, H, W)
-                frame = self.transform(frame)
+                torch.set_rng_state(state)
+                frame = self.transform(frames_tensor[i : i + 1])
                 augmented_frames.append(frame)
-            frames_tensor = torch.cat(augmented_frames, dim=0)  # (frame_stack, H, W)
+            frames_tensor = torch.cat(augmented_frames, dim=0)
 
             augmented_next_frames = []
             for i in range(next_frames_tensor.shape[0]):
-                frame = next_frames_tensor[i : i + 1]  # (1, H, W)
-                frame = self.transform(frame)
+                torch.set_rng_state(state)
+                frame = self.transform(next_frames_tensor[i : i + 1])
                 augmented_next_frames.append(frame)
             next_frames_tensor = torch.cat(augmented_next_frames, dim=0)
 
-        # horizontal flip (50% chance) to balance left/right turns
-        #! HIGHLY EXPIREMENTAL
+        # flip horizontally
         if self.augment and np.random.rand() < 0.5:
-            frames_tensor = torch.flip(frames_tensor, dims=[-1])  # flip width
+            frames_tensor = torch.flip(frames_tensor, dims=[-1])
             next_frames_tensor = torch.flip(next_frames_tensor, dims=[-1])
             actions[0] = -actions[0]  # invert steering
 
-        result = {
+        obs = self.observations[actual_idx].astype(np.float32)
+        normalized_obs = (obs - self.obs_min.flatten()) / self.obs_range.flatten()
+
+        is_done = 0.0
+        if next_idx >= len(self.frames) - 1:
+            is_done = 1.0
+
+        return {
             "frames": frames_tensor,
             "next_frames": next_frames_tensor,
             "actions": torch.from_numpy(actions),
-            "rewards": torch.tensor(self.rewards[actual_idx].astype(np.float32)).reshape(1),
+            "observations": torch.from_numpy(normalized_obs),
+            "rewards": torch.tensor([self.rewards[actual_idx]], dtype=torch.float32),
+            "dones": torch.tensor([is_done], dtype=torch.float32),
         }
-
-        # norm observations
-        obs = self.observations[actual_idx].astype(np.float32)
-        normalized_obs = np.zeros_like(obs)
-        for i, key in enumerate(self.observation_keys):
-            min_val, range_val = self.obs_normalizations_values[key]
-            normalized_obs[i] = (obs[i] - min_val) / range_val
-        result["observations"] = torch.from_numpy(normalized_obs)
-
-        return result
 
 
 class BCSACTrainer:
@@ -233,7 +244,9 @@ class BCSACTrainer:
         bc_weight: float = 1.0,
         gamma: float = 0.92,
         tau: float = 0.005,
-        alpha: float = 0.2,
+        alpha: float = 0.05,
+        learnable_alpha: bool = False,
+        target_entropy: int = -3,
         weight_decay: float = 1e-5,
     ):
         self.actor = actor
@@ -245,7 +258,15 @@ class BCSACTrainer:
         self.bc_weight = bc_weight
         self.gamma = gamma
         self.tau = tau
-        self.alpha = alpha
+
+        if learnable_alpha:
+            self.log_alpha = torch.tensor(np.log(alpha), requires_grad=True, device=device)
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=actor_lr)
+
+            self.target_entropy = target_entropy
+        else:
+            self.alpha = alpha
+        self.learnable_alpha = learnable_alpha
 
         self.actor_optimizer = torch.optim.AdamW(
             actor.parameters(),
@@ -273,6 +294,12 @@ class BCSACTrainer:
 
         self._update_target_network(tau=1.0)
 
+    @property
+    def alpha_val(self):
+        if self.learnable_alpha:
+            return self.log_alpha.exp()
+        return torch.tensor(self.alpha)
+
     def _update_target_network(self, tau: Optional[float] = None):
         """Soft update of target network parameters."""
         if tau is None:
@@ -286,7 +313,7 @@ class BCSACTrainer:
                 target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
     def train_epoch(self, dataloader: DataLoader, epoch: int) -> dict:
-        """Train for one epoch with BC-SAC."""
+        """Train for one epoch with BC-SAC and Learnable Alpha."""
         self.actor.train()
         self.q1.train()
         self.q2.train()
@@ -295,6 +322,7 @@ class BCSACTrainer:
         total_actor_loss = 0.0
         total_bc_loss = 0.0
         total_q_loss = 0.0
+        total_alpha_loss = 0.0
         total_samples = 0
 
         for batch in dataloader:
@@ -302,25 +330,23 @@ class BCSACTrainer:
             actions = batch["actions"].to(self.device)
             next_frames = batch["next_frames"].to(self.device)
             rewards = batch["rewards"].to(self.device)
+            rewards = torch.clamp(rewards, -5.0, 5.0)
             if rewards.dim() == 1:
                 rewards = rewards.unsqueeze(1)
-
-            # dones = 0 is fine here for now cuz we dont crash into any walls when recording (hopefully)
-            # TODO: save dones in record_demonstrations
-            dones = torch.zeros(frames.shape[0], 1, device=self.device)
+            dones = batch["dones"].to(self.device)
 
             batch_size = frames.shape[0]
 
+            current_alpha = self.alpha_val
+
             # ========== Train Critic ==========
-            # get target Q-values using target network
             with torch.no_grad():
                 next_td = TensorDict({"pixels": next_frames}, batch_size=[batch_size])
                 next_actor_out = self.actor(next_td)
-                next_actions = next_actor_out["loc"]
+                next_actions = next_actor_out["action"]  # sampled, not "loc"
                 next_log_probs = next_actor_out.get(
                     "log_prob", torch.zeros(batch_size, 1, device=self.device)
                 )
-
                 next_target_td = TensorDict(
                     {"pixels": next_frames, "action": next_actions}, batch_size=[batch_size]
                 )
@@ -329,17 +355,15 @@ class BCSACTrainer:
                 next_q_target = torch.min(next_q1_target, next_q2_target)
 
                 target_q = rewards + (1.0 - dones) * self.gamma * (
-                    next_q_target - self.alpha * next_log_probs
+                    next_q_target - current_alpha * next_log_probs
                 )
 
             current_td = TensorDict({"pixels": frames, "action": actions}, batch_size=[batch_size])
             current_q1 = self.q1(current_td)["state_action_value"]
             current_q2 = self.q2(current_td)["state_action_value"]
 
-            # twin Q-learning
             critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
 
-            # critic updates
             self.critic_optimizer.zero_grad()
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(
@@ -363,16 +387,27 @@ class BCSACTrainer:
             actor_q2 = self.q2(actor_td)["state_action_value"]
             actor_q = torch.min(actor_q1, actor_q2)
 
-            # RL loss: maximize Q-value + entropy
-            q_loss = -(actor_q - self.alpha * log_probs).mean()
+            # RL loss: maximize Q-value + entropy (using current_alpha)
+            # add norms again if doesn't work
+            q_loss = -(actor_q - current_alpha * log_probs).mean()
 
-            actor_loss = self.bc_weight * bc_loss + q_loss
+            actor_loss = (self.bc_weight * bc_loss) + (q_loss)
+            # actor_loss = q_loss + 0.1 * action_gap
 
-            # actor updates
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_optimizer.step()
+
+            # ========== Train Alpha (Entropy Coefficient) ==========
+            if self.learnable_alpha:
+                # -log_alpha * (log_prob + target_entropy)
+                alpha_loss = -(self.log_alpha * (log_probs + self.target_entropy).detach()).mean()
+
+                self.alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                self.alpha_optimizer.step()
+                total_alpha_loss += alpha_loss.item() * batch_size
 
             # ========== Soft update target network ==========
             self._update_target_network()
@@ -383,12 +418,18 @@ class BCSACTrainer:
             total_q_loss += q_loss.item() * batch_size
             total_samples += batch_size
 
-        return {
+        metrics = {
             "critic_loss": total_critic_loss / total_samples,
             "actor_loss": total_actor_loss / total_samples,
             "bc_loss": total_bc_loss / total_samples,
             "q_loss": total_q_loss / total_samples,
+            "alpha": self.alpha_val.item(),
         }
+
+        if self.learnable_alpha:
+            metrics["alpha_loss"] = total_alpha_loss / total_samples
+
+        return metrics
 
     def validate(self, dataloader: DataLoader) -> dict:
         """Validate on held-out data."""
@@ -453,7 +494,7 @@ class BCSACTrainer:
 @cli_option("--bc-weight", default=1.0, type=float, help="Weight for BC loss (λ)")
 @cli_option("--gamma", default=0.92, type=float, help="Discount factor")
 @cli_option("--tau", default=0.005, type=float, help="Target network update rate")
-@cli_option("--alpha", default=0.2, type=float, help="SAC entropy coefficient")
+@cli_option("--alpha", default=0.05, type=float, help="SAC entropy coefficient")
 @cli_option("--val-split", default=0.1, type=float, help="Validation split ratio")
 @cli_option("--num-workers", default=4, help="Data loader workers")
 @cli_option("--num-cells", default=256, help="Hidden layer size")
@@ -584,7 +625,12 @@ def main(
     dummy_frames = torch.zeros(1, FRAME_STACK, IMAGE_HEIGHT, IMAGE_WIDTH, device=device)
 
     with torch.no_grad():
-        init_td = TensorDict({"pixels": dummy_frames}, batch_size=[1])
+        init_td = TensorDict(
+            {
+                "pixels": torch.zeros((1, 3, 84, 84)),  # Force 3 channels here
+            },
+            batch_size=[1],
+        ).to(device)
         agent.actor(init_td)
 
     modules = agent.modules()
@@ -624,7 +670,7 @@ def main(
 
     best_val_mse = float("inf")
     patience_counter = 0
-    EARLY_STOP_PATIENCE = 50
+    EARLY_STOP_PATIENCE = 150
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 50)
@@ -647,6 +693,7 @@ def main(
             "val/q_value": val_metrics["val_q_value"],
             "lr/actor": trainer.actor_optimizer.param_groups[0]["lr"],
             "lr/critic": trainer.critic_optimizer.param_groups[0]["lr"],
+            "train/alpha": train_metrics["alpha"],
         }
 
         try:
