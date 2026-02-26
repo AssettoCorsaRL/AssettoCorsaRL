@@ -1,6 +1,6 @@
 """
 Usage:
-    acrl ac test --checkpoint models\bc_sac_pretrained --vae-checkpoint loss=0.1050.ckpt
+    acrl ac test --checkpoint models\bc_sac_pretrained.pt --vae-checkpoint loss=0.1050.ckpt
 """
 
 import warnings
@@ -33,9 +33,9 @@ from assetto_corsa_rl.ac_env import create_transformed_env
 from assetto_corsa_rl.model.sac import SACPolicy
 
 try:
-    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from assetto_corsa_rl.cli_registry import cli_command, cli_option, load_cfg_from_yaml
 except Exception:
-    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option, load_cfg_from_yaml
 
 
 def get_device():
@@ -81,12 +81,15 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
     print(f"  Num cells: {num_cells}")
     print(f"  VAE checkpoint: {config.get('vae_checkpoint_path', 'N/A')}")
 
+    print(load_cfg_from_yaml())
+
     print("\nCreating Assetto Corsa environment...")
     env = create_transformed_env(
-        racing_line_path="racing_lines.json",
+        racing_line_path=load_cfg_from_yaml().racing_line_path,
         device=device,
         image_shape=(84, 84),
         frame_stack=3,
+        use_ac_ai_racer=False,
     )
 
     print("\nInitializing policy...")
@@ -110,7 +113,6 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
     print(f"{'='*60}")
     print("\nWaiting for Assetto Corsa connection...")
     print("Make sure the AC_RL app is running in Assetto Corsa!")
-    input("Press Enter when ready...")
 
     episode_rewards = []
     episode_lengths = []
@@ -122,6 +124,7 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
         print(f"\n{'='*60}\nEpisode {episode + 1}/{episodes}\n{'='*60}")
 
         td = env.reset()
+        time.sleep(2)
 
         episode_reward = 0.0
         steps = 0

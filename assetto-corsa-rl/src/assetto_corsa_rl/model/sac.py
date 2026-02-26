@@ -201,8 +201,6 @@ class SACPolicy:
             nn.Linear(num_cells, 1, device=device),
         )
 
-        self.value = ValueOperator(module=value_net, in_keys=["pixels"])
-
         if vae_checkpoint_path:
             from .vae import load_vae_encoder
 
@@ -228,7 +226,6 @@ class SACPolicy:
             nn.Tanh(),
             nn.Linear(num_cells, 1, device=device),
         )
-        self.value_target = ValueOperator(module=value_net_target, in_keys=["pixels"])
 
         class CriticNet(nn.Module):
             def __init__(self, hidden: int, device, use_vae: bool):
@@ -298,8 +295,6 @@ class SACPolicy:
     def modules(self):
         return {
             "actor": self.actor,
-            "value": self.value,
-            "value_target": self.value_target,
             "q1": self.q1,
             "q2": self.q2,
             "q1_target": self.q1_target,

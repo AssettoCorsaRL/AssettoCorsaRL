@@ -34,8 +34,6 @@ class Trainer:
         cfg,
         td,
         actor,
-        value,
-        value_target,
         q1,
         q2,
         q1_target,
@@ -54,15 +52,12 @@ class Trainer:
         self.cfg = cfg
         self.current_td = td
         self.actor = actor
-        self.value = value
-        self.value_target = value_target
         self.q1 = q1
         self.q2 = q2
         self.q1_target = q1_target
         self.q2_target = q2_target
         self.actor_opt = actor_opt
         self.critic_opt = critic_opt
-        self.value_opt = value_opt
 
         self.device = device
         self.storage = storage
@@ -96,7 +91,7 @@ class Trainer:
     def _set_encoder_requires_grad(self, requires_grad: bool):
         """Enable or disable gradients for visual encoder layers in all networks."""
         # assumes actor, value, q1, q2 have a .cnn or the first few layers are the encoder
-        for net in [self.actor, self.value, self.q1, self.q2]:
+        for net in [self.actor, self.q1, self.q2]:
             if net is None:
                 continue
             # actor: cnn_features (first element of Sequential)
@@ -503,7 +498,7 @@ class Trainer:
 
             # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
             # or: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
-            actor_loss = (alpha.detach() * log_prob_new - min_q_new + kl_penalty).mean()
+            actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
 
             self.actor_opt.zero_grad()
             actor_loss.backward()
@@ -522,6 +517,9 @@ class Trainer:
                 alpha_loss.backward()
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
+                alpha_min = float(getattr(self.cfg, "alpha_min", 0.01))
+                with torch.no_grad():
+                    self.log_alpha.clamp_(min=math.log(alpha_min))
         else:
             actor_loss = None
             alpha_loss = None
@@ -588,10 +586,6 @@ class Trainer:
         """Soft update of target network: θ_target = τ*θ + (1-τ)*θ_target"""
         tau = self.cfg.tau
 
-        # update value target
-        for param, target_param in zip(self.value.parameters(), self.value_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
         # update Q1 target
         for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
@@ -641,10 +635,8 @@ class Trainer:
                     "actor_state": self.actor.state_dict(),
                     "q1_state": self.q1.state_dict(),
                     "q2_state": self.q2.state_dict(),
-                    "value_state": self.value.state_dict(),
                     "actor_opt": self.actor_opt.state_dict(),
                     "critic_opt": self.critic_opt.state_dict(),
-                    "value_opt": self.value_opt.state_dict(),
                     "steps": self.total_steps,
                     "config": {
                         "use_noisy": getattr(self.cfg, "use_noisy", False),

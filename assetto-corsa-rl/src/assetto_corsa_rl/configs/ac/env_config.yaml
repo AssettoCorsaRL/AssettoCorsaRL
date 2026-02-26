@@ -1,7 +1,8 @@
 environment:
   num_envs: 1 # ac env doesn't support parallel envs
   frames_per_batch: 1024
-  racing_line_path: "racing_lines.json" # path to racing line data file
+  racing_line_path: "https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/json/brazil_racing_lines.json" # path to racing line data file
+  # TODO: allow links to the docs (where there will be pleanty of jsons for different maps)
 
   # model observation inputs
   # set to true to include in observation vector

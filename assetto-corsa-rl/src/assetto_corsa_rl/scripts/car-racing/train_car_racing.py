@@ -34,9 +34,9 @@ from torchrl.data.replay_buffers import (
 from tensordict import TensorDict
 
 try:
-    from assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml
 except Exception:
-    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml  # type: ignore
 
 
 def init_weights(m):
@@ -44,81 +44,6 @@ def init_weights(m):
         nn.init.xavier_uniform_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
-
-
-def load_cfg_from_yaml(root: Path = None):
-    """Load `configs/env_config.yaml` and `configs/model_config.yaml` and merge them.
-
-    Model keys override environment keys when names collide. Missing keys are filled
-    from `SACConfig` defaults.
-
-    This version preserves integers and only converts string representations to appropriate types.
-    """
-    if root is None:
-        # project root (assetto-corsa-rl)
-        root = Path(__file__).resolve().parents[1]
-
-    env_p = root / "configs" / "car-racing" / "env_config.yaml"
-    model_p = root / "configs" / "car-racing" / "model_config.yaml"
-    train_p = root / "configs" / "car-racing" / "train_config.yaml"
-
-    def _read(p):
-        try:
-            with open(p, "r") as f:
-                return yaml.safe_load(f) or {}
-        except Exception as e:
-            print(f"Warning: could not read config {p}: {e}")
-            return {}
-
-    env = _read(env_p).get("environment", {})
-    model = _read(model_p).get("model", {})
-    train_raw = _read(train_p)
-
-    if isinstance(train_raw, dict):
-        train = {**train_raw.get("train", {}), **train_raw.get("training", {})}
-    else:
-        train = {}
-
-    cfg_dict = {}
-    cfg_dict.update(model)
-    cfg_dict.update(env)
-    cfg_dict.update(train)
-
-    def _try_convert(x):
-        if x is None or isinstance(x, bool):
-            return x
-        if isinstance(x, dict):
-            return {k: _try_convert(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return [_try_convert(v) for v in x]
-        if isinstance(x, int):
-            return x
-        if isinstance(x, float):
-            return x
-        if isinstance(x, str):
-            s = x.strip().replace(",", "").replace("_", "")
-            try:
-                if "." not in s and "e" not in s.lower():
-                    return int(s)
-                else:
-                    return float(s)
-            except Exception:
-                return x
-        return x
-
-    converted = {k: _try_convert(v) for k, v in cfg_dict.items()}
-
-    if isinstance(converted.get("wandb"), dict):
-        wandb_dict = converted.pop("wandb")
-        for k, v in wandb_dict.items():
-            converted[f"wandb_{k}"] = v
-
-    for k in ("wandb_project", "wandb_entity", "wandb_name", "wandb_enabled"):
-        converted.setdefault(k, None)
-
-    cfg = SimpleNamespace(**converted)
-    print(f"Loaded config from: {env_p}, {model_p}, {train_p}")
-    return cfg
 
 
 @cli_command(group="car-racing", name="train", help="Train SAC agent in CarRacing environment")

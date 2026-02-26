@@ -13,3 +13,4 @@ wandb>=0.15.0
 vgamepad>=0.1.0
 mss>=10.0.0
 pywin32>=223
+requests>=2.28.0

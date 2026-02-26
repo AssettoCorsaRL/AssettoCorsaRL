@@ -5,7 +5,7 @@ model:
   critic_lr: 3e-4
   max_grad_norm: 1.0
 
-  bc_pretrained_model: "models/bc_sac_pretrained.pt" # path to BC actor (pretrain_bc.py)
+  bc_pretrained_model: "D:/acrl/AssetoCorsaRL/models/bc_sac_pretrained.pt" # path to BC actor (pretrain_bc.py)
   vae_checkpoint_path: "loss=0.1050.ckpt" #* IMPORTANT: Path to pretrained encoder to load for VAE training
   replay_buffer_path: null
 
@@ -35,6 +35,6 @@ model:
   noise_sigma: 0.5
 
   #* exploration - IGNORE IF use_noisy=true
-  explore_start: 1
+  explore_start: 0.3 # 0.3 if starting with BC agent, else 1.0
   explore_end: 0.03
   explore_steps: 500_000

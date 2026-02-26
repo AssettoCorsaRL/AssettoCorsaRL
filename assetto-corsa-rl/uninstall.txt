@@ -2,7 +2,7 @@ aiohappyeyeballs==2.6.1
 aiohttp==3.13.3
 aiosignal==1.4.0
 annotated-types==0.7.0
-assetto-corsa-rl @ file:///D:/acrl/AssetoCorsaRL/assetto-corsa-rl/dist/assetto_corsa_rl-0.1.6-py3-none-any.whl#sha256=6bf2e479c7ae696587c59a868144123f05224c90dc5e88026b254c82c0c380a1
+assetto-corsa-rl @ file:///D:/acrl/AssetoCorsaRL/assetto-corsa-rl/dist/assetto_corsa_rl-0.1.7-py3-none-any.whl#sha256=6bf2e479c7ae696587c59a868144123f05224c90dc5e88026b254c82c0c380a1
 async-timeout==5.0.1
 attrs==25.4.0
 backports.tarfile==1.2.0

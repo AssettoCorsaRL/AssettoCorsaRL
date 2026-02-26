@@ -87,7 +87,7 @@ def discover_commands():
 
 
 @click.group()
-@click.version_option(version="0.1.6", prog_name="acrl")
+@click.version_option(version="0.1.7", prog_name="acrl")
 def cli():
     """Assetto Corsa Reinforcement Learning Toolkit.
 

@@ -29,7 +29,7 @@ class AssettoCorsa(gym.Env):
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
-        constant_reward_per_ms: float = 0.01,
+        constant_reward_per_ms: float = -0.01,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.1,
         ms_per_action: float = 20.0,
@@ -349,22 +349,39 @@ class AssettoCorsa(gym.Env):
             return float(data.get(key, 0.0))
 
     def _load_racing_line(self, filepath: str) -> None:
-        """Load racing line from JSON file."""
-        path = Path(filepath)
-        if not path.exists():
-            raise FileNotFoundError(f"Racing line file not found: {filepath}")
+        """Load racing line from JSON file or URL.
 
-        with open(path, "r") as f:
-            self.racing_line = json.load(f)
+        The `filepath` may be a local path or an HTTP/HTTPS URL.  When a URL is
+        provided we download the JSON and parse it in-memory; local files are
+        read normally.
+        """
+        # support remote files so users can point at our hosted lines
+        if filepath.startswith("http://") or filepath.startswith("https://"):
+            try:
+                import requests
 
-        if self.racing_line["num_laps"] == 0:
+                resp = requests.get(filepath, timeout=10)
+                resp.raise_for_status()
+                self.racing_line = resp.json()
+            except Exception as e:  # pylint: disable=broad-except
+                raise IOError(f"Failed to download racing line from {filepath}: {e}")
+        else:
+            path = Path(filepath)
+            if not path.exists():
+                raise FileNotFoundError(f"Racing line file not found: {filepath}")
+
+            with open(path, "r") as f:
+                self.racing_line = json.load(f)
+
+        if self.racing_line.get("num_laps", 0) == 0:
             raise ValueError("Racing line file contains no laps")
 
         lap = self.racing_line["laps"][0]
         positions = np.array([[p["x"], p["y"], p["z"]] for p in lap["positions"]])
         self.racing_line_positions = positions
 
-        print(f"✓ Loaded racing line with {len(positions)} points")
+        # avoid unicode characters in logs to prevent encoding issues on some consoles
+        print(f"Loaded racing line with {len(positions)} points")
 
     def _find_closest_point_on_racing_line(
         self, position: np.ndarray, search_window: int = 100
@@ -373,14 +390,15 @@ class AssettoCorsa(gym.Env):
             return 0, 0.0
 
         n = len(self.racing_line_positions)
-        center = self._current_racing_line_index
+        if search_window == -1 or search_window >= n:
+            indices = np.arange(n)
+        else:
+            center = self._current_racing_line_index
+            indices = np.arange(center - search_window, center + search_window + 1) % n
 
-        indices = np.arange(center - search_window, center + search_window + 1) % n
         candidates = self.racing_line_positions[indices]
-
         distances = np.linalg.norm(candidates - position, axis=1)
         local_idx = np.argmin(distances)
-
         closest_idx = int(indices[local_idx])
         return closest_idx, float(distances[local_idx])
 
@@ -390,29 +408,46 @@ class AssettoCorsa(gym.Env):
 
         closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=100)
 
-        if self._current_racing_line_index == 0:
-            self._current_racing_line_index = closest_idx
+        # if self._current_racing_line_index == 0:
+        # self._current_racing_line_index = closest_idx
 
         idx_diff = closest_idx - self._current_racing_line_index
         n = len(self.racing_line_positions)
-
         if idx_diff < -(n // 2):
             idx_diff += n
         elif idx_diff > n // 2:
             idx_diff -= n
 
-        # Only advance, never go backward
-        if idx_diff <= 0:
+        if idx_diff < 0:
             return self._meters_advanced
 
-        self._current_racing_line_index = closest_idx
+        # Project position onto the segment between closest and next point
+        next_idx = (closest_idx + 1) % n
+        seg_start = self.racing_line_positions[closest_idx]
+        seg_end = self.racing_line_positions[next_idx]
+        seg = seg_end - seg_start
+        seg_len = np.linalg.norm(seg)
 
+        if seg_len > 0:
+            t = np.clip(np.dot(position - seg_start, seg) / (seg_len**2), 0.0, 1.0)
+        else:
+            t = 0.0
+
+        # Arc length up to closest_idx
         segments = (
             self.racing_line_positions[1 : closest_idx + 1]
             - self.racing_line_positions[0:closest_idx]
         )
-        distances = np.linalg.norm(segments, axis=1)
-        return float(np.sum(distances))
+        arc = float(np.sum(np.linalg.norm(segments, axis=1)))
+
+        # Add fractional progress along current segment
+        total = arc + t * seg_len
+
+        if total < self._meters_advanced:
+            return self._meters_advanced
+
+        self._current_racing_line_index = closest_idx
+        return total
 
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
     #! UNTESTED WITH PRETRAINED AGENTS
@@ -476,6 +511,10 @@ class AssettoCorsa(gym.Env):
         """
         super().reset(seed=seed)
 
+        self._current_racing_line_index = 0
+        self._meters_advanced = 0.0
+        self._last_speed = 0.0
+
         self.controller.reset()
         self.controller.update()
 
@@ -512,7 +551,25 @@ class AssettoCorsa(gym.Env):
             if not success:
                 print("Warning: send_ctrl_c failed during env.reset()")
 
-        time.sleep(1)
+        time.sleep(1.5)
+
+        obs = self._get_observation()
+
+        if self.racing_line_positions is not None and self._last_obs:
+            position = np.array(self._last_obs.get("car", {}).get("world_location", [0, 0, 0]))
+            # full search to find true spawn index
+            closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=-1)
+            self._current_racing_line_index = closest_idx
+            # compute arc to spawn so first step reward starts from 0 delta
+            segments = (
+                self.racing_line_positions[1 : closest_idx + 1]
+                - self.racing_line_positions[0:closest_idx]
+            )
+            self._meters_advanced = float(np.sum(np.linalg.norm(segments, axis=1)))
+
+        if self._last_obs:
+            velocity = self._last_obs.get("car", {}).get("velocity", [0, 0, 0])
+            self._last_speed = np.linalg.norm(velocity)
 
         return obs, info
 
@@ -735,81 +792,70 @@ def create_mock_env(device: Optional[torch.device] = None):
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Track current racing line index live.")
+    parser = argparse.ArgumentParser(description="Debug AC environment live.")
     parser.add_argument("--racing-line", type=str, default="racing_lines.json")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--send-port", type=int, default=9877)
     parser.add_argument("--recv-port", type=int, default=9876)
     args = parser.parse_args()
 
-    # Load racing line
-    path = Path(args.racing_line)
-    if not path.exists():
-        print(f"[ERROR] Racing line file not found: {path}")
-        return
-
-    with open(path, "r") as f:
-        racing_line = json.load(f)
-
-    if racing_line["num_laps"] == 0:
-        print("[ERROR] Racing line file contains no laps.")
-        return
-
-    lap = racing_line["laps"][0]
-    racing_line_positions = np.array([[p["x"], p["y"], p["z"]] for p in lap["positions"]])
-    print(f"[main] Loaded racing line with {len(racing_line_positions)} points")
-
-    # Start telemetry
-    telemetry = Telemetry(
+    env = AssettoCorsa(
         host=args.host,
         send_port=args.send_port,
         recv_port=args.recv_port,
-        timeout=0.1,
-        auto_start_receiver=True,
-        capture_images=False,
+        racing_line_path=args.racing_line,
+        include_image=False,
+        use_ac_ai_racer=False,
     )
 
-    current_racing_line_index = 0
-    print("[main] Listening for telemetry... Press Ctrl+C to stop.\n")
+    obs, info = env.reset()
+    print("Environment reset. Press Ctrl+C to stop.\n")
 
     try:
         while True:
-            data = telemetry.get_latest()
-
+            data = env._last_obs
             if data is None:
                 time.sleep(0.05)
+                obs = env._get_observation()
                 continue
 
-            world_location = data.get("car", {}).get("world_location", None)
-            if world_location is None or len(world_location) < 3:
-                time.sleep(0.05)
-                continue
+            position = np.array(data.get("car", {}).get("world_location", [0, 0, 0]))
+            velocity = data.get("car", {}).get("velocity", [0, 0, 0])
+            speed = np.linalg.norm(velocity)
 
-            position = np.array([world_location[0], world_location[1], world_location[2]])
+            closest_idx, dist_to_line = env._find_closest_point_on_racing_line(position)
+            a_closest_idx, _ = env._find_closest_point_on_racing_line(position, search_window=-1)
 
-            search_window = 100
-            n = len(racing_line_positions)
-            indices = (
-                np.arange(
-                    current_racing_line_index - search_window,
-                    current_racing_line_index + search_window + 1,
-                )
-                % n
+            meters = env._meters_advanced
+
+            reward = env._calculate_reward(obs, data)
+            done = env._check_done(obs, data)
+
+            print(
+                f"step={env._episode_step:5d} | "
+                f"rl_idx={closest_idx:4d} | "
+                f"fx_idx={a_closest_idx} | "
+                f"dist_to_line={dist_to_line:6.2f}m | "
+                f"meters={meters:8.1f} | "
+                f"speed={speed:6.2f}m/s | "
+                f"reward={reward:7.3f} | "
+                f"damage={sum(data['car'].get('damage', [0]))} | "
+                f"done={done}"
             )
-            candidates = racing_line_positions[indices]
-            distances = np.linalg.norm(candidates - position, axis=1)
-            closest_idx = int(indices[np.argmin(distances)])
 
-            if closest_idx != current_racing_line_index:
-                current_racing_line_index = closest_idx
-                print(f"[main] current_racing_line_index = {current_racing_line_index}")
+            if done:
+                print("Episode done, resetting...")
+                obs, info = env.reset()
+            else:
+                obs = env._get_observation()
+                env._episode_step += 1
 
-            time.sleep(0.02)
+            time.sleep(0.05)
 
     except KeyboardInterrupt:
-        print("\n[main] Stopped.")
+        print("\nStopped.")
     finally:
-        telemetry.close()
+        env.close()
 
 
 if __name__ == "__main__":

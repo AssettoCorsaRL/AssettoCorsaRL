@@ -16,9 +16,13 @@ Usage in a script:
 from __future__ import annotations
 
 from typing import Callable, Any, Dict, List, Optional
+from importlib.resources import files
+from types import SimpleNamespace
+from pathlib import Path
 import functools
+import yaml
 
-# Global registry of commands
+
 _COMMAND_REGISTRY: Dict[str, List[Dict[str, Any]]] = {}
 
 
@@ -127,3 +131,84 @@ def get_registered_commands(
 def clear_registry():
     """Clear the command registry (mainly for testing)."""
     _COMMAND_REGISTRY.clear()
+
+
+def _resolve_config_root():
+    try:
+        return Path(files("assetto_corsa_rl"))
+    except Exception:
+        return Path(__file__).resolve().parents[4]
+
+
+def load_cfg_from_yaml(root: Path = None):
+    """Load configs/ac/env_config.yaml, model_config.yaml, train_config.yaml and merge."""
+    if root is None:
+        root = _resolve_config_root()
+
+    env_p = root / "configs" / "ac" / "env_config.yaml"
+    model_p = root / "configs" / "ac" / "model_config.yaml"
+    train_p = root / "configs" / "ac" / "train_config.yaml"
+
+    def _read(p):
+        try:
+            with open(p, "r") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            print(f"Warning: could not read config {p}: {e}")
+            return {}
+
+    env = _read(env_p).get("environment", {})
+    model = _read(model_p).get("model", {})
+    train_raw = _read(train_p)
+    train = {}
+    if isinstance(train_raw, dict):
+        train.update(train_raw.get("train", {}))
+        train.update(train_raw.get("training", {}))
+
+    cfg_dict = {}
+    cfg_dict.update(model)
+    cfg_dict.update(env)
+    cfg_dict.update(train)
+
+    input_config = env.get("inputs", None)
+
+    def _try_convert(x):
+        if x is None or isinstance(x, bool):
+            return x
+        if isinstance(x, dict):
+            return {k: _try_convert(v) for k, v in x.items()}
+        if isinstance(x, (list, tuple)):
+            return [_try_convert(v) for v in x]
+        if isinstance(x, int):
+            return x
+        if isinstance(x, float):
+            return x
+        if isinstance(x, str):
+            s = x.strip().replace(",", "").replace("_", "")
+            try:
+                if "." not in s and "e" not in s.lower():
+                    return int(s)
+                return float(s)
+            except Exception:
+                return x
+        return x
+
+    converted = {k: _try_convert(v) for k, v in cfg_dict.items()}
+
+    if isinstance(converted.get("wandb"), dict):
+        wandb_dict = converted.pop("wandb")
+        for k, v in wandb_dict.items():
+            converted[f"wandb_{k}"] = v
+
+    for k in ("wandb_project", "wandb_entity", "wandb_name", "wandb_enabled"):
+        converted.setdefault(k, None)
+
+    converted["num_envs"] = 1
+    converted["input_config"] = input_config
+
+    cfg = SimpleNamespace(**converted)
+    print(f"Loaded config from: {env_p}, {model_p}, {train_p}")
+    if input_config:
+        enabled_count = sum(1 for v in input_config.values() if v)
+        print(f"  Input config: {enabled_count}/{len(input_config)} inputs enabled")
+    return cfg

@@ -3,7 +3,7 @@
 A comprehensive toolkit for training RL agents in Assetto Corsa and Car Racing environments.
 """
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 __author__ = "Assetto Corsa RL Contributors"
 __license__ = "MIT"
 

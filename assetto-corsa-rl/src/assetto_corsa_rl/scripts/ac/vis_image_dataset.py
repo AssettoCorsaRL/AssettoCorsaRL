@@ -1,7 +1,7 @@
 """Visualize saved frame-stack datasets (.npz) from Assetto Corsa.
 
 Usage:
-    acrl ac vis-dataset --input-dir datasets/demonstrations
+    acrl ac vis-dataset --input-dir datasets/demonstrations4
 
 Controls (when window active):
  - n : next sample
