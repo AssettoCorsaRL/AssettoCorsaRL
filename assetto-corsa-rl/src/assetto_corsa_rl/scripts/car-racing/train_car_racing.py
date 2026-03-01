@@ -158,7 +158,6 @@ def train():
     # ===== Optimizers =====
     actor_opt = torch.optim.Adam(actor.parameters(), lr=cfg.lr)
     critic_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=cfg.lr)
-    value_opt = torch.optim.Adam(value.parameters(), lr=cfg.lr)
 
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
@@ -197,7 +196,6 @@ def train():
         q2_target,
         actor_opt,
         critic_opt,
-        value_opt,
         log_alpha,
         alpha_opt,
         target_entropy,

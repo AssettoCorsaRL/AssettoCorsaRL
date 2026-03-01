@@ -4,46 +4,30 @@ from tensordict import TensorDict
 
 
 def reduce_value_to_batch(x, batch_size):
-    """Reduce a value-shaped tensor or TensorDict to a (batch_size, 1) tensor.
-
-    See original docstring in the repo.
-    """
     try:
         v = x.get("value") if hasattr(x, "get") else x
-
         if v.shape[0] == batch_size:
             if v.ndim == 1:
                 return v.view(-1, 1)
             return v.flatten(1).mean(dim=1, keepdim=True)
-
         return v.view(batch_size, -1).mean(dim=1, keepdim=True)
     except Exception:
         return None
 
 
 def pack_pixels(x):
-    """Pack pixel tensors to a compact integer format.
-
-    - If input values are in [0, 1], pack to `torch.uint8` in [0, 255].
-    """
     if not isinstance(x, torch.Tensor):
         return x
     return (x.clamp(0.0, 1.0) * 255.0).round().to(torch.uint8).cpu()
 
 
 def unpack_pixels(x):
-    """Inverse of `pack_pixels`.
-
-    Converts integer-packed pixels back to floating-point in [0,1] (uint8) or [-1,1] (int8).
-    """
     if not isinstance(x, torch.Tensor):
         return x
-
     if x.dtype == torch.uint8:
         return x.to(torch.float32) / 255.0
     if x.dtype == torch.int8:
         return x.to(torch.float32) / 127.0
-
     return x.to(torch.float32)
 
 
@@ -88,12 +72,26 @@ def expand_actions_for_envs(actions, target_batch):
     return actions
 
 
-def add_transition(rb, i, pixels, next_pixels, action, reward, done):
+def add_transition(rb, i, pixels, next_pixels, action, reward, done, vector=None, next_vector=None):
+    """Add a single env transition to the replay buffer.
+
+    Args:
+        rb: replay buffer
+        i: env index
+        pixels: [num_envs, C, H, W] current pixels
+        next_pixels: [num_envs, C, H, W] next pixels
+        action: [num_envs, action_dim]
+        reward: [num_envs]
+        done: [num_envs]
+        vector: optional [num_envs, obs_dim] telemetry vector
+        next_vector: optional [num_envs, obs_dim] next telemetry vector
+    """
     packed_pixels = pack_pixels(pixels[i])
     packed_next = pack_pixels(next_pixels[i])
     action_cpu = action[i].to(torch.float32).cpu()
     reward_cpu = reward[i].unsqueeze(0).cpu()
     done_cpu = done[i].unsqueeze(0).cpu()
+
     transition = TensorDict(
         {
             "pixels": packed_pixels,
@@ -104,6 +102,12 @@ def add_transition(rb, i, pixels, next_pixels, action, reward, done):
         },
         batch_size=[],
     )
+
+    if vector is not None:
+        transition["vector"] = vector[i].to(torch.float32).cpu()
+    if next_vector is not None:
+        transition["next_vector"] = next_vector[i].to(torch.float32).cpu()
+
     rb.add(transition)
 
 

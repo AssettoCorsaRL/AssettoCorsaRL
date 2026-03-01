@@ -490,7 +490,7 @@ def load_vae_encoder(
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
     except FileNotFoundError:
-        warnings.warn(f"VAE checkpoint file not found: '{checkpoint_path}'", RuntimeWarning)
+        print(f"VAE checkpoint file not found: '{checkpoint_path}'", RuntimeWarning)
         raise
     except Exception as e:
         print(f"Failed to load VAE checkpoint from '{checkpoint_path}': {e}", RuntimeWarning)

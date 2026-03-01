@@ -40,7 +40,6 @@ class Trainer:
         q2_target,
         actor_opt,
         critic_opt,
-        value_opt,
         log_alpha,
         alpha_opt,
         target_entropy,
@@ -75,11 +74,8 @@ class Trainer:
         self._last_save_steps = 0
         self._last_save_rb_steps = 0
 
-        self._steps_since_update = 0
-        self._update_every = getattr(cfg, "update_every", cfg.num_envs)
-
         self._updates_count = 0
-        self._updates_per_step = getattr(cfg, "updates_per_step", 1)
+        self._updates_per_step = int(getattr(cfg, "updates_per_step", 1))
         self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
         self._freeze_encoder_steps = getattr(cfg, "freeze_encoder_steps", 0)
         self._encoder_frozen = False
@@ -90,14 +86,9 @@ class Trainer:
 
     def _set_encoder_requires_grad(self, requires_grad: bool):
         """Enable or disable gradients for visual encoder layers in all networks."""
-        # assumes actor, value, q1, q2 have a .cnn or the first few layers are the encoder
         for net in [self.actor, self.q1, self.q2]:
             if net is None:
                 continue
-            # actor: cnn_features (first element of Sequential)
-            # value: value_cnn (first element)
-            # q1/q2: .cnn attribute
-
             for name, module in net.named_modules():
                 if "cnn" in name.lower() or isinstance(module, torch.nn.Conv2d):
                     for param in module.parameters():
@@ -123,11 +114,7 @@ class Trainer:
         self._maybe_reset(td_next, dones)
 
     def _exploration_epsilon(self):
-        """Linearly annealed exploration epsilon between start and end over explore_steps.
-
-        Uses `cfg` values (source of truth). If noisy-network exploration is enabled in the
-        config, epsilon-greedy is disabled (returns 0.0).
-        """
+        """Linearly annealed exploration epsilon between start and end over explore_steps."""
         if self.cfg.use_noisy:
             return 0.0
 
@@ -139,41 +126,19 @@ class Trainer:
         frac = min(1.0, float(self.total_steps) / float(steps))
         return float(start + (end - start) * frac)
 
-    # ===== Main loop =====
     def run(self, total_steps=0):
         self.total_steps = total_steps
-        self._pending_updates = 0  # track updates to do during reset
-
-        max_pending = getattr(self.cfg, "max_pending_updates", 10000)
 
         while self.total_steps < self.cfg.total_steps:
             for _ in range(self.cfg.frames_per_batch):
                 self._step_and_store()
 
-                self._steps_since_update += self.cfg.num_envs
-                if self._steps_since_update >= self._update_every:
-                    num_base_updates = max(1, self._steps_since_update // self._update_every)
-                    self._pending_updates += num_base_updates * self._updates_per_step
-                    self._steps_since_update = 0
-
-                #  if too many pending updates, do some now to avoid memory issues
-                if self._pending_updates >= max_pending:
-                    self._do_pending_updates()
+                if len(self.rb) >= self.cfg.batch_size:
+                    for _ in range(self._updates_per_step):
+                        self._do_update()
 
             self._maybe_log_and_save()
         print("Training finished")
-
-    def _do_pending_updates(self):
-        """Execute all pending updates - called during resets when car isn't being controlled."""
-        if self._pending_updates <= 0 or len(self.rb) < self.cfg.batch_size:
-            return
-
-        updates_to_do = self._pending_updates
-        self._pending_updates = 0
-
-        for _ in range(updates_to_do):
-            if len(self.rb) >= self.cfg.batch_size:
-                self._do_update()
 
     def _step_and_store(self):
         target_batch = self.current_td.batch_size
@@ -185,7 +150,6 @@ class Trainer:
             actor_input = TensorDict({"pixels": pixels_only}, batch_size=[pixels_only.shape[0]])
             use_noisy = getattr(self.cfg, "use_noisy", False)
 
-            # if using noisy-net exploration, resample actor noise each step
             if use_noisy:
                 for m in self.actor.modules():
                     if hasattr(m, "sample_noise"):
@@ -198,7 +162,6 @@ class Trainer:
             )
             actor_action = actor_output["action"] if has_actor_action else None
 
-            # if using noisy, disable epsilon-greedy entirely.
             if use_noisy:
                 eps = 0.0
                 if actor_action is None:
@@ -215,7 +178,6 @@ class Trainer:
                 eps = self._exploration_epsilon()
 
             if eps > 0.0:
-                # per-env mask deciding whether to use random action
                 mask = torch.rand(self.cfg.num_envs, device=self.device) < eps
                 rand_actions = sample_random_action(self.cfg.num_envs, dev=self.device)
                 if actor_action is None:
@@ -235,9 +197,6 @@ class Trainer:
         td_next = get_inner(next_td)
 
         rewards, dones = extract_reward_and_done(td_next, self.cfg.num_envs, self.device)
-
-        # if dones.any():
-        #     self._debug_on_done(actions, actions_step, actor_output, td_next)
 
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
@@ -293,9 +252,6 @@ class Trainer:
         if "next" in td_next.keys() and "pixels" in td_next["next"].keys():
             self.current_td = td_next["next"]
         if dones.any():
-            # do all pending gradient updates during reset when car isn't being controlled
-            self._do_pending_updates()
-
             try:
                 reset_td = self.env.reset()
                 self.current_td = (
@@ -333,10 +289,6 @@ class Trainer:
         batch_indices = info.get("index", None)
 
         pixels_b = batch["pixels"]
-
-        # NOTE: Do NOT sample noise during gradient updates
-        # Noisy networks should only resample during environment rollout
-        # Sampling here adds unnecessary variance to gradients
 
         if isinstance(pixels_b, torch.Tensor) and not torch.is_floating_point(pixels_b):
             pixels_b = unpack_pixels(pixels_b).to(self.device)
@@ -377,7 +329,6 @@ class Trainer:
 
             q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
 
-            # clip Q-targets to prevent divergence (critical for stability)
             min_q = float(getattr(self.cfg, "min_q_target", -1000.0))
             max_q = float(getattr(self.cfg, "max_q_target", 1000.0))
             q_target = torch.clamp(q_target, min=min_q, max=max_q)
@@ -395,9 +346,7 @@ class Trainer:
             td_error_2 = torch.abs(q2_pred - q_target)
             td_errors = torch.max(td_error_1, td_error_2).squeeze(-1)
 
-            # update priorities in PER
             if batch_indices is not None:
-                # convert to numpy if needed
                 priorities = td_errors.cpu().numpy()
                 self.rb.update_priority(batch_indices, priorities)
 
@@ -430,13 +379,6 @@ class Trainer:
         # ===== Actor Update =====
         self._updates_count += 1
         if self._updates_count % self._actor_update_delay == 0:
-            # store old policy for KL penalty
-            with torch.no_grad():
-                td_in_old = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
-                out_old = self.actor(td_in_old)
-                old_loc = out_old["loc"].detach()
-                old_scale = out_old["scale"].detach()
-
             # sample actions from current policy
             td_in = TensorDict({"pixels": pixels_b}, batch_size=pixels_b.shape[0])
             out = self.actor(td_in)
@@ -471,33 +413,7 @@ class Trainer:
             q2_new = self.q2(pixels_b, new_actions).view(-1, 1)
             min_q_new = torch.min(q1_new, q2_new)
 
-            # compute KL divergence between old and new policy (Gaussian KL)
-            # KL(N(μ1,σ1)||N(μ2,σ2)) = log(σ2/σ1) + (σ1² + (μ1-μ2)²)/(2σ2²) - 1/2
-            new_loc = out["loc"]
-            new_scale = out["scale"]
-            kl_div = (
-                torch.log(old_scale / new_scale)
-                + (new_scale.pow(2) + (new_loc - old_loc).pow(2)) / (2 * old_scale.pow(2))
-                - 0.5
-            ).sum(dim=-1, keepdim=True)
-
-            # KL penalty coefficient (can be made configurable)
-            beta_kl = getattr(self.cfg, "beta_kl", 0.001)
-            kl_penalty = beta_kl * kl_div
-
-            # Log KL divergence immediately after computation
-            wandb.log(
-                {
-                    "actor/kl_divergence_instant": kl_div.mean().item(),
-                    "actor/kl_divergence_max": kl_div.max().item(),
-                    "actor/kl_divergence_min": kl_div.min().item(),
-                    "actor/kl_penalty_instant": kl_penalty.mean().item(),
-                },
-                step=self.total_steps,
-            )
-
-            # Actor loss: maximize Q(s,a) - α * log π(a|s) - β * KL(π_old||π_new)
-            # or: minimize α * log π(a|s) - Q(s,a) + β * KL(π_old||π_new)
+            # Actor loss: maximize Q(s,a) - α * log π(a|s)
             actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
 
             self.actor_opt.zero_grad()
@@ -508,7 +424,6 @@ class Trainer:
             # ===== Alpha (Temperature) Update =====
             alpha_loss = None
             if self.log_alpha is not None and self.alpha_opt is not None:
-                # we want: E[-log π(a|s)] ≈ target_entropy
                 with torch.no_grad():
                     entropy_error = log_prob_new + self.target_entropy
                 alpha_loss = -(self.log_alpha * entropy_error).mean()
@@ -525,10 +440,7 @@ class Trainer:
             alpha_loss = None
             log_prob_new = None
             min_q_new = None
-            kl_div = None
-            kl_penalty = None
             new_actions = None
-            beta_kl = getattr(self.cfg, "beta_kl", 0.001)
 
         # ===== Soft Update Target Networks =====
         self._soft_update_target()
@@ -541,7 +453,6 @@ class Trainer:
                 "loss/q1_loss": q1_loss.item(),
                 "loss/q2_loss": q2_loss.item(),
                 "loss/actor_loss": (actor_loss.item() if actor_loss is not None else 0.0),
-                "loss/kl_penalty": (kl_penalty.mean().item() if kl_penalty is not None else 0.0),
                 #
                 "critic/mean_q_value": (min_q_new.mean().item() if min_q_new is not None else 0.0),
                 "critic/q_target_mean": q_target.mean().item(),
@@ -557,8 +468,6 @@ class Trainer:
                 "actor/entropy_gap": current_entropy - self.target_entropy,
                 "actor/alpha": alpha.item(),
                 "actor/alpha_loss": (alpha_loss.item() if alpha_loss is not None else 0.0),
-                "actor/kl_divergence": (kl_div.mean().item() if kl_div is not None else 0.0),
-                "actor/beta_kl": beta_kl,
                 #
                 "reward/rewards_per_step_mean": rewards_b.mean().item(),
                 "reward/rewards_per_step_max": rewards_b.max().item(),
@@ -586,11 +495,9 @@ class Trainer:
         """Soft update of target network: θ_target = τ*θ + (1-τ)*θ_target"""
         tau = self.cfg.tau
 
-        # update Q1 target
         for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
-        # update Q2 target
         for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
             target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
@@ -615,18 +522,12 @@ class Trainer:
                         "buffer": len(self.rb),
                         "time": elapsed,
                         "epsilon": eps,
-                        # "alpha": (
-                        #     alpha_val
-                        #     if alpha_val is not None
-                        #     else float(self.cfg.alpha)
-                        # ),
                     },
                     step=self.total_steps,
                 )
             except Exception as e:
                 print("Warning: wandb logging failed (_maybe_log_and_save):", e)
 
-            # record last log
             self._last_log_steps = self.total_steps
 
         if self.total_steps - getattr(self, "_last_save_steps", 0) >= self.cfg.save_interval:
@@ -647,11 +548,8 @@ class Trainer:
                 f".\\models\\sac_checkpoint_{self.total_steps}.pt",
             )
             print(f"Saved checkpoint at step {self.total_steps}")
-
-            # record last save
             self._last_save_steps = self.total_steps
 
-        # save replay buffer periodically
         rb_save_interval = getattr(
             self.cfg, "save_interval_replaybuffer", self.cfg.save_interval * 2
         )
@@ -673,7 +571,6 @@ class Trainer:
 
                 existing_buffers = sorted(rb_dir.glob("replay_buffer_*.pkl"))
 
-                # clean up old replay buffers if needed to maintain free space
                 while existing_buffers and available_space < min_free_space_bytes:
                     oldest_buffer = existing_buffers.pop(0)
                     buffer_size = oldest_buffer.stat().st_size
@@ -719,20 +616,6 @@ class Trainer:
             except Exception as e:
                 print(f"Warning: Failed to save replay buffer: {e}")
 
-            # * i dont have enough wandb storage to do this sooo
-            # TODO: add option in config for ts
-            # if self.cfg and getattr(self.cfg, "wandb", False) and WANDB_AVAILABLE:
-            #     try:
-            #         wandb.save(f".\\models\\sac_checkpoint_{self.total_steps}.pt")
-            #         wandb.log(
-            #             {
-            #                 "checkpoint": f".\\models\\sac_checkpoint_{self.total_steps}.pt"
-            #             },
-            #             step=self.total_steps,
-            #         )
-            #     except Exception:
-            #         pass
-
 
 def collect_initial_data(env, rb, cfg, current_td, device):
     t = Trainer(
@@ -763,15 +646,12 @@ def run_training_loop(
     cfg,
     current_td,
     actor,
-    value,
-    value_target,
     q1,
     q2,
     q1_target,
     q2_target,
     actor_opt,
     critic_opt,
-    value_opt,
     log_alpha,
     alpha_opt,
     target_entropy,
@@ -788,22 +668,18 @@ def run_training_loop(
         cfg,
         current_td,
         actor,
-        value,
-        value_target,
         q1,
         q2,
         q1_target,
         q2_target,
         actor_opt,
         critic_opt,
-        value_opt,
         log_alpha,
         alpha_opt,
         target_entropy,
         device,
         storage,
     )
-    # restore passed-in state when available
     if episode_returns is not None:
         t.episode_returns = episode_returns
     if current_episode_return is not None:

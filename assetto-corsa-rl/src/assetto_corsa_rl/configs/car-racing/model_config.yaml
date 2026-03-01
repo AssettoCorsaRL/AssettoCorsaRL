@@ -13,8 +13,6 @@ model:
   batch_size: 512
   replay_size: 1_000_000
 
-  update_every: 32
-
   load_initial: true
 
   use_noisy: false

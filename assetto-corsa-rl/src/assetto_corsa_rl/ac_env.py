@@ -29,9 +29,9 @@ class AssettoCorsa(gym.Env):
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
-        constant_reward_per_ms: float = -0.01,
+        constant_reward_per_ms: float = 0,
         reward_per_m_advanced_along_centerline: float = 1.0,
-        final_speed_reward_per_m_per_s: float = 0.1,
+        final_speed_reward_per_m_per_s: float = 0.05,
         ms_per_action: float = 20.0,
         include_image: bool = False,
         use_ac_ai_racer: bool = True,
@@ -451,43 +451,25 @@ class AssettoCorsa(gym.Env):
 
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
     #! UNTESTED WITH PRETRAINED AGENTS
-    def _calculate_reward(self, obs: np.ndarray, data: Optional[Dict]) -> float:
-        """Calculate reward based on observation and telemetry.
-
-        reward = constant_reward_per_ms * ms_per_action
-               + (meters_advanced[i] - meters_advanced[i-1]) * reward_per_m_advanced_along_centerline
-               + final_speed_reward_per_m_per_s * (|v_i| - |v_{i-1}|) if moving forward
-        """
-
-        reward = 0.0
-
-        reward += self.constant_reward_per_ms * self.ms_per_action
-
-        position = np.array(
-            [
-                data["car"]["world_location"][0],
-                data["car"]["world_location"][1],
-                data["car"]["world_location"][2],
-            ]
-        )
-
+    def _calculate_reward(self, obs, data):
+        position = np.array(data["car"]["world_location"][:3])
         current_meters = self._calculate_meters_advanced(position)
         meters_progress = current_meters - self._meters_advanced
-
-        reward += meters_progress * self.reward_per_m_advanced_along_centerline
-
         self._meters_advanced = current_meters
 
         velocity = data.get("car", {}).get("velocity", [0, 0, 0])
-        current_speed = np.linalg.norm(
-            velocity
-        )  # hacky fix until i do unit conversions which i dont wanna do so
+        speed = np.linalg.norm(velocity)  # m/s
 
-        speed_change = current_speed - self._last_speed
-        reward += self.final_speed_reward_per_m_per_s * speed_change
+        off_track = float(data.get("car", {}).get("tyres_off_track", 0))
+        damage = sum(data["car"].get("damage", [0]))
 
-        self._last_speed = current_speed
-
+        reward = (
+            meters_progress * 1.0  # progress along racing line
+            + speed * 0.01  # bonus for going fast (always positive signal)
+            - off_track * 0.5  # penalty for being off track
+            - (1.0 if damage > 0 else 0.0)  # terminal penalty for damage
+        )
+        self._last_speed = speed
         return reward
 
     def _check_done(self, obs: np.ndarray, data: Optional[Dict]) -> bool:
