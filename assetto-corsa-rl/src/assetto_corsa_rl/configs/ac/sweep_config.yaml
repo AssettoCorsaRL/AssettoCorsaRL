@@ -1,0 +1,56 @@
+# WandB Sweep configuration for SAC hyperparameter search.
+# Run with:  acrl ac sweep
+# To join an existing sweep from a second machine:
+#   set WANDB_SWEEP_ID=<id> && acrl ac sweep
+
+program: acrl
+method: bayes # bayes | grid | random
+
+metric:
+  name: reward/rewards_per_environment_mean
+  goal: maximize
+
+parameters:
+  actor_lr:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1e-3
+
+  critic_lr:
+    distribution: log_uniform_values
+    min: 1.0e-5
+    max: 1.0e-3
+
+  alpha:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.5
+
+  tau:
+    distribution: uniform
+    min: 0.005
+    max: 0.05
+
+  gamma:
+    distribution: uniform
+    min: 0.97
+    max: 0.999
+
+  batch_size:
+    values: [128, 256, 512]
+
+  updates_per_step:
+    values: [2, 4, 8]
+
+  actor_update_delay:
+    values: [1, 2]
+
+  noise_sigma:
+    distribution: uniform
+    min: 0.2
+    max: 0.6
+
+early_terminate:
+  type: hyperband
+  min_iter: 25000
+  eta: 2

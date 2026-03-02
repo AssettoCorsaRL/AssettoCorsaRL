@@ -15,6 +15,90 @@ from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from .noisy import NoisyLazyLinear
 
 
+class BoundedNormalParams(nn.Module):
+    def __init__(self, min_scale, max_scale):
+        super().__init__()
+        self.register_buffer("min_scale", min_scale)
+        self.register_buffer("max_scale", max_scale)
+        self.register_buffer("scale_range", max_scale - min_scale)
+
+    def forward(self, x):
+        loc, scale_raw = x.chunk(2, dim=-1)
+        scale = self.min_scale + torch.sigmoid(scale_raw) * self.scale_range
+        return {"loc": loc, "scale": scale}
+
+
+class ActorNet(nn.Module):
+    def __init__(
+        self,
+        cnn,
+        fusion_size,
+        num_cells,
+        action_dim,
+        dropout,
+        use_noisy,
+        noise_sigma,
+        device,
+        obs_dim,
+        min_scale,
+        max_scale,
+    ):
+        super().__init__()
+        self.cnn = cnn
+        self.obs_dim = obs_dim
+
+        def make_lin(i, o):
+            if use_noisy:
+                return NoisyLazyLinear(o, sigma=noise_sigma, device=device)
+            return nn.Linear(i, o, device=device)
+
+        self.mlp = nn.Sequential(
+            make_lin(fusion_size, num_cells),
+            nn.Tanh(),
+            nn.Dropout(p=dropout),
+            make_lin(num_cells, num_cells),
+            nn.Tanh(),
+            nn.Dropout(p=dropout),
+            make_lin(num_cells, 2 * action_dim),
+            BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
+        )
+
+    def forward(self, pixels, vector=None):
+        img_feat = self.cnn(pixels)
+        if vector is not None and self.obs_dim > 0:
+            x = torch.cat([img_feat, vector], dim=-1)
+        else:
+            x = img_feat
+        return self.mlp(x)
+
+
+class CriticNet(nn.Module):
+    def __init__(self, encoder, critic_input_size, hidden, device, obs_dim):
+        super().__init__()
+        self.cnn = encoder
+        self.obs_dim = obs_dim
+        # LayerNorm after each hidden layer dramatically improves sample
+        # efficiency at high UTD ratios by stabilising Q-value estimates.
+        self.fc = nn.Sequential(
+            nn.Linear(critic_input_size, hidden, device=device),
+            nn.LayerNorm(hidden, device=device),
+            nn.Tanh(),
+            nn.Linear(hidden, hidden, device=device),
+            nn.LayerNorm(hidden, device=device),
+            nn.Tanh(),
+            nn.Linear(hidden, 1, device=device),
+        )
+
+    def forward(self, pixels, action, vector=None):
+        img_features = self.cnn(pixels)
+        act = action.flatten(start_dim=1)
+        parts = [img_features, act]
+        if vector is not None and self.obs_dim > 0:
+            parts.append(vector)
+        x = torch.cat(parts, dim=-1)
+        return self.fc(x)
+
+
 def get_device():
     """Determine the appropriate device for training"""
     is_fork = multiprocessing.get_start_method() == "fork"
@@ -56,6 +140,15 @@ class SACPolicy:
         self.use_noisy = use_noisy
         self.noise_sigma = noise_sigma
         self.actor_dropout = float(actor_dropout)
+
+        # Auto-detect obs_dim from env if not explicitly provided
+        if obs_dim == 0:
+            try:
+                spec = env.observation_spec
+                if "vector" in spec.keys():
+                    obs_dim = int(spec["vector"].shape[-1])
+            except Exception:
+                pass
         self.obs_dim = obs_dim
 
         action_dim = int(env.action_spec.shape[-1])
@@ -89,70 +182,12 @@ class SACPolicy:
         self.shared_cnn = shared_cnn
         self.target_cnn = target_cnn
 
-        # ── Helpers ───────────────────────────────────────────────────────
-        class BoundedNormalParams(nn.Module):
-            def __init__(self, min_scale, max_scale):
-                super().__init__()
-                self.register_buffer("min_scale", min_scale)
-                self.register_buffer("max_scale", max_scale)
-                self.register_buffer("scale_range", max_scale - min_scale)
-
-            def forward(self, x):
-                loc, scale_raw = x.chunk(2, dim=-1)
-                scale = self.min_scale + torch.sigmoid(scale_raw) * self.scale_range
-                return {"loc": loc, "scale": scale}
-
-        def _make_linear(in_f: int, out_f: int):
-            if self.use_noisy:
-                return NoisyLazyLinear(out_f, sigma=self.noise_sigma, device=device)
-            return nn.Linear(in_f, out_f, device=device)
-
         min_scale = torch.tensor([0.1, 0.1, 0.1], device=device)
         max_scale = torch.tensor([1.0, 1.0, 1.0], device=device)
 
         # ── Actor ─────────────────────────────────────────────────────────
         # Fuses CNN features with optional telemetry vector
         fusion_input_size = cnn_output_size + obs_dim
-
-        class ActorNet(nn.Module):
-            def __init__(
-                self,
-                cnn,
-                fusion_size,
-                num_cells,
-                action_dim,
-                dropout,
-                use_noisy,
-                noise_sigma,
-                device,
-            ):
-                super().__init__()
-                self.cnn = cnn
-                self.obs_dim = obs_dim
-
-                def make_lin(i, o):
-                    if use_noisy:
-                        return NoisyLazyLinear(o, sigma=noise_sigma, device=device)
-                    return nn.Linear(i, o, device=device)
-
-                self.mlp = nn.Sequential(
-                    make_lin(fusion_size, num_cells),
-                    nn.Tanh(),
-                    nn.Dropout(p=dropout),
-                    make_lin(num_cells, num_cells),
-                    nn.Tanh(),
-                    nn.Dropout(p=dropout),
-                    make_lin(num_cells, 2 * action_dim),
-                    BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
-                )
-
-            def forward(self, pixels, vector=None):
-                img_feat = self.cnn(pixels)
-                if vector is not None and self.obs_dim > 0:
-                    x = torch.cat([img_feat, vector], dim=-1)
-                else:
-                    x = img_feat
-                return self.mlp(x)
 
         actor_net = ActorNet(
             shared_cnn,
@@ -163,6 +198,9 @@ class SACPolicy:
             self.use_noisy,
             self.noise_sigma,
             device,
+            obs_dim,
+            min_scale,
+            max_scale,
         )
 
         if obs_dim > 0:
@@ -214,32 +252,10 @@ class SACPolicy:
         # Targets use a frozen deepcopy updated via polyak in the trainer.
         critic_input_size = cnn_output_size + action_dim + obs_dim
 
-        class CriticNet(nn.Module):
-            def __init__(self, encoder, hidden, device, obs_dim):
-                super().__init__()
-                self.cnn = encoder
-                self.obs_dim = obs_dim
-                self.fc = nn.Sequential(
-                    nn.Linear(critic_input_size, hidden, device=device),
-                    nn.Tanh(),
-                    nn.Linear(hidden, hidden, device=device),
-                    nn.Tanh(),
-                    nn.Linear(hidden, 1, device=device),
-                )
-
-            def forward(self, pixels, action, vector=None):
-                img_features = self.cnn(pixels)
-                act = action.flatten(start_dim=1)
-                parts = [img_features, act]
-                if vector is not None and self.obs_dim > 0:
-                    parts.append(vector)
-                x = torch.cat(parts, dim=-1)
-                return self.fc(x)
-
-        q1_net = CriticNet(shared_cnn, num_cells, device, obs_dim)
-        q2_net = CriticNet(shared_cnn, num_cells, device, obs_dim)
-        q1_net_target = CriticNet(target_cnn, num_cells, device, obs_dim)
-        q2_net_target = CriticNet(target_cnn, num_cells, device, obs_dim)
+        q1_net = CriticNet(shared_cnn, critic_input_size, num_cells, device, obs_dim)
+        q2_net = CriticNet(shared_cnn, critic_input_size, num_cells, device, obs_dim)
+        q1_net_target = CriticNet(target_cnn, critic_input_size, num_cells, device, obs_dim)
+        q2_net_target = CriticNet(target_cnn, critic_input_size, num_cells, device, obs_dim)
 
         # Wrap in ValueOperator for state dict / parameter access,
         # but call via .module() directly in trainer to pass raw tensors

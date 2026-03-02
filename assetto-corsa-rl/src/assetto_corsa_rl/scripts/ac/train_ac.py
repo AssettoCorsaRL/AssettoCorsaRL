@@ -3,6 +3,7 @@
 import time
 import math
 import sys
+import yaml
 from pathlib import Path
 
 import torch
@@ -23,7 +24,7 @@ except Exception:
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
 
-from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage
+from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage, ListStorage
 
 try:
     from assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml
@@ -31,8 +32,8 @@ except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml  # type: ignore
 
 
-@cli_command(group="ac", name="train", help="Train SAC agent in Assetto Corsa")
-def train():
+def _do_train():
+    """Core training loop – called by ``train`` and by ``wandb.agent`` during sweeps."""
     cfg = load_cfg_from_yaml()
     print(cfg)
 
@@ -50,11 +51,20 @@ def train():
         if getattr(cfg, "wandb_name", None):
             wandb_kwargs["name"] = cfg.wandb_name
         wandb_run = wandb.init(**wandb_kwargs)
+        # ── Sweep override ────────────────────────────────────────────────
+        # wandb.agent injects swept hyper-parameters via wandb.config.
+        # Write them back to cfg so the rest of the code picks them up
+        # automatically (optimizers, replay buffer, etc. are built later).
+        if wandb.run is not None:
+            for k, v in dict(wandb.config).items():
+                if hasattr(cfg, k) and not k.startswith("_"):
+                    setattr(cfg, k, v)
+                    print(f"  [sweep] cfg.{k} = {v}")
         print("WandB initialized:", getattr(wandb.run, "name", None))
     except Exception as e:
         print("Warning: WandB init failed, continuing without logging:", e)
 
-    env = create_transformed_env(
+    env_kwargs = dict(
         racing_line_path=getattr(cfg, "racing_line_path", "racing_lines.json"),
         device=device,
         image_shape=(84, 84),
@@ -62,6 +72,7 @@ def train():
         input_config=getattr(cfg, "input_config", None),
         use_ac_ai_racer=False,
     )
+    env = create_transformed_env(**env_kwargs)
     current_td = env.reset()
 
     print(f"Initial pixels shape: {current_td.get('pixels').shape}")
@@ -79,7 +90,11 @@ def train():
 
     with torch.no_grad():
         dummy_pixels = current_td.get("pixels").unsqueeze(0).to(device)
-        init_td = TensorDict({"pixels": dummy_pixels}, batch_size=[1])
+        init_data = {"pixels": dummy_pixels}
+        dummy_vector = current_td.get("vector", None)
+        if dummy_vector is not None:
+            init_data["vector"] = dummy_vector.unsqueeze(0).to(device)
+        init_td = TensorDict(init_data, batch_size=[1])
         modules["actor"](init_td.clone())
 
     if cfg.use_noisy:
@@ -180,8 +195,8 @@ def train():
     target_entropy = -float(env.action_spec.shape[-1])
     print(f"Target entropy: {target_entropy}")
 
-    print("using PrioritizedReplayBuffer with LazyTensorStorage")
-    storage = LazyTensorStorage(max_size=cfg.replay_size, device="cpu")
+    print("using PrioritizedReplayBuffer with ListStorage (picklable for async)")
+    storage = ListStorage(max_size=cfg.replay_size)
     rb = PrioritizedReplayBuffer(
         alpha=cfg.per_alpha,
         beta=cfg.per_beta,
@@ -250,10 +265,67 @@ def train():
         total_steps=total_steps,
         episode_returns=episode_returns,
         current_episode_return=current_episode_return,
+        env_kwargs=env_kwargs,
     )
 
     wandb.finish()
     print("WandB finished")
+
+
+@cli_command(group="ac", name="train", help="Train SAC agent in Assetto Corsa")
+def train():
+    """Train SAC agent in Assetto Corsa."""
+    _do_train()
+
+
+@cli_command(group="ac", name="sweep", help="Run a WandB hyperparameter sweep")
+def sweep():
+    """Create a WandB sweep and run the agent for *sweep_count* trials.
+
+    Set the WANDB_SWEEP_ID env-var to join an existing sweep instead of
+    creating a new one.  Set sweep_count in train_config.yaml to control
+    how many trials this agent runs.
+    """
+    import os
+
+    cfg = load_cfg_from_yaml()
+    sweep_count = int(getattr(cfg, "sweep_count", 20))
+
+    # Locate sweep_config.yaml next to the other ac configs.
+    try:
+        from importlib.resources import files
+
+        sweep_cfg_path = Path(files("assetto_corsa_rl")) / "configs" / "ac" / "sweep_config.yaml"
+    except Exception:
+        sweep_cfg_path = (
+            Path(__file__).resolve().parents[4] / "configs" / "ac" / "sweep_config.yaml"
+        )
+
+    with open(sweep_cfg_path, "r") as f:
+        sweep_config = yaml.safe_load(f)
+
+    project = getattr(cfg, "wandb_project", "AssetoCorsaRL-AssettoCorsa")
+    entity = getattr(cfg, "wandb_entity", None)
+
+    # Join an existing sweep or create a new one.
+    sweep_id_env = os.environ.get("WANDB_SWEEP_ID")
+    if sweep_id_env:
+        sweep_id = sweep_id_env
+        print(f"Joining existing sweep: {sweep_id}")
+    else:
+        init_kwargs = {"project": project}
+        if entity:
+            init_kwargs["entity"] = entity
+        sweep_id = wandb.sweep(sweep_config, **init_kwargs)
+        print(f"Created sweep: {sweep_id}")
+
+    print(f"Running {sweep_count} trial(s) via wandb.agent …")
+    wandb.agent(
+        sweep_id,
+        function=_do_train,
+        count=sweep_count,
+        project=project,
+    )
 
 
 if __name__ == "__main__":

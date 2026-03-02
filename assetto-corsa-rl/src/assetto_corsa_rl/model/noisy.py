@@ -7,6 +7,7 @@
 
 
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -270,15 +271,15 @@ class NoisyLazyLinear(nn.Module):
             raise ValueError("sigma must be non-negative")
         self.out_features = out_features
         self.sigma = sigma
-        self.device = device
-        self._layer = None
+        self._device = device
+        self._layer: Optional[FactorisedNoisyLayer] = None
 
     def forward(self, x: torch.Tensor):
         # lazily create the underlying noisy layer using the observed input size
         if self._layer is None:
             in_features = x.shape[-1]
             self._layer = FactorisedNoisyLayer(in_features, self.out_features, sigma=self.sigma).to(
-                self.device if self.device is not None else x.device
+                self._device if self._device is not None else x.device
             )
         return self._layer(x)
 

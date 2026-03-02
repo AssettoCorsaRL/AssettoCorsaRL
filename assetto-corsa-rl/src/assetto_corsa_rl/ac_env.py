@@ -32,7 +32,6 @@ class AssettoCorsa(gym.Env):
         constant_reward_per_ms: float = 0,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.05,
-        ms_per_action: float = 20.0,
         include_image: bool = False,
         use_ac_ai_racer: bool = True,
         observation_image_shape: Tuple[int, int] = (84, 84),
@@ -49,7 +48,6 @@ class AssettoCorsa(gym.Env):
         self.constant_reward_per_ms = constant_reward_per_ms
         self.reward_per_m_advanced_along_centerline = reward_per_m_advanced_along_centerline
         self.final_speed_reward_per_m_per_s = final_speed_reward_per_m_per_s
-        self.ms_per_action = ms_per_action
 
         self.racing_line = None
         self.racing_line_positions = None
@@ -452,6 +450,8 @@ class AssettoCorsa(gym.Env):
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
     #! UNTESTED WITH PRETRAINED AGENTS
     def _calculate_reward(self, obs, data):
+        if data is None or data.get("car") is None or data["car"].get("world_location") is None:
+            return 0.0
         position = np.array(data["car"]["world_location"][:3])
         current_meters = self._calculate_meters_advanced(position)
         meters_progress = current_meters - self._meters_advanced
@@ -475,6 +475,9 @@ class AssettoCorsa(gym.Env):
     def _check_done(self, obs: np.ndarray, data: Optional[Dict]) -> bool:
         if self._episode_step >= self.max_episode_steps:
             return True
+
+        if data is None or data.get("car") is None or data.get("lap") is None:
+            return False
 
         if data["lap"]["get_lap_count"] == 2:
             return True

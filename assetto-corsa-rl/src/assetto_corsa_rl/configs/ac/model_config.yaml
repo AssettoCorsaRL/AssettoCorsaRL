@@ -3,26 +3,26 @@ model:
   lr: 3e-4
   actor_lr: 1e-4
   critic_lr: 3e-4
-  max_grad_norm: 1.0
+  max_grad_norm: 10.0
 
-  bc_pretrained_model: "D:/acrl/AssetoCorsaRL/models/bc_sac_pretrained.pt" # path to BC actor (pretrain_bc.py)
+  bc_pretrained_model: null
   vae_checkpoint_path: "D:/acrl/AssetoCorsaRL/models/loss=0.1050.ckpt" #* IMPORTANT: Path to pretrained encoder to load for VAE training
   replay_buffer_path: null
 
   gamma: 0.99
   tau: 0.01
 
-  alpha: 0.5
+  alpha: 0.2
   alpha_lr: 3e-4
-  alpha_min: 0.1
+  alpha_min: 0.0001
 
-  batch_size: 128
-  replay_size: 1_000_000
+  batch_size: 256
+  replay_size: 1_000_000 # smaller buffer = higher fraction of recent data
 
-  updates_per_step: 1 #TODO: support float values for ts
+  updates_per_step: 2
   actor_update_delay: 2
 
-  freeze_encoder_steps: 50000
+  freeze_encoder_steps: 100_000_000 # "never" unfreeze it
 
   load_initial: true
 
@@ -30,10 +30,32 @@ model:
   per_beta: 0.4
 
   #* noisy - IGNORE IF use_noisy=false
-  use_noisy: false
-  noise_sigma: 0.5
+  use_noisy: true
+  noise_sigma: 0.3
 
   #* exploration - IGNORE IF use_noisy=true
-  explore_start: 0.3 # 0.3 if starting with BC agent, else 1.0
+  explore_start: 1
   explore_end: 0.03
-  explore_steps: 500_000
+  explore_steps: 50_000
+
+  min_q_target: -50
+  max_q_target: 50
+
+  # How many times a single transition may be sampled before its PER priority
+  # is zeroed so it can never be drawn again (it will be overwritten by new data).
+  number_times_single_memory_is_used_before_discard: 32
+
+  # JIT-compile actor / critic network forward passes with torch.compile.
+  # Requires PyTorch >= 2.0.  Set to false if you hit compatibility issues.
+  compile_models: false
+  compile_mode: "reduce-overhead" # options: default | reduce-overhead | max-autotune
+
+  # ── Learning rate schedulers ──────────────────────────────────────────────
+  # lr_scheduler: cosine | linear | none
+  #   cosine  – CosineAnnealingLR from initial LR down to (initial * lr_min_factor)
+  #   linear  – LinearLR from initial LR down to (initial * lr_min_factor)
+  #   none    – constant LR (scheduler disabled)
+  # lr_warmup_steps is applied *before* the main schedule (linear ramp-up).
+  lr_scheduler: "linear"
+  lr_warmup_steps: 0 # gradient-update steps of linear warmup (0 to disable)
+  lr_min_factor: 0.05 # minimum LR = initial_lr * lr_min_factor

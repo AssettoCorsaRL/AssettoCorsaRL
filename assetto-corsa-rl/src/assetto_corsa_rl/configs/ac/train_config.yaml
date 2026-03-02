@@ -1,7 +1,7 @@
 train:
-  total_steps: 10_000_000
+  total_steps: 1_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
-  save_interval: 250_000 # how often (in steps) to save model checkpoints
+  save_interval: 50_000 # how often (in steps) to save model checkpoints
   save_interval_replaybuffer: 1_000_000 # how often (in steps) to save the replay buffer
 
   min_free_space_gb: 30 # minimum free disk space to maintain (in GB)
@@ -16,3 +16,12 @@ train:
     name: null
 
   checkpoint_dir: "models"
+
+  use_async: true # set to true to run collector + learner as separate processes (torch.multiprocessing)
+  queue_size: 65536 # max transitions in the inter-process queue before back-pressure kicks in
+  sync_every: 200 # collector syncs actor weights from shared memory every N steps
+
+  # ── wandb sweep ────────────────────────────────────────────────────────────
+  # Number of trials this agent will run when calling `acrl ac sweep`.
+  # Set WANDB_SWEEP_ID env-var to join an existing sweep instead of creating one.
+  sweep_count: 20
