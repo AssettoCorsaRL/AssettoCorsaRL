@@ -111,6 +111,65 @@ def add_transition(rb, i, pixels, next_pixels, action, reward, done, vector=None
     rb.add(transition)
 
 
+def activate_ac_window(retries: int = 10, retry_delay: float = 2.0) -> bool:
+    """Find the Assetto Corsa window and bring it to the foreground.
+
+    Retries up to *retries* times, waiting *retry_delay* seconds between
+    attempts, to give the process time to create its window after launch.
+    Returns True if the window was found and activated, False otherwise.
+    """
+    import time as _time
+
+    try:
+        import win32gui
+        import win32con
+        import win32api
+        import win32process
+    except ImportError:
+        print("[game] pywin32 not available – skipping window activation.")
+        return False
+
+    def _find():
+        found = []
+
+        def _cb(hwnd, _):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd)
+                if "Assetto Corsa" in title or "acs" in title.lower():
+                    found.append(hwnd)
+            return True
+
+        win32gui.EnumWindows(_cb, None)
+        return found[0] if found else None
+
+    for attempt in range(retries):
+        hwnd = _find()
+        if hwnd:
+            try:
+                win32process.AttachThreadInput(
+                    win32api.GetCurrentThreadId(),
+                    win32process.GetWindowThreadProcessId(hwnd)[0],
+                    True,
+                )
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                win32gui.BringWindowToTop(hwnd)
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                print("[game] Assetto Corsa window activated.")
+                return True
+            except Exception as e:
+                print(f"[game] Window activation error: {e}")
+                return False
+        if attempt < retries - 1:
+            print(f"[game] Waiting for AC window (attempt {attempt + 1}/{retries})...")
+            _time.sleep(retry_delay)
+
+    print("[game] Warning: Could not find Assetto Corsa window to activate.")
+    return False
+
+
 def fix_action_shape(a, batch_size, action_dim=None):
     if not isinstance(a, torch.Tensor):
         return a

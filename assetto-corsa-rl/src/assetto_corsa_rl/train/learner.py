@@ -11,6 +11,7 @@ from tensordict import TensorDict
 import wandb
 
 from .train_utils import fix_action_shape, unpack_pixels
+from .logging_utils import log_info, log_success, log_warning, log_error, log_metric
 
 
 class LearnerWorker:
@@ -73,25 +74,23 @@ class LearnerWorker:
         self._updates_count = 0
         self._updates_per_step = int(getattr(cfg, "updates_per_step", 1))
         self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
+
+        self._cumul_used: int = int(getattr(cfg, "cumul_memories_used", 0))
+        self._cumul_should: int = int(getattr(cfg, "cumul_memories_should_have_been_used", 0))
         self._freeze_encoder_steps = getattr(cfg, "freeze_encoder_steps", 0)
         self._encoder_frozen = False
         self._last_epsilon = 0.0  # updated from collector meta messages
 
-        # Fixed-size numpy array so:
-        #   1. Index access is O(1) with no hash overhead
-        #   2. Expired slots are reset to 0, so ListStorage slot reuse starts
-        #      fresh (prevents stale counts from killing newly-added transitions)
         _rb_max = int(getattr(cfg, "replay_size", 1_000_000))
         self._sample_counts = np.zeros(_rb_max, dtype=np.int32)
         self._max_uses: int = int(
             getattr(cfg, "number_times_single_memory_is_used_before_discard", 32)
         )
         self._last_expired_count: int = 0
-        # Log to wandb/queue every N gradient updates (not every single step)
         self._log_update_every: int = int(getattr(cfg, "log_update_every", 100))
 
         if getattr(cfg, "compile_models", False):
-            print("[compile] Applying torch.compile to actor / critic networks...")
+            log_info("Applying torch.compile to actor / critic networks...")
             try:
                 _mode = str(getattr(cfg, "compile_mode", "reduce-overhead"))
                 actor.module.module = torch.compile(actor.module.module, mode=_mode)
@@ -99,12 +98,10 @@ class LearnerWorker:
                 q2.module = torch.compile(q2.module, mode=_mode)
                 q1_target.module = torch.compile(q1_target.module, mode=_mode)
                 q2_target.module = torch.compile(q2_target.module, mode=_mode)
-                print(f"[compile] Done (mode={_mode}).")
+                log_success(f"torch.compile applied (mode={_mode})")
             except Exception as _ce:
-                print(f"[compile] torch.compile failed (continuing without it): {_ce}")
+                log_warning(f"torch.compile failed (continuing without it): {_ce}")
 
-        # ── LR schedulers ─────────────────────────────────────────────────────
-        # Total gradient updates over the whole run (used as T_max / total_iters).
         _total_updates = max(
             1,
             int(getattr(cfg, "total_steps", 1_000_000)) * int(getattr(cfg, "updates_per_step", 1)),
@@ -113,14 +110,27 @@ class LearnerWorker:
         self.critic_scheduler = self._build_scheduler(self.critic_opt, _total_updates)
 
     def run(self):
-        """Run until ``stop_event`` is set (multi-process usage)."""
+        """Run until ``stop_event`` is set (multi-process usage).
+
+        The learner trains the GPU continuously whenever the replay buffer has
+        enough data.  No pacing gate — the GPU should be saturated at all times.
+        """
+        _weight_push_every = max(1, self._updates_per_step)
         while self.stop_event is None or not self.stop_event.is_set():
             n = self._drain_transitions()
             self.total_steps += n
-            if len(self.rb) >= self.cfg.batch_size and n > 0:
+
+            trained_this_iter = False
+            start_steps = int(getattr(self.cfg, "start_steps", 0))
+            if self.total_steps >= start_steps and len(self.rb) >= self.cfg.batch_size:
                 for _ in range(self._updates_per_step):
                     self._do_update()
-                self._push_weights()
+                if self._updates_count % _weight_push_every == 0:
+                    self._push_weights()
+                trained_this_iter = True
+
+            if not trained_this_iter and n == 0:
+                time.sleep(0.001)
             self._maybe_log_and_save(epsilon=self._last_epsilon)
 
     def _set_encoder_requires_grad(self, requires_grad: bool):
@@ -148,7 +158,6 @@ class LearnerWorker:
             if isinstance(item, dict) and item.get("_meta"):
                 if "episode_return" in item:
                     self.episode_returns.append(float(item["episode_return"]))
-                    # Prevent unbounded growth — keep only the most recent 10 000 episodes
                     if len(self.episode_returns) > 10_000:
                         del self.episode_returns[:1_000]
                 if "epsilon" in item:
@@ -218,7 +227,6 @@ class LearnerWorker:
 
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
 
-        # Extract optional telemetry vectors from the batch
         vector_b = batch["vector"].to(self.device) if "vector" in batch.keys() else None
         next_vector_b = (
             batch["next_vector"].to(self.device) if "next_vector" in batch.keys() else None
@@ -262,14 +270,10 @@ class LearnerWorker:
             if batch_indices is not None:
                 indices_arr = batch_indices.flatten().cpu().numpy()
                 new_priorities = td_errors.cpu().numpy().copy()
-                # Vectorised update — O(batch) instead of O(batch) Python loop
                 self._sample_counts[indices_arr] += 1
                 expired_mask = self._sample_counts[indices_arr] >= self._max_uses
-                new_priorities[expired_mask] = 1e-8  # expired: never sample again
-                # Reset counters so that when ListStorage REUSES a slot the new
-                # transition starts with count=0 instead of inheriting stale count
-                self._sample_counts[indices_arr[expired_mask]] = 0
                 _expired = int(expired_mask.sum())
+                self._sample_counts[indices_arr[expired_mask]] = 0
                 self.rb.update_priority(batch_indices, new_priorities)
                 self._last_expired_count = _expired
 
@@ -370,7 +374,6 @@ class LearnerWorker:
 
         self._soft_update_target()
 
-        # ── Step LR schedulers ────────────────────────────────────────────────
         if self.actor_scheduler is not None:
             self.actor_scheduler.step()
         if self.critic_scheduler is not None:
@@ -415,6 +418,9 @@ class LearnerWorker:
                 "per/beta": beta,
                 "buffer/expired_this_batch": self._last_expired_count,
                 "buffer/expired_fraction": self._last_expired_count / max(1, self.cfg.batch_size),
+                "pacing/cumul_memories_used": self._cumul_used,
+                "pacing/cumul_memories_should_have_been_used": self._cumul_should,
+                "pacing/pacing_lag": max(0, self._cumul_should - self._cumul_used),
                 "lr/actor_lr": self.actor_opt.param_groups[0]["lr"],
                 "lr/critic_lr": self.critic_opt.param_groups[0]["lr"],
             }
@@ -500,13 +506,13 @@ class LearnerWorker:
             combined = torch.optim.lr_scheduler.SequentialLR(
                 opt, schedulers=[warmup_sched, main_sched], milestones=[warmup]
             )
-            print(
-                f"[scheduler] {sched_type} (warmup={warmup} steps, "
-                f"T={main_steps}, lr {initial_lr:.2e} → {eta_min:.2e})"
+            log_info(
+                f"{sched_type} scheduler with warmup={warmup} steps, "
+                f"T={main_steps}, lr {initial_lr:.2e} → {eta_min:.2e}"
             )
             return combined
 
-        print(f"[scheduler] {sched_type} " f"(T={main_steps}, lr {initial_lr:.2e} → {eta_min:.2e})")
+        log_info(f"{sched_type} scheduler: T={main_steps}, lr {initial_lr:.2e} → {eta_min:.2e}")
         return main_sched
 
     # === periodic logging & checkpointing ================================================â”€
@@ -558,11 +564,9 @@ class LearnerWorker:
                 },
             }
 
-            # Always save sac_last.pt
             torch.save(ckpt, save_dir / "sac_last.pt")
             print(f"Saved sac_last.pt at step {self.total_steps} (avg_return={avg_return:.4f})")
 
-            # Save sac_best.pt if this is a new best
             if avg_return > self._best_avg_return:
                 self._best_avg_return = avg_return
                 torch.save(ckpt, save_dir / "sac_best.pt")

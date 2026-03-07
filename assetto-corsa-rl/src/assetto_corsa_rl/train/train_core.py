@@ -8,6 +8,7 @@ import torch
 
 from .collector import CollectorWorker
 from .learner import LearnerWorker
+from .logging_utils import log_info, log_success, log_warning, log_error
 
 
 # ── subprocess entry-points ────────────────────────────────────────────────────
@@ -71,9 +72,9 @@ def _learner_process_fn(
     start_time,
 ):
     """Entry-point for the learner subprocess."""
-    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
+    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage
 
-    storage = ListStorage(max_size=rb_kwargs["max_size"])
+    storage = LazyTensorStorage(max_size=rb_kwargs["max_size"])
     rb = PrioritizedReplayBuffer(
         alpha=rb_kwargs["alpha"],
         beta=rb_kwargs["beta"],
@@ -244,8 +245,6 @@ class Trainer:
         """Spawn collector and learner as separate processes using
         torch.multiprocessing for asynchronous, decoupled training."""
 
-        # Share actor weights via shared memory so the learner can push
-        # updated weights to the collector without serialising through a queue.
         actor_state = {
             k: v.cpu().clone().share_memory_() for k, v in self.learner.actor.state_dict().items()
         }
@@ -253,14 +252,12 @@ class Trainer:
         weights_lock = mp.Lock()
         weights_version = mp.Value("i", 0)
 
-        # Transitions flow collector → learner; logs flow learner → main process.
         queue_size = int(getattr(self.cfg, "queue_size", 65536))
         transitions_queue = mp.Queue(maxsize=queue_size)
-        log_queue = mp.Queue()
+        log_queue = mp.Queue(maxsize=10_000)
 
         stop_event = mp.Event()
 
-        # Deep-copy models so each process owns independent parameter storage.
         actor_for_learner = copy.deepcopy(self.learner.actor).cpu()
         actor_for_collector = copy.deepcopy(self.learner.actor).cpu()
         q1_mp = copy.deepcopy(self.learner.q1).cpu()
@@ -268,8 +265,6 @@ class Trainer:
         q1_target_mp = copy.deepcopy(self.learner.q1_target).cpu()
         q2_target_mp = copy.deepcopy(self.learner.q2_target).cpu()
 
-        # Close the main-process env to release the UDP port so the
-        # collector subprocess can bind to it when it creates its own env.
         if hasattr(self.env, "close"):
             try:
                 self.env.close()
@@ -294,8 +289,6 @@ class Trainer:
             name="CollectorWorker",
         )
 
-        # Pass lightweight kwargs so the learner can recreate its own
-        # replay buffer inside the subprocess (torchrl storages block pickle).
         rb_kwargs = dict(
             max_size=int(self.cfg.replay_size),
             alpha=float(self.cfg.per_alpha),
@@ -333,9 +326,9 @@ class Trainer:
             name="LearnerWorker",
         )
 
-        print("Starting CollectorWorker process...")
+        log_info("Starting CollectorWorker process...")
         collector_proc.start()
-        print("Starting LearnerWorker process...")
+        log_info("Starting LearnerWorker process...")
         learner_proc.start()
 
         # Main process: drain log_queue and forward to wandb so the learner
@@ -349,18 +342,18 @@ class Trainer:
             # final drain after learner exits
             _flush_log_queue(log_queue)
         except KeyboardInterrupt:
-            print("KeyboardInterrupt — stopping workers...")
+            log_warning("KeyboardInterrupt — stopping workers...")
         finally:
             stop_event.set()
             collector_proc.join(timeout=10)
             learner_proc.join(timeout=30)
             if collector_proc.is_alive():
-                print("Warning: collector did not exit cleanly, terminating.")
+                log_warning("collector did not exit cleanly, terminating.")
                 collector_proc.terminate()
             if learner_proc.is_alive():
-                print("Warning: learner did not exit cleanly, terminating.")
+                log_warning("learner did not exit cleanly, terminating.")
                 learner_proc.terminate()
-            print("All worker processes stopped.")
+            log_success("All worker processes stopped.")
 
 
 def _flush_log_queue(log_queue: mp.Queue) -> None:

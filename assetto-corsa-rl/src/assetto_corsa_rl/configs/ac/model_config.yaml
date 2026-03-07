@@ -12,12 +12,12 @@ model:
   gamma: 0.99
   tau: 0.01
 
-  alpha: 0.2
+  alpha: 1.0
   alpha_lr: 3e-4
   alpha_min: 0.0001
 
-  batch_size: 256
-  replay_size: 1_000_000 # smaller buffer = higher fraction of recent data
+  batch_size: 512
+  replay_size: 200_000 # each transition ≈ 127 KB (2× uint8 84×84×9). 200k ≈ 25 GB.
 
   updates_per_step: 2
   actor_update_delay: 2
@@ -30,32 +30,26 @@ model:
   per_beta: 0.4
 
   #* noisy - IGNORE IF use_noisy=false
-  use_noisy: true
-  noise_sigma: 0.3
+  use_noisy: false
+  noise_sigma: 0.45
 
   #* exploration - IGNORE IF use_noisy=true
-  explore_start: 1
-  explore_end: 0.03
-  explore_steps: 50_000
+  explore_start: 0
+  explore_end: 0
+  explore_steps: 1
 
   min_q_target: -50
   max_q_target: 50
 
-  # How many times a single transition may be sampled before its PER priority
-  # is zeroed so it can never be drawn again (it will be overwritten by new data).
   number_times_single_memory_is_used_before_discard: 32
 
-  # JIT-compile actor / critic network forward passes with torch.compile.
-  # Requires PyTorch >= 2.0.  Set to false if you hit compatibility issues.
-  compile_models: false
-  compile_mode: "reduce-overhead" # options: default | reduce-overhead | max-autotune
+  cumul_memories_used: 0
+  cumul_memories_should_have_been_used: 0
+  max_pacing_lag_batches: 1000
 
-  # ── Learning rate schedulers ──────────────────────────────────────────────
-  # lr_scheduler: cosine | linear | none
-  #   cosine  – CosineAnnealingLR from initial LR down to (initial * lr_min_factor)
-  #   linear  – LinearLR from initial LR down to (initial * lr_min_factor)
-  #   none    – constant LR (scheduler disabled)
-  # lr_warmup_steps is applied *before* the main schedule (linear ramp-up).
-  lr_scheduler: "linear"
+  compile_models: false
+  compile_mode: "reduce-overhead" # default | reduce-overhead | max-autotune
+
+  lr_scheduler: "linear" # cosine | linear | none
   lr_warmup_steps: 0 # gradient-update steps of linear warmup (0 to disable)
   lr_min_factor: 0.05 # minimum LR = initial_lr * lr_min_factor

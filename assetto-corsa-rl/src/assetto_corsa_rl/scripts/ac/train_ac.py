@@ -15,6 +15,7 @@ try:
     from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
+    from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
@@ -23,6 +24,7 @@ except Exception:
     from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
+    from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
 
 from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage, ListStorage
 
@@ -34,12 +36,16 @@ except Exception:
 
 def _do_train():
     """Core training loop – called by ``train`` and by ``wandb.agent`` during sweeps."""
+    log_success("Loading configuration...", bold=True)
     cfg = load_cfg_from_yaml()
     print(cfg)
 
     torch.manual_seed(cfg.seed)
     device = get_device() if cfg.device is None else torch.device(cfg.device)
-    print("Using device:", device)
+    log_success(f"Device: {device}", bold=True)
+
+    if getattr(cfg, "normalize_observations", False):
+        log_success("Observation normalization enabled", bold=True)
 
     try:
         wandb_kwargs = {
@@ -59,10 +65,10 @@ def _do_train():
             for k, v in dict(wandb.config).items():
                 if hasattr(cfg, k) and not k.startswith("_"):
                     setattr(cfg, k, v)
-                    print(f"  [sweep] cfg.{k} = {v}")
-        print("WandB initialized:", getattr(wandb.run, "name", None))
+                    log_info(f"[sweep] cfg.{k} = {v}")
+        log_success(f"WandB initialized: {getattr(wandb.run, 'name', None)}")
     except Exception as e:
-        print("Warning: WandB init failed, continuing without logging:", e)
+        log_warning(f"WandB init failed, continuing without logging: {e}")
 
     env_kwargs = dict(
         racing_line_path=getattr(cfg, "racing_line_path", "racing_lines.json"),
@@ -71,11 +77,35 @@ def _do_train():
         frame_stack=3,
         input_config=getattr(cfg, "input_config", None),
         use_ac_ai_racer=False,
+        normalize_observations=getattr(cfg, "normalize_observations", False),
+        normalization_bounds=getattr(cfg, "normalization_bounds", None),
     )
+
+    input("press enter when ur sure the controller is connected n stuff")
+
+    import subprocess, time as _time  # noqa: E401
+
+    _proc_list = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq acs.exe"], capture_output=True, text=True
+    )
+    if "acs.exe" not in _proc_list.stdout.lower():
+        log_info("Launching Assetto Corsa...")
+        subprocess.Popen(
+            [r"D:\Steam\steamapps\common\assettocorsa\acs.exe"],
+            cwd=r"D:\Steam\steamapps\common\assettocorsa",
+        )
+        _time.sleep(10)
+        from assetto_corsa_rl.train.train_utils import activate_ac_window
+
+        activate_ac_window()
+        log_success("Assetto Corsa launched.")
+    else:
+        log_success("Assetto Corsa is already running.")
+
     env = create_transformed_env(**env_kwargs)
     current_td = env.reset()
 
-    print(f"Initial pixels shape: {current_td.get('pixels').shape}")
+    log_info(f"Initial pixels shape: {current_td.get('pixels').shape}")
 
     vae_path = getattr(cfg, "vae_checkpoint_path", None)
     agent = SACPolicy(
@@ -98,7 +128,7 @@ def _do_train():
         modules["actor"](init_td.clone())
 
     if cfg.use_noisy:
-        print(f"Using noisy networks for exploration (sigma={cfg.noise_sigma})")
+        log_info(f"Using noisy networks for exploration (sigma={cfg.noise_sigma})")
 
     actor = modules["actor"]
     q1 = modules["q1"]
@@ -108,7 +138,7 @@ def _do_train():
 
     pretrained_path = getattr(cfg, "pretrained_model", None)
     bc_pretrained_path = cfg.bc_pretrained_model
-    print(f"BC: {bc_pretrained_path}")
+    log_info(f"BC pretrained model: {bc_pretrained_path}")
 
     if pretrained_path:
         print(f"Loading pretrained model from {pretrained_path}...")
@@ -116,20 +146,20 @@ def _do_train():
             checkpoint = torch.load(pretrained_path, map_location=device)
             if "actor_state" in checkpoint:
                 actor.load_state_dict(checkpoint["actor_state"])
-                print("Loaded actor state")
+                log_success("Loaded actor state")
             if "q1_state" in checkpoint:
                 q1.load_state_dict(checkpoint["q1_state"])
-                print("Loaded Q1 state")
+                log_success("Loaded Q1 state")
             if "q2_state" in checkpoint:
                 q2.load_state_dict(checkpoint["q2_state"])
-                print("Loaded Q2 state")
+                log_success("Loaded Q2 state")
             q1_target.load_state_dict(q1.state_dict())
             q2_target.load_state_dict(q2.state_dict())
-            print("Copied states to target networks")
+            log_success("Copied states to target networks")
         except Exception as e:
-            print(f"Warning: Failed to load pretrained model: {e}")
+            log_warning(f"Failed to load pretrained model: {e}")
     elif bc_pretrained_path:
-        print(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
+        log_info(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
         checkpoint = torch.load(bc_pretrained_path, map_location=device)
 
         # check if BC model was trained with different noisy setting
@@ -137,11 +167,11 @@ def _do_train():
         current_use_noisy = cfg.use_noisy
 
         if bc_use_noisy != current_use_noisy:
-            print(
-                f"  Note: BC model was trained with use_noisy={bc_use_noisy}, "
+            log_warning(
+                f"BC model was trained with use_noisy={bc_use_noisy}, "
                 f"current model has use_noisy={current_use_noisy}"
             )
-            print("  Loading with strict=False to handle architecture mismatch...")
+            log_info("Loading with strict=False to handle architecture mismatch...")
             strict = False
         else:
             strict = True
@@ -160,29 +190,29 @@ def _do_train():
         if "q1_state" in checkpoint:
             try:
                 q1.load_state_dict(checkpoint["q1_state"], strict=strict)
-                print("✓ Loaded BC-SAC pretrained Q1")
+                log_success("Loaded BC-SAC pretrained Q1")
             except Exception as e:
-                print(f"  Warning: Partial Q1 load: {e}")
+                log_warning(f"Partial Q1 load: {e}")
         if "q2_state" in checkpoint:
             try:
                 q2.load_state_dict(checkpoint["q2_state"], strict=strict)
-                print("✓ Loaded BC-SAC pretrained Q2")
+                log_success("Loaded BC-SAC pretrained Q2")
             except Exception as e:
-                print(f"  Warning: Partial Q2 load: {e}")
+                log_warning(f"Partial Q2 load: {e}")
         if "q1_target_state" in checkpoint:
             try:
                 q1_target.load_state_dict(checkpoint["q1_target_state"], strict=strict)
-                print("✓ Loaded BC-SAC pretrained Q1 target")
+                log_success("Loaded BC-SAC pretrained Q1 target")
             except Exception as e:
-                print(f"  Warning: Partial Q1 target load: {e}")
+                log_warning(f"Partial Q1 target load: {e}")
         if "q2_target_state" in checkpoint:
             try:
                 q2_target.load_state_dict(checkpoint["q2_target_state"], strict=strict)
-                print("✓ Loaded BC-SAC pretrained Q2 target")
+                log_success("Loaded BC-SAC pretrained Q2 target")
             except Exception as e:
-                print(f"  Warning: Partial Q2 target load: {e}")
+                log_warning(f"Partial Q2 target load: {e}")
 
-    print("Target network initialized")
+    log_success("Target network initialized")
 
     actor_lr = getattr(cfg, "actor_lr", cfg.lr)
     critic_lr = getattr(cfg, "critic_lr", cfg.lr)
@@ -193,10 +223,10 @@ def _do_train():
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
     target_entropy = -float(env.action_spec.shape[-1])
-    print(f"Target entropy: {target_entropy}")
+    log_info(f"Target entropy: {target_entropy}")
 
-    print("using PrioritizedReplayBuffer with ListStorage (picklable for async)")
-    storage = ListStorage(max_size=cfg.replay_size)
+    log_info("Using PrioritizedReplayBuffer with LazyTensorStorage (contiguous memory)")
+    storage = LazyTensorStorage(max_size=cfg.replay_size)
     rb = PrioritizedReplayBuffer(
         alpha=cfg.per_alpha,
         beta=cfg.per_beta,
@@ -206,7 +236,7 @@ def _do_train():
 
     replay_buffer_path = getattr(cfg, "replay_buffer_path", None)
     if replay_buffer_path and Path(replay_buffer_path).exists():
-        print(f"Loading replay buffer from {replay_buffer_path}...")
+        log_info(f"Loading replay buffer from {replay_buffer_path}...")
         try:
             import pickle
 
@@ -215,8 +245,8 @@ def _do_train():
 
             if "buffer" in rb_state:
                 rb._storage._storage = rb_state["buffer"]
-                print(
-                    f"✓ Loaded {rb_state.get('buffer_size', 'unknown')} transitions from replay buffer"
+                log_success(
+                    f"Loaded {rb_state.get('buffer_size', 'unknown')} transitions from replay buffer"
                 )
 
             if "sampler_state" in rb_state:
@@ -225,24 +255,25 @@ def _do_train():
                     rb._sampler._alpha = sampler_state["alpha"]
                 if sampler_state.get("beta") is not None and hasattr(rb._sampler, "_beta"):
                     rb._sampler._beta = sampler_state["beta"]
-                print(
-                    f"✓ Restored sampler state (alpha={sampler_state.get('alpha')}, beta={sampler_state.get('beta')})"
+                log_success(
+                    f"Restored sampler state (alpha={sampler_state.get('alpha')}, beta={sampler_state.get('beta')})"
                 )
 
-            print(f"Replay buffer loaded from step {rb_state.get('total_steps', 'unknown')}")
+            log_info(f"Replay buffer loaded from step {rb_state.get('total_steps', 'unknown')}")
         except Exception as e:
-            print(f"Warning: Failed to load replay buffer: {e}")
-            print("Starting with empty replay buffer")
+            log_warning(f"Failed to load replay buffer: {e}")
+            log_info("Starting with empty replay buffer")
     elif replay_buffer_path:
-        print(f"Warning: Replay buffer path specified but file not found: {replay_buffer_path}")
+        log_warning(f"Replay buffer path specified but file not found: {replay_buffer_path}")
 
     total_steps = 0
     episode_returns = []
     current_episode_return = torch.zeros(1, device=device)
 
-    input("press enter when ur sure the controller is connected n stuff")
-
     start_time = time.time()
+
+    print_banner("Training Started")
+    print_section_header("SAC Training Loop")
 
     run_training_loop(
         env,
@@ -269,7 +300,7 @@ def _do_train():
     )
 
     wandb.finish()
-    print("WandB finished")
+    log_success("WandB finished. Training complete!")
 
 
 @cli_command(group="ac", name="train", help="Train SAC agent in Assetto Corsa")

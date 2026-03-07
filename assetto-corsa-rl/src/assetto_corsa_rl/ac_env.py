@@ -35,6 +35,8 @@ class AssettoCorsa(gym.Env):
         include_image: bool = False,
         use_ac_ai_racer: bool = True,
         observation_image_shape: Tuple[int, int] = (84, 84),
+        normalize_observations: bool = True,
+        normalization_bounds: Optional[Dict[str, list]] = None,
     ):
         super().__init__()
 
@@ -48,6 +50,9 @@ class AssettoCorsa(gym.Env):
         self.constant_reward_per_ms = constant_reward_per_ms
         self.reward_per_m_advanced_along_centerline = reward_per_m_advanced_along_centerline
         self.final_speed_reward_per_m_per_s = final_speed_reward_per_m_per_s
+
+        self.normalize_observations = normalize_observations
+        self.normalization_bounds = normalization_bounds or {}
 
         self.racing_line = None
         self.racing_line_positions = None
@@ -157,194 +162,181 @@ class AssettoCorsa(gym.Env):
                 [self._extract_value_from_data(key, data) for key in self.observation_keys],
                 dtype=np.float32,
             )
+            # Apply normalization if enabled
+            if self.normalize_observations:
+                vector = self._normalize_vector(vector)
 
         if self.include_image:
             return {"vector": vector, "image": img}
         return vector
 
     def _extract_value_from_data(self, key: str, data: Dict[str, Any]) -> float:
-        """Extract a single observation value from telemetry data.
+        car = data["car"]
+        inputs = data["inputs"]
+        lap = data["lap"]
+        session = data["session"]
+        stats = data["stats"]
+        tyres = data["tyres"]
 
-        Args:
-            key: The observation key name
-            data: Full telemetry data dict
+        # TODO: verify all these work
 
-        Returns:
-            Float value for the observation
-        """
+        match key:
+            case "speed_kmh":
+                return float(car["speed_kmh"])
+            case "speed_mph":
+                return float(car["speed_mph"])
+            case "speed_ms":
+                return float(car["speed_ms"])
+            case "rpm":
+                return float(car["rpm"])
+            case "fuel":
+                return float(car["fuel"])
+            case "tyres_off_track":
+                return float(car["tyres_off_track"])
+            case "in_pit_lane":
+                return float(car["in_pit_lane"])
+            case "cg_height":
+                return float(car["cg_height"])
+            case "drive_train_speed":
+                return float(car["drive_train_speed"])
+            case "drs_available":
+                return float(car["drs_available"])
+            case "drs_enabled":
+                return float(car["drs_enabled"])
 
-        # TODO: remove this ass code
-
-        if key == "speed_kmh":
-            return float(data.get("car", {}).get("speed_kmh", 0.0))
-        elif key == "speed_mph":
-            return float(data.get("car", {}).get("speed_mph", 0.0))
-        elif key == "speed_ms":
-            return float(data.get("car", {}).get("speed_ms", 0.0))
-        elif key == "rpm":
-            return float(data.get("car", {}).get("rpm", 0.0))
-        elif key == "gear":
-            gear = data.get("car", {}).get("gear", 0)
-            # Handle string gears: 'N' = 0, 'R' = -1, numbers = int(gear)
-            if isinstance(gear, str):
+            case "gear":
+                gear = car["gear"]
+                if gear == "R":
+                    return -1.0
                 if gear == "N":
                     return 0.0
-                elif gear == "R":
-                    return -1.0
-                else:
-                    try:
-                        return float(gear)
-                    except ValueError:
-                        return 0.0
-            return float(gear)
-        elif key == "velocity_x":
-            vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
-            return float(vel[0] if len(vel) > 0 else 0.0)
-        elif key == "velocity_y":
-            vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
-            return float(vel[1] if len(vel) > 1 else 0.0)
-        elif key == "velocity_z":
-            vel = data.get("car", {}).get("velocity", [0.0, 0.0, 0.0])
-            return float(vel[2] if len(vel) > 2 else 0.0)
-        elif key == "acceleration_x":
-            acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
-            return float(acc[0] if len(acc) > 0 else 0.0)
-        elif key == "acceleration_y":
-            acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
-            return float(acc[1] if len(acc) > 1 else 0.0)
-        elif key == "acceleration_z":
-            acc = data.get("car", {}).get("acceleration", [0.0, 0.0, 0.0])
-            return float(acc[2] if len(acc) > 2 else 0.0)
+                return float(gear)
 
-        elif key == "fuel":
-            return float(data.get("car", {}).get("fuel", 0.0))
-        elif key == "tyres_off_track":
-            return float(data.get("car", {}).get("tyres_off_track", 0.0))
-        elif key == "in_pit_lane":
-            return float(data.get("car", {}).get("in_pit_lane", 0.0))
-        elif key == "damage":
-            damage = data.get("car", {}).get("damage", [0.0, 0.0, 0.0, 0.0, 0.0])
-            return float(sum(damage) if isinstance(damage, list) else damage)
-        elif key == "cg_height":
-            return float(data.get("car", {}).get("cg_height", 0.0))
-        elif key == "drive_train_speed":
-            return float(data.get("car", {}).get("drive_train_speed", 0.0))
+            case "damage":
+                return float(sum(car["damage"]))
 
-        elif key == "drs_available":
-            return float(data.get("car", {}).get("drs_available", 0.0))
-        elif key == "drs_enabled":
-            return float(data.get("car", {}).get("drs_enabled", 0.0))
-        elif key == "has_drs":
-            return float(data.get("stats", {}).get("has_drs", 0.0))
-        elif key == "has_ers":
-            return float(data.get("stats", {}).get("has_ers", 0.0))
-        elif key == "has_kers":
-            return float(data.get("stats", {}).get("has_kers", 0.0))
+            case "velocity_x":
+                return float(car["velocity"][0])
+            case "velocity_y":
+                return float(car["velocity"][1])
+            case "velocity_z":
+                return float(car["velocity"][2])
 
-        elif key == "gas":
-            return float(data.get("inputs", {}).get("gas", 0.0))
-        elif key == "brake":
-            return float(data.get("inputs", {}).get("brake", 0.0))
-        elif key == "clutch":
-            return float(data.get("inputs", {}).get("clutch", 0.0))
-        elif key == "steer":
-            return float(data.get("inputs", {}).get("steer", 0.0))
+            case "acceleration_x":
+                return float(car["acceleration"][0])
+            case "acceleration_y":
+                return float(car["acceleration"][1])
+            case "acceleration_z":
+                return float(car["acceleration"][2])
 
-        elif key == "current_lap_time":
-            return float(data.get("lap", {}).get("get_current_lap_time", 0.0))
-        elif key == "last_lap_time":
-            return float(data.get("lap", {}).get("get_last_lap_time", 0.0))
-        elif key == "best_lap_time":
-            return float(data.get("lap", {}).get("get_best_lap_time", 0.0))
-        elif key == "lap_count":
-            return float(data.get("lap", {}).get("get_lap_count", 0.0))
-        elif key == "lap_delta":
-            return float(data.get("lap", {}).get("get_lap_delta", 0.0))
-        elif key == "current_sector":
-            return float(data.get("lap", {}).get("get_current_sector", 0.0))
-        elif key == "invalid_lap":
-            return float(data.get("lap", {}).get("get_invalid", 0.0))
+            case "gas":
+                return float(inputs["gas"])
+            case "brake":
+                return float(inputs["brake"])
+            case "clutch":
+                return float(inputs["clutch"])
+            case "steer":
+                return float(inputs["steer"])
 
-        elif key == "track_length":
-            return float(data.get("session", {}).get("track_length", 0.0))
-        elif key == "air_temp":
-            return float(data.get("session", {}).get("air_temp", 0.0))
-        elif key == "road_temp":
-            return float(data.get("session", {}).get("road_temp", 0.0))
-        elif key == "session_status":
-            return float(data.get("session", {}).get("session_status", 0.0))
+            case "current_lap_time":
+                return float(lap["get_current_lap_time"])
+            case "last_lap_time":
+                return float(lap["get_last_lap_time"])
+            case "best_lap_time":
+                return float(lap["get_best_lap_time"])
+            case "lap_count":
+                return float(lap["get_lap_count"])
+            case "lap_delta":
+                return float(lap["get_lap_delta"])
+            case "current_sector":
+                return float(lap["get_current_sector"])
+            case "invalid_lap":
+                return float(lap["get_invalid"])
 
-        elif key == "tyre_wear_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                wear_vals = [t.get("wear", 0.0) for t in tyres if t.get("wear") is not None]
-                return float(np.mean(wear_vals) if wear_vals else 0.0)
-            return 0.0
-        elif key == "tyre_pressure_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                pressure_vals = [
-                    t.get("pressure", 0.0) for t in tyres if t.get("pressure") is not None
-                ]
-                return float(np.mean(pressure_vals) if pressure_vals else 0.0)
-            return 0.0
-        elif key == "tyre_temp_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                temp_vals = []
+            case "track_length":
+                return float(session["track_length"])
+            case "air_temp":
+                return float(session["air_temp"])
+            case "road_temp":
+                return float(session["road_temp"])
+            case "session_status":
+                return float(session["session_status"])
+
+            case "has_drs":
+                return float(stats["has_drs"])
+            case "has_ers":
+                return float(stats["has_ers"])
+            case "has_kers":
+                return float(stats["has_kers"])
+
+            case "tyre_wear_avg":
+                return float(np.mean([t["wear"] for t in tyres]))
+            case "tyre_pressure_avg":
+                return float(np.mean([t["pressure"] for t in tyres]))
+            case "tyre_temp_avg":
+                return float(np.mean([t["temp_m"] for t in tyres]))
+            case "tyre_dirty_avg":
+                return float(np.mean([t["dirty"] for t in tyres]))
+
+            case "tyre_slip_ratio_avg":
+                # Handle mixed array/scalar values and -1 sentinel values
+                slip_values = []
                 for t in tyres:
-                    if t.get("temp_m") is not None:
-                        temp_vals.append(t["temp_m"])
-                return float(np.mean(temp_vals) if temp_vals else 0.0)
-            return 0.0
-        elif key == "tyre_dirty_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                dirty_vals = [t.get("dirty", 0.0) for t in tyres if t.get("dirty") is not None]
-                return float(np.mean(dirty_vals) if dirty_vals else 0.0)
-            return 0.0
-        elif key == "tyre_slip_ratio_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                slip_vals = []
+                    val = t.get("slip_ratio", 0.0)
+                    # Convert arrays to first element, handle -1 sentinel
+                    if isinstance(val, (list, np.ndarray)):
+                        scalar_val = float(val[0]) if len(val) > 0 else 0.0
+                    else:
+                        scalar_val = float(val) if val != -1 else 0.0
+                    slip_values.append(scalar_val)
+                return float(np.mean(slip_values))
+            case "tyre_slip_angle_avg":
+                angle_values = []
                 for t in tyres:
-                    val = t.get("slip_ratio")
-                    if val is not None:
-                        if isinstance(val, (list, tuple, np.ndarray)):
-                            val = float(np.mean(val)) if len(val) > 0 else 0.0
-                        else:
-                            val = float(val)
-                        slip_vals.append(val)
-                return float(np.mean(slip_vals) if slip_vals else 0.0)
-            return 0.0
-        elif key == "tyre_slip_angle_avg":
-            tyres = data.get("tyres", [])
-            if tyres:
-                slip_vals = []
-                for t in tyres:
-                    val = t.get("slip_angle")
-                    if val is not None:
-                        # Handle case where slip_angle might be an array
-                        if isinstance(val, (list, tuple, np.ndarray)):
-                            val = float(np.mean(val)) if len(val) > 0 else 0.0
-                        else:
-                            val = float(val)
-                        slip_vals.append(val)
-                return float(np.mean(slip_vals) if slip_vals else 0.0)
-            return 0.0
+                    val = t.get("slip_angle", 0.0)
+                    if isinstance(val, (list, np.ndarray)):
+                        scalar_val = float(val[0]) if len(val) > 0 else 0.0
+                    else:
+                        scalar_val = float(val) if val != -1 else 0.0
+                    angle_values.append(scalar_val)
+                return float(np.mean(angle_values))
 
-        # Individual tyre temps (tyre_N_temp_X where N=0-3, X=i/m/o)
-        elif key.startswith("tyre_") and "_temp_" in key:
-            parts = key.split("_")
-            tyre_idx = int(parts[1])
-            temp_pos = parts[3]  # i, m, or o
-            tyres = data.get("tyres", [])
-            if tyre_idx < len(tyres):
-                return float(tyres[tyre_idx].get(f"temp_{temp_pos}", 0.0) or 0.0)
-            return 0.0
+            case _ if key.startswith("tyre_") and "_temp_" in key:
+                _, tyre_idx, _, temp_pos = key.split("_")
+                return float(tyres[int(tyre_idx)][f"temp_{temp_pos}"])
 
-        else:
-            return float(data.get(key, 0.0))
+            case _:
+                return float(data[key])
+
+    def _normalize_vector(self, vector: np.ndarray) -> np.ndarray:
+        """Normalize observation vector to [-1, 1] range using normalization bounds.
+
+        Args:
+            vector: Observation vector of shape (obs_dim,)
+
+        Returns:
+            Normalized observation vector clipped to [-1, 1]
+        """
+        if not self.normalize_observations or not self.normalization_bounds:
+            return vector
+
+        normalized = np.copy(vector)
+        for i, key in enumerate(self.observation_keys):
+            if key not in self.normalization_bounds:
+                continue
+
+            bounds = self.normalization_bounds[key]
+            if len(bounds) != 2:
+                continue
+
+            min_val, max_val = bounds
+            if max_val <= min_val:
+                continue
+
+            # Normalize to [-1, 1]: 2 * (x - min) / (max - min) - 1
+            normalized[i] = 2.0 * (vector[i] - min_val) / (max_val - min_val) - 1.0
+
+        return normalized
 
     def _load_racing_line(self, filepath: str) -> None:
         """Load racing line from JSON file or URL.
@@ -450,8 +442,6 @@ class AssettoCorsa(gym.Env):
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
     #! UNTESTED WITH PRETRAINED AGENTS
     def _calculate_reward(self, obs, data):
-        if data is None or data.get("car") is None or data["car"].get("world_location") is None:
-            return 0.0
         position = np.array(data["car"]["world_location"][:3])
         current_meters = self._calculate_meters_advanced(position)
         meters_progress = current_meters - self._meters_advanced
@@ -775,14 +765,133 @@ def create_mock_env(device: Optional[torch.device] = None):
 
 
 def main() -> None:
+    """Test observation normalization with actual AC environment."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Debug AC environment live.")
+    parser = argparse.ArgumentParser(description="Test AC environment observation normalization.")
     parser.add_argument("--racing-line", type=str, default="racing_lines.json")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--send-port", type=int, default=9877)
     parser.add_argument("--recv-port", type=int, default=9876)
+    parser.add_argument("--normalize", action="store_true", help="Enable normalization")
     args = parser.parse_args()
+
+    # Include all observations from env_config
+    input_config = {
+        # car dynamics
+        "speed_kmh": True,
+        "speed_mph": False,
+        "speed_ms": False,
+        "rpm": True,
+        "gear": True,
+        "velocity_x": True,
+        "velocity_y": True,
+        "velocity_z": True,
+        "acceleration_x": True,
+        "acceleration_y": True,
+        "acceleration_z": True,
+        # car state
+        "fuel": False,
+        "tyres_off_track": True,
+        "in_pit_lane": False,
+        "damage": False,
+        "cg_height": False,
+        "drive_train_speed": False,
+        # DRS/ERS/KERS
+        "drs_available": False,
+        "drs_enabled": False,
+        "has_drs": False,
+        "has_ers": False,
+        "has_kers": False,
+        # inputs (current)
+        "gas": True,
+        "brake": True,
+        "clutch": True,
+        "steer": True,
+        # lap info
+        "current_lap_time": False,
+        "last_lap_time": False,
+        "best_lap_time": False,
+        "lap_count": False,
+        "lap_delta": False,
+        "current_sector": False,
+        "invalid_lap": False,
+        # Track/Session info
+        "track_length": False,
+        "air_temp": False,
+        "road_temp": False,
+        "session_status": False,
+        # Tyre info (per-tyre averages)
+        "tyre_wear_avg": True,
+        "tyre_pressure_avg": True,
+        "tyre_temp_avg": True,
+        "tyre_dirty_avg": False,
+        "tyre_slip_ratio_avg": True,
+        "tyre_slip_angle_avg": True,
+        # Individual tyre temps (front-left, front-right, rear-left, rear-right)
+        "tyre_0_temp_i": True,
+        "tyre_0_temp_m": True,
+        "tyre_0_temp_o": True,
+        "tyre_1_temp_i": True,
+        "tyre_1_temp_m": True,
+        "tyre_1_temp_o": True,
+        "tyre_2_temp_i": True,
+        "tyre_2_temp_m": True,
+        "tyre_2_temp_o": True,
+        "tyre_3_temp_i": True,
+        "tyre_3_temp_m": True,
+        "tyre_3_temp_o": True,
+    }
+
+    normalization_bounds = {
+        "speed_kmh": [0, 300],
+        "speed_mph": [0, 186],
+        "speed_ms": [0, 83],
+        "rpm": [0, 8000],
+        "gear": [0, 8],
+        "velocity_x": [-50, 50],
+        "velocity_y": [-50, 50],
+        "velocity_z": [-50, 50],
+        "acceleration_x": [-30, 30],
+        "acceleration_y": [-30, 30],
+        "acceleration_z": [-30, 30],
+        "fuel": [0, 100],
+        "tyres_off_track": [0, 4],
+        "cg_height": [-2, 2],
+        "drive_train_speed": [0, 400],
+        "damage": [0, 100],
+        "gas": [0, 1],
+        "brake": [0, 1],
+        "clutch": [0, 1],
+        "steer": [-1, 1],
+        "current_lap_time": [0, 300],
+        "last_lap_time": [0, 300],
+        "best_lap_time": [0, 300],
+        "lap_count": [0, 100],
+        "lap_delta": [-10, 10],
+        "current_sector": [0, 3],
+        "track_length": [0, 50000],
+        "air_temp": [-50, 50],
+        "road_temp": [-50, 150],
+        "tyre_wear_avg": [0, 100],
+        "tyre_pressure_avg": [20, 30],
+        "tyre_temp_avg": [0, 150],
+        "tyre_dirty_avg": [0, 100],
+        "tyre_slip_ratio_avg": [0, 2],
+        "tyre_slip_angle_avg": [0, 50],
+        "tyre_0_temp_i": [0, 150],
+        "tyre_0_temp_m": [0, 150],
+        "tyre_0_temp_o": [0, 150],
+        "tyre_1_temp_i": [0, 150],
+        "tyre_1_temp_m": [0, 150],
+        "tyre_1_temp_o": [0, 150],
+        "tyre_2_temp_i": [0, 150],
+        "tyre_2_temp_m": [0, 150],
+        "tyre_2_temp_o": [0, 150],
+        "tyre_3_temp_i": [0, 150],
+        "tyre_3_temp_m": [0, 150],
+        "tyre_3_temp_o": [0, 150],
+    }
 
     env = AssettoCorsa(
         host=args.host,
@@ -791,56 +900,67 @@ def main() -> None:
         racing_line_path=args.racing_line,
         include_image=False,
         use_ac_ai_racer=False,
+        normalize_observations=args.normalize,
+        normalization_bounds=normalization_bounds,
+        input_config=input_config,
     )
 
-    obs, info = env.reset()
-    print("Environment reset. Press Ctrl+C to stop.\n")
+    print("=" * 150)
+    print(f"AC ENVIRONMENT NORMALIZATION TEST (normalize={args.normalize})")
+    print("=" * 150)
+    print(f"Total observation keys: {len(env.observation_keys)}")
+    print(f"Observation keys: {env.observation_keys}\n")
 
     try:
+        obs, info = env.reset()
+        print("Environment reset. Running steps...\n")
+
         while True:
-            data = env._last_obs
-            if data is None:
+            if env._last_obs is None:
                 time.sleep(0.05)
                 obs = env._get_observation()
                 continue
 
-            position = np.array(data.get("car", {}).get("world_location", [0, 0, 0]))
-            velocity = data.get("car", {}).get("velocity", [0, 0, 0])
-            speed = np.linalg.norm(velocity)
+            data = env._last_obs
 
-            closest_idx, dist_to_line = env._find_closest_point_on_racing_line(position)
-            a_closest_idx, _ = env._find_closest_point_on_racing_line(position, search_window=-1)
-
-            meters = env._meters_advanced
-
-            reward = env._calculate_reward(obs, data)
-            done = env._check_done(obs, data)
-
-            print(
-                f"step={env._episode_step:5d} | "
-                f"rl_idx={closest_idx:4d} | "
-                f"fx_idx={a_closest_idx} | "
-                f"dist_to_line={dist_to_line:6.2f}m | "
-                f"meters={meters:8.1f} | "
-                f"speed={speed:6.2f}m/s | "
-                f"reward={reward:7.3f} | "
-                f"damage={sum(data['car'].get('damage', [0]))} | "
-                f"done={done}"
+            # Extract raw values before normalization
+            raw_values = np.array(
+                [env._extract_value_from_data(key, data) for key in env.observation_keys],
+                dtype=np.float32,
             )
 
-            if done:
-                print("Episode done, resetting...")
+            # Get normalized observation (if enabled in env)
+            obs = env._get_observation()
+
+            print("-" * 150)
+            print(f"{'Key':<25} {'Raw Value':<15} {'Bounds':<25} {'Normalized':<15}")
+            print("-" * 150)
+
+            for i, key in enumerate(env.observation_keys):
+                raw_val = raw_values[i]
+                norm_val = obs[i] if args.normalize else raw_val
+
+                bounds = env.normalization_bounds.get(key, None)
+                bounds_str = str(bounds) if bounds else "N/A"
+
+                print(f"{key:<25} {raw_val:<15.4f} {bounds_str:<25} {norm_val:<15.4f}")
+
+            # Random action
+            action = env.action_space.sample()
+            obs, reward, terminated, truncated, info = env.step(action)
+
+            if terminated or truncated:
+                print("\nEpisode done, resetting...")
                 obs, info = env.reset()
-            else:
-                obs = env._get_observation()
-                env._episode_step += 1
 
             time.sleep(0.05)
+            print()
 
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nStopped by user.")
     finally:
         env.close()
+        print("Environment closed.")
 
 
 if __name__ == "__main__":

@@ -173,6 +173,7 @@ def train():
         beta=cfg.per_beta,
         storage=storage,
         batch_size=cfg.batch_size,
+        dtype=torch.float64,
     )
 
     current_td = td

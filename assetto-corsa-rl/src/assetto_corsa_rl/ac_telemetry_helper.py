@@ -284,6 +284,22 @@ class Telemetry:
         #     self._sct.close()
         #     self._sct = None
 
+    def reconnect_mss(self) -> None:
+        """Close and re-initialize the mss screen capture instance.
+
+        Call this after Assetto Corsa has been (re)launched so that mss
+        picks up the new window instead of holding stale display state.
+        """
+        if self._sct is not None:
+            try:
+                self._sct.close()
+            except Exception:
+                pass
+            self._sct = None
+        self._ac_window_handle = None
+        self._sct = mss()
+        print("✓ MSS reconnected")
+
     def get_latest_image(self) -> Optional[np.ndarray]:
         """Get latest captured image.
 

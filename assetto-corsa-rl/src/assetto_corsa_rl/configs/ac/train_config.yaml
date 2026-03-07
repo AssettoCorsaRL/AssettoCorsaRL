@@ -1,8 +1,9 @@
 train:
+  start_steps: 10_000 # number of random action steps to collect before training begins
   total_steps: 1_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
   save_interval: 50_000 # how often (in steps) to save model checkpoints
-  save_interval_replaybuffer: 1_000_000 # how often (in steps) to save the replay buffer
+  save_interval_replaybuffer: 100_000 # how often (in steps) to save the replay buffer
 
   min_free_space_gb: 30 # minimum free disk space to maintain (in GB)
 

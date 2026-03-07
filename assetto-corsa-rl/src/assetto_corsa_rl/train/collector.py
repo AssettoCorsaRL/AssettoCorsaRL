@@ -8,6 +8,7 @@ from .train_utils import (
     pack_pixels,
     sample_random_action,
 )
+from .logging_utils import log_info
 
 
 class CollectorWorker:
@@ -59,7 +60,14 @@ class CollectorWorker:
     # ── helpers ───────────────────────────────────────────────────────────
 
     def _exploration_epsilon(self):
-        """Linearly anneal epsilon from explore_start → explore_end over explore_steps."""
+        """Linearly anneal epsilon from explore_start → explore_end over explore_steps.
+
+        During start_steps, force epsilon=1.0 (purely random exploration).
+        """
+        start_steps = int(getattr(self.cfg, "start_steps", 0))
+        if self.total_steps < start_steps:
+            return 1.0
+
         if getattr(self.cfg, "use_noisy", False):
             return 0.0
         start = float(getattr(self.cfg, "explore_start", 1.0))
