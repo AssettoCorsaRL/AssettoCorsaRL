@@ -1,6 +1,90 @@
+import math
+
 import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
+
+
+class OrnsteinUhlenbeckNoise:
+    """Temporally-correlated action noise for coherent exploration.
+
+    Instead of independent random actions each step (which causes jittering),
+    OU noise produces smooth trajectories — the agent commits to a maneuver
+    for several steps before gradually drifting to another.
+
+    The API is flexible: ``theta``, ``sigma`` and ``mu`` may be scalars or
+    arrays/tensors with length equal to ``action_dim``.  If arrays are provided,
+    they are broadcast across ``num_envs`` so each environment shares the same
+    parameter vector.
+
+    Equation:
+        dx = theta * (mu - x) * dt + sigma * sqrt(dt) * N(0, 1)
+    """
+
+    def __init__(
+        self,
+        action_dim: int,
+        num_envs: int = 1,
+        theta: float | list[float] | torch.Tensor = 0.15,
+        sigma: float | list[float] | torch.Tensor = 0.3,
+        mu: float | list[float] | torch.Tensor | None = None,
+        dt: float = 1.0,
+        device=None,
+    ):
+        self.dt = dt
+        self.device = device or torch.device("cpu")
+
+        def _to_tensor(x, default):
+            if isinstance(x, (list, tuple)):
+                t = torch.tensor(x, dtype=torch.float32, device=self.device)
+            elif isinstance(x, torch.Tensor):
+                t = x.to(self.device).float()
+            else:
+                t = torch.tensor([x], dtype=torch.float32, device=self.device)
+            # expand to (num_envs, action_dim) if needed
+            if t.numel() == 1:
+                t = t.expand(num_envs, action_dim)
+            else:
+                t = t.view(1, -1).expand(num_envs, -1)
+            return t
+
+        self.theta = _to_tensor(theta, 0.15)
+        self.sigma = _to_tensor(sigma, 0.3)
+        if mu is not None:
+            self.mu = _to_tensor(mu, 0.0)
+        else:
+            self.mu = torch.zeros((num_envs, action_dim), device=self.device)
+        self.state = self.mu.clone()
+
+    def reset(self, env_indices=None):
+        """Reset noise state (e.g. on episode end)."""
+        if env_indices is None:
+            self.state = self.mu.clone()
+        else:
+            self.state[env_indices] = self.mu[env_indices].clone()
+
+    def sample(self) -> torch.Tensor:
+        """Return next OU noise sample (num_envs, action_dim)."""
+        dx = self.theta * (self.mu - self.state) * self.dt + self.sigma * math.sqrt(
+            self.dt
+        ) * torch.randn_like(self.state)
+        self.state = self.state + dx
+        return self.state.clone()
+
+    def reset(self, env_indices=None):
+        """Reset noise state (e.g. on episode end)."""
+        if env_indices is None:
+            self.state = self.mu.clone()
+        else:
+            self.state[env_indices] = self.mu[env_indices].clone()
+
+    def sample(self) -> torch.Tensor:
+        """Return next OU noise sample (num_envs, action_dim)."""
+        dx = self.theta * (self.mu - self.state) * self.dt + self.sigma * math.sqrt(
+            self.dt
+        ) * torch.randn_like(self.state)
+        self.state = self.state + dx
+        return self.state.clone()
 
 
 def reduce_value_to_batch(x, batch_size):

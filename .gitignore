@@ -31,3 +31,4 @@
 /assetto-corsa-rl/src/assetto_corsa_rl/scripts/car-racing/__pycache__
 /assetto-corsa-rl/src/assetto_corsa_rl.egg-info
 /assetto-corsa-rl/wandb
+/sac_best.pt

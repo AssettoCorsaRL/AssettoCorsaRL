@@ -2,6 +2,7 @@ import torch
 from tensordict import TensorDict
 
 from .train_utils import (
+    OrnsteinUhlenbeckNoise,
     expand_actions_for_envs,
     extract_reward_and_done,
     get_inner,
@@ -39,6 +40,36 @@ class CollectorWorker:
         self._local_version = -1
         self.current_td = self.env.reset()
         self.current_episode_return = torch.zeros(cfg.num_envs, device=self.device)
+
+        # Track whether we've logged the start of random exploration
+        self._start_steps_logged = False
+        self._end_start_steps_logged = False
+        start_steps = int(getattr(self.cfg, "start_steps", 0))
+        if start_steps > 0:
+            log_info(f"[COLLECTOR] Beginning random exploration phase: {start_steps:,} steps")
+
+        # ── Ornstein-Uhlenbeck noise for coherent exploration ──────────
+        action_dim = int(env.action_spec.shape[-1])
+        ou_theta = getattr(cfg, "ou_theta", 0.15)
+        ou_sigma = getattr(cfg, "ou_sigma", 0.3)
+        # Slight forward-driving bias: [steer=0, gas=0.4, brake=0]
+        ou_mu_cfg = getattr(cfg, "ou_mu", None)
+        if ou_mu_cfg is None:
+            ou_mu_default = torch.zeros(action_dim, device=self.device)
+            if action_dim >= 2:
+                ou_mu_default[1] = 0.4
+        else:
+            ou_mu_default = torch.tensor(ou_mu_cfg, dtype=torch.float32, device=self.device)
+        self.ou_noise = OrnsteinUhlenbeckNoise(
+            action_dim=action_dim,
+            num_envs=cfg.num_envs,
+            theta=ou_theta,
+            sigma=ou_sigma,
+            mu=ou_mu_default,
+            device=self.device,
+        )
+        self._ou_noise_decay_steps = int(getattr(cfg, "ou_noise_decay_steps", 100_000))
+        self._ou_noise_scale = float(getattr(cfg, "ou_noise_scale", 0.3))
 
     # ── async entry-point (multi-process) ─────────────────────────────────
 
@@ -124,7 +155,18 @@ class CollectorWorker:
             else:
                 eps = self._exploration_epsilon()
 
-            if eps > 0.0:
+            start_steps = int(getattr(self.cfg, "start_steps", 0))
+            in_random_phase = self.total_steps < start_steps
+
+            if in_random_phase:
+                # OU noise for coherent random exploration (car actually drives)
+                ou_sample = self.ou_noise.sample()
+                # Clip to action bounds: steer [-1,1], gas [0,1], brake [0,1]
+                actions = ou_sample.clone()
+                actions[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
+                if actions.shape[-1] >= 2:
+                    actions[:, 1:] = actions[:, 1:].clamp(0.0, 1.0)
+            elif eps > 0.0:
                 mask = torch.rand(self.cfg.num_envs, device=self.device) < eps
                 rand_actions = sample_random_action(self.cfg.num_envs, dev=self.device)
                 if actor_action is None:
@@ -139,6 +181,19 @@ class CollectorWorker:
                     if actor_action is not None
                     else sample_random_action(self.cfg.num_envs, dev=self.device)
                 )
+
+            # Additive OU noise on policy actions (decaying) after random phase
+            if not in_random_phase and actor_action is not None:
+                decay_frac = min(
+                    1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
+                )
+                noise_scale = self._ou_noise_scale * (1.0 - decay_frac)
+                if noise_scale > 1e-6:
+                    ou_delta = self.ou_noise.sample() - self.ou_noise.mu[0]
+                    actions = actions + noise_scale * ou_delta
+                    actions[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
+                    if actions.shape[-1] >= 2:
+                        actions[:, 1:] = actions[:, 1:].clamp(0.0, 1.0)
 
         actions_step = expand_actions_for_envs(actions, target_batch)
         action_td = TensorDict({"action": actions_step}, batch_size=target_batch)
@@ -181,10 +236,21 @@ class CollectorWorker:
         self._maybe_reset(td_next, dones)
         self.total_steps += self.cfg.num_envs
 
+        # Log when exiting start_steps phase
+        start_steps = int(getattr(self.cfg, "start_steps", 0))
+        if not self._end_start_steps_logged and self.total_steps >= start_steps > 0:
+            log_info(f"[COLLECTOR] Random exploration phase complete! ({self.total_steps:,} steps)")
+            log_info(f"[COLLECTOR] Beginning policy learning...")
+            self._end_start_steps_logged = True
+
     def _handle_episode_end(self, rewards, dones):
         rewards = rewards.to(self.current_episode_return.device)
         dones = dones.to(self.current_episode_return.device)
         self.current_episode_return += rewards
+        # Reset OU noise on episode boundaries for fresh trajectories
+        done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
+        if done_indices.numel() > 0:
+            self.ou_noise.reset(env_indices=done_indices)
         for i, d in enumerate(dones):
             if d.item():
                 ep_ret = float(self.current_episode_return[i].item())

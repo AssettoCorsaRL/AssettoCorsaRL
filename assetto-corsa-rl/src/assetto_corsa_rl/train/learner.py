@@ -112,24 +112,38 @@ class LearnerWorker:
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage).
 
-        The learner trains the GPU continuously whenever the replay buffer has
-        enough data.  No pacing gate — the GPU should be saturated at all times.
+        Gradient updates are paced to the data collection rate:
+        for every new transition, we earn ``updates_per_step`` update credits.
+        The learner only trains when it has credits, keeping the effective UTD
+        ratio equal to ``updates_per_step`` regardless of GPU speed.
         """
         _weight_push_every = max(1, self._updates_per_step)
+        _update_credit = 0
+        # Allow a small burst when lots of transitions arrive at once, but
+        # cap to keep the loop responsive to stop_event / logging.
+        _max_updates_per_tick = self._updates_per_step * 64
+
         while self.stop_event is None or not self.stop_event.is_set():
             n = self._drain_transitions()
             self.total_steps += n
+            _update_credit += n * self._updates_per_step
 
             trained_this_iter = False
             start_steps = int(getattr(self.cfg, "start_steps", 0))
-            if self.total_steps >= start_steps and len(self.rb) >= self.cfg.batch_size:
-                for _ in range(self._updates_per_step):
+            if (
+                _update_credit > 0
+                and self.total_steps >= start_steps
+                and len(self.rb) >= self.cfg.batch_size
+            ):
+                k = min(_update_credit, _max_updates_per_tick)
+                for _ in range(k):
                     self._do_update()
+                _update_credit -= k
                 if self._updates_count % _weight_push_every == 0:
                     self._push_weights()
                 trained_this_iter = True
 
-            if not trained_this_iter and n == 0:
+            if not trained_this_iter:
                 time.sleep(0.001)
             self._maybe_log_and_save(epsilon=self._last_epsilon)
 
@@ -263,13 +277,26 @@ class LearnerWorker:
         q1_pred = self.q1.module(pixels_b, actions_b, vector_b).view(-1, 1)
         q2_pred = self.q2.module(pixels_b, actions_b, vector_b).view(-1, 1)
 
+        # ── PER importance-sampling weights ───────────────────────────
+        # Without IS correction, PER introduces bias that destabilises
+        # the critic – a primary cause of catastrophic forgetting.
+        is_weights = info.get("_weight", None)
+        if is_weights is None:
+            is_weights = info.get("weight", None)
+        if is_weights is not None:
+            is_weights = is_weights.to(self.device).view(-1, 1).clamp(min=1e-4)
+        else:
+            is_weights = torch.ones_like(rewards_b)
+
         with torch.no_grad():
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
             td_errors = torch.max(td_error_1, td_error_2).squeeze(-1)
             if batch_indices is not None:
                 indices_arr = batch_indices.flatten().cpu().numpy()
-                new_priorities = td_errors.cpu().numpy().copy()
+                # Clip priorities to prevent runaway PER sampling
+                _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
+                new_priorities = np.clip(td_errors.cpu().numpy().copy(), 1e-6, _max_priority)
                 self._sample_counts[indices_arr] += 1
                 expired_mask = self._sample_counts[indices_arr] >= self._max_uses
                 _expired = int(expired_mask.sum())
@@ -284,8 +311,12 @@ class LearnerWorker:
         )
         self.rb.beta = beta
 
-        q1_loss = F.mse_loss(q1_pred, q_target)
-        q2_loss = F.mse_loss(q2_pred, q_target)
+        # Huber loss (smooth_l1) instead of MSE – prevents quadratic
+        # gradient explosion on large TD errors, especially with PER.
+        q1_elementwise = F.smooth_l1_loss(q1_pred, q_target, reduction="none")
+        q2_elementwise = F.smooth_l1_loss(q2_pred, q_target, reduction="none")
+        q1_loss = (is_weights * q1_elementwise).mean()
+        q2_loss = (is_weights * q2_elementwise).mean()
         critic_loss = q1_loss + q2_loss
 
         with torch.no_grad():
@@ -363,8 +394,9 @@ class LearnerWorker:
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
                 alpha_min = float(getattr(self.cfg, "alpha_min", 0.01))
+                alpha_max = float(getattr(self.cfg, "alpha_max", 1.0))
                 with torch.no_grad():
-                    self.log_alpha.clamp_(min=math.log(alpha_min))
+                    self.log_alpha.clamp_(min=math.log(alpha_min), max=math.log(alpha_max))
         else:
             actor_loss = None
             alpha_loss = None
@@ -416,6 +448,8 @@ class LearnerWorker:
                 "per/td_error_max": td_errors.max().item(),
                 "per/td_error_min": td_errors.min().item(),
                 "per/beta": beta,
+                "per/is_weight_mean": is_weights.mean().item(),
+                "per/is_weight_max": is_weights.max().item(),
                 "buffer/expired_this_batch": self._last_expired_count,
                 "buffer/expired_fraction": self._last_expired_count / max(1, self.cfg.batch_size),
                 "pacing/cumul_memories_used": self._cumul_used,
@@ -460,10 +494,20 @@ class LearnerWorker:
 
     def _soft_update_target(self):
         tau = self.cfg.tau
+        # Q1/Q2 share a CNN encoder; Q1_target/Q2_target share a target CNN.
+        # Track updated data pointers so the shared CNN is polyak-updated
+        # exactly once (not twice).
+        updated_ptrs = set()
         for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            ptr = target_param.data_ptr()
+            if ptr not in updated_ptrs:
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+                updated_ptrs.add(ptr)
         for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            ptr = target_param.data_ptr()
+            if ptr not in updated_ptrs:
+                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+                updated_ptrs.add(ptr)
 
     # === LR scheduler factory =============================================================
 

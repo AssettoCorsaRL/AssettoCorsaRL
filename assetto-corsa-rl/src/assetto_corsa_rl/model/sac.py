@@ -77,8 +77,6 @@ class CriticNet(nn.Module):
         super().__init__()
         self.cnn = encoder
         self.obs_dim = obs_dim
-        # LayerNorm after each hidden layer dramatically improves sample
-        # efficiency at high UTD ratios by stabilising Q-value estimates.
         self.fc = nn.Sequential(
             nn.Linear(critic_input_size, hidden, device=device),
             nn.LayerNorm(hidden, device=device),
