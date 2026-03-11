@@ -1,5 +1,5 @@
 train:
-  start_steps: 10_000 # number of random action steps to collect before training begins
+  start_steps: 100_000 # number of random action steps to collect before training begins
   total_steps: 1_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
   save_interval: 50_000 # how often (in steps) to save model checkpoints

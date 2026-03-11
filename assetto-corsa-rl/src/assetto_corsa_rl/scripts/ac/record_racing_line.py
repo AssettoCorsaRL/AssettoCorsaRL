@@ -5,7 +5,7 @@ to a file when each lap completes. The script waits for a new lap to start
 before beginning recording.
 
 Usage:
-    acrl ac record-racing-line --output racing_lines_brazil.json --track brazil
+    acrl ac record-racing-line --output racing_lines_monaco.json --track monaco
 """
 
 import sys
@@ -202,7 +202,7 @@ class RacingLineRecorder:
 @cli_option("--output", "-o", default="racing_lines.json", help="Output file path")
 @cli_option("--track", "-t", default=None, help="Track name")
 @cli_option("--laps", "-l", default=2, help="Maximum number of laps to record")
-@cli_option("--sample-rate", "-s", default=0.05, type=float, help="Sample rate in seconds")
+@cli_option("--sample-rate", "-s", default=0.01, type=float, help="Sample rate in seconds")
 @cli_option("--host", default="127.0.0.1", help="Telemetry host")
 @cli_option("--port", "-p", default=9876, help="Telemetry port")
 def main(output, track, laps, sample_rate, host, port):
@@ -270,10 +270,10 @@ def main(output, track, laps, sample_rate, host, port):
 
 if __name__ == "__main__":
     main(
-        output="racing_lines_brazil.json",
-        track="Brazil",
+        output="racing_lines_monaco.json",
+        track="Monaco",
         laps=2,
-        sample_rate=0.05,
+        sample_rate=0.01,
         host="127.0.0.1",
         port=9876,
     )

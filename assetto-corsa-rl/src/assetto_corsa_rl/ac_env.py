@@ -29,7 +29,7 @@ class AssettoCorsa(gym.Env):
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
-        constant_reward_per_ms: float = 0,
+        constant_reward_per_ms: float = -0.2,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.05,
         include_image: bool = False,
@@ -56,6 +56,7 @@ class AssettoCorsa(gym.Env):
 
         self.racing_line = None
         self.racing_line_positions = None
+        self.racing_line_segment_lengths = None  # Precomputed arc lengths
         self._load_racing_line(racing_line_path)
 
         self.action_space = spaces.Box(
@@ -370,8 +371,16 @@ class AssettoCorsa(gym.Env):
         positions = np.array([[p["x"], p["y"], p["z"]] for p in lap["positions"]])
         self.racing_line_positions = positions
 
+        # Precompute segment lengths for efficient arc length calculation
+        segments = positions[1:] - positions[:-1]
+        segment_lengths = np.linalg.norm(segments, axis=1)
+        self.racing_line_segment_lengths = segment_lengths
+
         # avoid unicode characters in logs to prevent encoding issues on some consoles
-        print(f"Loaded racing line with {len(positions)} points")
+        total_length = float(np.sum(segment_lengths))
+        print(
+            f"Loaded racing line with {len(positions)} points (total length: {total_length:.1f}m)"
+        )
 
     def _find_closest_point_on_racing_line(
         self, position: np.ndarray, search_window: int = 100
@@ -393,16 +402,18 @@ class AssettoCorsa(gym.Env):
         return closest_idx, float(distances[local_idx])
 
     def _calculate_meters_advanced(self, position: np.ndarray) -> float:
-        if self.racing_line_positions is None:
+        """Calculate cumulative distance along racing line from current position.
+
+        Returns the total arc length from the start of the racing line to the
+        closest point (plus fractional progress along the current segment).
+        """
+        if self.racing_line_positions is None or self.racing_line_segment_lengths is None:
             return 0.0
 
         closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=100)
-
-        # if self._current_racing_line_index == 0:
-        # self._current_racing_line_index = closest_idx
+        n = len(self.racing_line_positions)
 
         idx_diff = closest_idx - self._current_racing_line_index
-        n = len(self.racing_line_positions)
         if idx_diff < -(n // 2):
             idx_diff += n
         elif idx_diff > n // 2:
@@ -411,26 +422,19 @@ class AssettoCorsa(gym.Env):
         if idx_diff < 0:
             return self._meters_advanced
 
-        # Project position onto the segment between closest and next point
+        arc = float(np.sum(self.racing_line_segment_lengths[:closest_idx]))
+
         next_idx = (closest_idx + 1) % n
         seg_start = self.racing_line_positions[closest_idx]
         seg_end = self.racing_line_positions[next_idx]
         seg = seg_end - seg_start
-        seg_len = np.linalg.norm(seg)
+        seg_len = self.racing_line_segment_lengths[closest_idx]
 
         if seg_len > 0:
             t = np.clip(np.dot(position - seg_start, seg) / (seg_len**2), 0.0, 1.0)
         else:
             t = 0.0
 
-        # Arc length up to closest_idx
-        segments = (
-            self.racing_line_positions[1 : closest_idx + 1]
-            - self.racing_line_positions[0:closest_idx]
-        )
-        arc = float(np.sum(np.linalg.norm(segments, axis=1)))
-
-        # Add fractional progress along current segment
         total = arc + t * seg_len
 
         if total < self._meters_advanced:
@@ -447,6 +451,11 @@ class AssettoCorsa(gym.Env):
         meters_progress = current_meters - self._meters_advanced
         self._meters_advanced = current_meters
 
+        n = len(self.racing_line_positions)
+        if self._current_racing_line_index >= n - 3:
+            self._current_racing_line_index = 0
+            self._meters_advanced = 0.0
+
         velocity = data.get("car", {}).get("velocity", [0, 0, 0])
         speed = np.linalg.norm(velocity)  # m/s
 
@@ -454,10 +463,12 @@ class AssettoCorsa(gym.Env):
         damage = sum(data["car"].get("damage", [0]))
 
         reward = (
-            meters_progress * 1.0  # progress along racing line
-            + speed * 0.01  # bonus for going fast (always positive signal)
+            self.constant_reward_per_ms
+            * 0.02  # constant reward proportional to timestep (0.02s per step)
+            + meters_progress
+            * self.reward_per_m_advanced_along_centerline  # progress along racing line
             - off_track * 0.5  # penalty for being off track
-            - (1.0 if damage > 0 else 0.0)  # terminal penalty for damage
+            - (50.0 if damage > 0 else 0.0)  # terminal penalty for damage
         )
         self._last_speed = speed
         return reward
@@ -932,9 +943,9 @@ def main() -> None:
             # Get normalized observation (if enabled in env)
             obs = env._get_observation()
 
-            print("-" * 150)
-            print(f"{'Key':<25} {'Raw Value':<15} {'Bounds':<25} {'Normalized':<15}")
-            print("-" * 150)
+            # print("-" * 150)
+            # print(f"{'Key':<25} {'Raw Value':<15} {'Bounds':<25} {'Normalized':<15}")
+            # print("-" * 150)
 
             for i, key in enumerate(env.observation_keys):
                 raw_val = raw_values[i]
@@ -943,11 +954,16 @@ def main() -> None:
                 bounds = env.normalization_bounds.get(key, None)
                 bounds_str = str(bounds) if bounds else "N/A"
 
-                print(f"{key:<25} {raw_val:<15.4f} {bounds_str:<25} {norm_val:<15.4f}")
+                # print(f"{key:<25} {raw_val:<15.4f} {bounds_str:<25} {norm_val:<15.4f}")
 
-            # Random action
-            action = env.action_space.sample()
-            obs, reward, terminated, truncated, info = env.step(action)
+            # action = env.action_space.sample()
+            # obs, reward, terminated, truncated, info = env.step(action)
+
+            reward = env._calculate_reward(obs, env._last_obs)
+            terminated = env._check_done(obs, env._last_obs)
+            truncated = False
+
+            print(f"Reward: {reward:.4f} | current_index: {env._current_racing_line_index}")
 
             if terminated or truncated:
                 print("\nEpisode done, resetting...")

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import wandb
 from tensordict import TensorDict
+import subprocess, time as _time  # noqa: E401
 
 try:
     from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
@@ -80,10 +81,6 @@ def _do_train():
         normalize_observations=getattr(cfg, "normalize_observations", False),
         normalization_bounds=getattr(cfg, "normalization_bounds", None),
     )
-
-    input("press enter when ur sure the controller is connected n stuff")
-
-    import subprocess, time as _time  # noqa: E401
 
     _proc_list = subprocess.run(
         ["tasklist", "/FI", "IMAGENAME eq acs.exe"], capture_output=True, text=True

@@ -32,3 +32,4 @@
 /assetto-corsa-rl/src/assetto_corsa_rl.egg-info
 /assetto-corsa-rl/wandb
 /sac_best.pt
+/sac_best copy.pt

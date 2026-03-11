@@ -1,8 +1,7 @@
 environment:
   num_envs: 1 # ac env doesn't support parallel envs
   frames_per_batch: 1024
-  racing_line_path: "https://assettocorsarl.github.io/AssettoCorsaRL-DOCS/json/brazil_racing_lines.json" # path to racing line data file
-  # TODO: allow links to the docs (where there will be pleanty of jsons for different maps)
+  racing_line_path: "D:/acrl/AssetoCorsaRL/racing_lines.json" # path to racing line data file
 
   normalize_observations: true # whether to normalize vector observations to around [-1, 1]
   # (not a strict [-1, 1], values may bounce above and below this threshold)

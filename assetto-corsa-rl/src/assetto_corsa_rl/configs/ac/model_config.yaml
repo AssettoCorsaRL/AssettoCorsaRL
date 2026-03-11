@@ -5,20 +5,22 @@ model:
   critic_lr: 3e-4
   max_grad_norm: 10.0
 
+  # bc_pretrained_model: "D:/acrl/AssetoCorsaRL/models/sac_last.pt"
   bc_pretrained_model: null
   vae_checkpoint_path: "D:/acrl/AssetoCorsaRL/models/loss=0.1050.ckpt" #* IMPORTANT: Path to pretrained encoder to load for VAE training
+  # replay_buffer_path: "D:/acrl/AssetoCorsaRL/models/replay_buffer_1225061.pkl"
   replay_buffer_path: null
 
   gamma: 0.99
   tau: 0.01
 
-  alpha: 0.15
+  alpha: 0.2
   alpha_lr: 3e-4
-  alpha_min: 0.0001
+  alpha_min: 0.01
   alpha_max: 1.0
 
   batch_size: 512
-  replay_size: 400_000
+  replay_size: 1_000_000
 
   updates_per_step: 2
   actor_update_delay: 2
@@ -47,10 +49,10 @@ model:
   ou_noise_scale: 0.3 # initial scale for additive noise after start_steps
   ou_noise_decay_steps: 100_000 # steps over which additive OU noise decays to zero
 
-  min_q_target: -50
-  max_q_target: 50
+  min_q_target: -500
+  max_q_target: 2000
 
-  number_times_single_memory_is_used_before_discard: 32
+  number_times_single_memory_is_used_before_discard: 128
 
   cumul_memories_used: 0
   cumul_memories_should_have_been_used: 0

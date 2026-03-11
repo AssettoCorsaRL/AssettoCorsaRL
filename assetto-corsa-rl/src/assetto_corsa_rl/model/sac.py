@@ -54,10 +54,10 @@ class ActorNet(nn.Module):
 
         self.mlp = nn.Sequential(
             make_lin(fusion_size, num_cells),
-            nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Dropout(p=dropout),
             make_lin(num_cells, num_cells),
-            nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Dropout(p=dropout),
             make_lin(num_cells, 2 * action_dim),
             BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
