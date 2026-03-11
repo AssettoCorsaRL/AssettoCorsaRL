@@ -30,7 +30,7 @@ if src_path not in sys.path:
     sys.path.insert(0, src_path)
 
 from assetto_corsa_rl.ac_telemetry_helper import Telemetry  # type: ignore
-from assetto_corsa_rl.ac_env import parse_image_shape  # type: ignore
+from assetto_corsa_rl.ac_env import parse_image_shape, AssettoCorsa  # type: ignore
 
 try:
     from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
@@ -50,6 +50,8 @@ class DemonstrationRecorder:
         min_speed_mph: float = 5.0,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: Optional[str] = "racing_lines.json",
+        normalize_observations: bool = False,
+        normalization_bounds: Optional[Dict[str, list]] = None,
     ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,12 +63,24 @@ class DemonstrationRecorder:
         self.input_config = input_config or {}
         self.observation_keys = [k for k, v in self.input_config.items() if v]
         self.racing_line_path = racing_line_path
+        self.normalize_observations = normalize_observations
+        self.normalization_bounds = normalization_bounds or {}
 
         self.frames: list = []
         self.actions: list = []
         self.observations: list = []
         self.rewards: list = []
         self.metadata: list = []
+
+        # Store configuration for dataset metadata
+        self._config_metadata = {
+            "observation_keys": self.observation_keys,
+            "normalize_observations": self.normalize_observations,
+            "normalization_bounds": self.normalization_bounds,
+            "racing_line_path": str(racing_line_path),
+            "image_shape": self.image_shape,
+            "frame_stack": self.frame_stack,
+        }
 
         self.frame_buffer: list = []
 
@@ -84,20 +98,25 @@ class DemonstrationRecorder:
         self._latest_processed_img: Optional[np.ndarray] = None
         self._reader_fetches: int = 0
 
-        from assetto_corsa_rl.ac_env import AssettoCorsa
-
         self._env_helper = AssettoCorsa.__new__(AssettoCorsa)
+
+        # Initialize environment helper with normalization support
+        self._env_helper.observation_keys = self.observation_keys
+        self._env_helper.normalize_observations = self.normalize_observations
+        self._env_helper.normalization_bounds = self.normalization_bounds
+
+        # Reward function parameters
+        self._env_helper.constant_reward_per_ms = 0.01
+        self._env_helper.reward_per_m_advanced_along_centerline = 1.0
+        self._env_helper.final_speed_reward_per_m_per_s = 0.1
+        self._env_helper.ms_per_action = 20.0
+        self._env_helper._meters_advanced = 0.0
+        self._env_helper._last_speed = 0.0
+        self._env_helper._last_centerline_idx = 0
+        self._env_helper._current_racing_line_index = 0
 
         try:
             self._env_helper._load_racing_line(racing_line_path)
-            self._env_helper.constant_reward_per_ms = 0.01
-            self._env_helper.reward_per_m_advanced_along_centerline = 1.0
-            self._env_helper.final_speed_reward_per_m_per_s = 0.1
-            self._env_helper.ms_per_action = 20.0
-            self._env_helper._meters_advanced = 0.0
-            self._env_helper._last_speed = 0.0
-            self._env_helper._last_centerline_idx = 0
-            self._env_helper._current_racing_line_index = 0
             self._last_reset_time = 0.0
             self._reset_cooldown_seconds = 2.0
             print(f"✓ Using environment reward function with racing line")
@@ -165,12 +184,6 @@ class DemonstrationRecorder:
             auto_start_receiver=True,
             capture_images=True,
         )
-        # TODO: add this cntrl c behavior into the telemetry, with the ai_racer argument
-        try:
-            if not self.telemetry.send_ctrl_c():
-                print("Warning: send_ctrl_c did not succeed at start")
-        except Exception as e:
-            print(f"Warning: exception sending ctrl+c at start: {e}")
 
         self.session_start = datetime.now()
         # start background reader that prefetches + preprocesses frames
@@ -218,15 +231,6 @@ class DemonstrationRecorder:
                 # during recording the game window would not respond to Ctrl+C
                 # which prevented regaining control after a lap reset.
                 self.telemetry.send_reset()
-                try:
-                    if not self.telemetry.send_ctrl_c():
-                        print("Warning: send_ctrl_c did not succeed during lap reset")
-                except Exception as e:
-                    print(f"Warning: exception sending ctrl+c during lap reset: {e}")
-                try:
-                    self.telemetry.clear_queue()
-                except Exception:
-                    pass
                 time.sleep(0.5)
         except Exception as e:
             print(f"Warning: failed to send telemetry reset: {e}")
@@ -259,14 +263,23 @@ class DemonstrationRecorder:
         return np.stack(self.frame_buffer, axis=0)
 
     def _extract_observation(self, data: Dict[str, Any]) -> Optional[np.ndarray]:
-        """Extract observation values from telemetry data based on input_config."""
+        """Extract observation values from telemetry data based on input_config.
+
+        Applies normalization if enabled and normalization bounds are available.
+        """
         if data is None or not self.observation_keys:
             return None
 
         obs_values = [
             self._env_helper._extract_value_from_data(key, data) for key in self.observation_keys
         ]
-        return np.array(obs_values, dtype=np.float32)
+        obs = np.array(obs_values, dtype=np.float32)
+
+        # Apply normalization if enabled
+        if self.normalize_observations and self.normalization_bounds:
+            obs = self._env_helper._normalize_vector(obs)
+
+        return obs
 
     def _calculate_reward(self, data: Dict[str, Any]) -> float:
         """Calculate reward from telemetry data.
@@ -406,12 +419,19 @@ class DemonstrationRecorder:
         return True
 
     def _save_batch(self):
-        """Save current batch to disk."""
+        """Save current batch to disk.
+
+        Saves frames, actions, observations, rewards, metadata, and configuration.
+        """
         if len(self.frames) == 0:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         batch_idx = self.saved_samples // self.save_interval
+
+        # Create batch directory
+        batch_dir = self.output_dir
+        batch_dir.mkdir(parents=True, exist_ok=True)
 
         filename = f"demo_batch_{batch_idx:05d}_{timestamp}.npz"
         filepath = self.output_dir / filename
@@ -426,7 +446,17 @@ class DemonstrationRecorder:
             save_dict["observations"] = np.array(self.observations, dtype=np.float32)
             save_dict["observation_keys"] = np.array(self.observation_keys, dtype=object)
 
+        # Include metadata and configuration
+        save_dict["metadata"] = np.array(self.metadata, dtype=object)
+
         np.savez_compressed(filepath, **save_dict)
+
+        # Save configuration as separate JSON file for easy access
+        import json
+
+        config_file = self.output_dir / f"batch_{batch_idx:04d}_{timestamp}_config.json"
+        with open(config_file, "w") as f:
+            json.dump(self._config_metadata, f, indent=2)
 
         self.saved_samples += len(self.frames)
         obs_info = f" with {len(self.observation_keys)} obs dims" if self.observations else ""
@@ -545,6 +575,9 @@ def main(
         return
 
     input_config = None
+    normalization_bounds = None
+    normalize_observations = False
+
     if config_path:
         try:
             import yaml
@@ -559,6 +592,17 @@ def main(
                     print(
                         f"✓ Loaded input config: {enabled_count}/{len(input_config)} inputs enabled"
                     )
+
+                # Load normalization configuration if available
+                normalization_config = cfg_data.get("environment", {}).get("normalization", {})
+                if normalization_config:
+                    normalize_observations = normalization_config.get(
+                        "normalize_observations", False
+                    )
+                    normalization_bounds = normalization_config.get("bounds", {})
+                    if normalize_observations and normalization_bounds:
+                        print(f"✓ Loaded normalization bounds for {len(normalization_bounds)} keys")
+
         except Exception as e:
             print(f"Warning: Could not load config from {config_path}: {e}")
             input_config = None
@@ -571,6 +615,8 @@ def main(
         min_speed_mph=min_speed,
         input_config=input_config,
         racing_line_path=racing_line_path,
+        normalize_observations=normalize_observations,
+        normalization_bounds=normalization_bounds,
     )
 
     print("=" * 50)
@@ -589,6 +635,13 @@ def main(
         print(f"Reset interval: {reset_interval}s")
     else:
         print("Reset interval: disabled")
+    if input_config:
+        enabled_obs = sum(1 for v in input_config.values() if v)
+        print(f"Observations: {enabled_obs} fields")
+        if normalize_observations and normalization_bounds:
+            print(f"  ↳ Normalization: enabled ({len(normalization_bounds)} bounds)")
+        else:
+            print("  ↳ Normalization: disabled")
     print("=" * 50)
 
     input("\nPress Enter when Assetto Corsa is running and you're ready to record...")
@@ -723,10 +776,12 @@ def main(
                 elapsed_total = current_time - start_time
                 fps = recorder.total_frames / elapsed_total if elapsed_total > 0 else 0
                 status = "paused" if paused else ("recording" if success else "waiting")
+                current_reward = recorder.metadata[-1]["reward"] if recorder.metadata else 0.0
                 print(
                     f"\rFrames: {recorder.total_frames} | "
                     f"Saved: {recorder.saved_samples} | "
                     f"FPS: {fps:.1f} | "
+                    f"Reward: {current_reward:.4f} | "
                     f"Status: {status}    ",
                     end="",
                 )

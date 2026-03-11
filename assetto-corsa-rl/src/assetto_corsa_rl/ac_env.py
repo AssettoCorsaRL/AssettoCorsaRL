@@ -468,7 +468,7 @@ class AssettoCorsa(gym.Env):
             + meters_progress
             * self.reward_per_m_advanced_along_centerline  # progress along racing line
             - off_track * 0.5  # penalty for being off track
-            - (50.0 if damage > 0 else 0.0)  # terminal penalty for damage
+            - (50.0 + speed * 5.0 if damage > 0 else 0.0)
         )
         self._last_speed = speed
         return reward

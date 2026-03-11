@@ -269,3 +269,109 @@ def fix_action_shape(a, batch_size, action_dim=None):
     if L % action_dim == 0:
         return a.view(batch_size, L // action_dim, action_dim).mean(dim=1)
     return a[:, :action_dim]
+
+
+def load_expert_demonstrations(
+    rb,
+    demo_dir: str,
+    subsample: int = None,
+    priority: float = 1.0,
+    log_fn=None,
+):
+    """Load expert demonstrations from npz files into the replay buffer.
+
+    Args:
+        rb: Prioritized replay buffer to populate
+        demo_dir: Path to directory containing demo_batch_*.npz files
+        subsample: If set, sample every Nth frame (default None = use all)
+        priority: PER priority value for expert transitions
+        log_fn: Optional logging function (e.g. log_info)
+
+    Returns:
+        Total number of transitions loaded
+    """
+    from pathlib import Path
+    import numpy as np
+
+    demo_path = Path(demo_dir)
+    if not demo_path.exists():
+        if log_fn:
+            log_fn(f"Expert demonstrations directory not found: {demo_dir}")
+        return 0
+
+    demo_files = sorted(demo_path.glob("demo_batch_*.npz"))
+    if not demo_files:
+        if log_fn:
+            log_fn(f"No demo_batch_*.npz files found in {demo_dir}")
+        return 0
+
+    total_loaded = 0
+    for demo_file in demo_files:
+        try:
+            data = np.load(demo_file, allow_pickle=True)
+            frames = data["frames"]  # [N, C, H, W]
+            actions = data["actions"]  # [N, action_dim]
+            rewards = data["rewards"]  # [N]
+
+            observations = None
+            if "observations" in data:
+                observations = data["observations"]  # [N, obs_dim]
+
+            num_samples = len(frames)
+
+            indices = list(range(num_samples))
+            if subsample and subsample > 1:
+                indices = indices[::subsample]
+
+            for idx in indices:
+                current_pixels = torch.from_numpy(frames[idx]).unsqueeze(0)  # [1, C, H, W]
+
+                if idx + 1 < len(frames):
+                    next_pixels = torch.from_numpy(frames[idx + 1]).unsqueeze(0)
+                else:
+                    next_pixels = current_pixels.clone()
+
+                action = torch.from_numpy(actions[idx]).unsqueeze(0)  # [1, action_dim]
+                reward = torch.from_numpy(rewards[idx : idx + 1])  # [1]
+                done = torch.zeros(1, dtype=torch.bool)
+
+                transition = TensorDict(
+                    {
+                        "pixels": pack_pixels(current_pixels[0]),
+                        "action": action[0].float().cpu(),
+                        "reward": reward.float().cpu(),
+                        "next_pixels": pack_pixels(next_pixels[0]),
+                        "done": done.cpu(),
+                    },
+                    batch_size=[],
+                )
+
+                if observations is not None:
+                    transition["vector"] = torch.from_numpy(observations[idx]).float().cpu()
+                    if idx + 1 < len(observations):
+                        transition["next_vector"] = (
+                            torch.from_numpy(observations[idx + 1]).float().cpu()
+                        )
+                    else:
+                        transition["next_vector"] = transition["vector"].clone()
+
+                rb.add(transition)
+                total_loaded += 1
+
+            if log_fn:
+                subsample_info = (
+                    f" (subsampled 1/{subsample})" if subsample and subsample > 1 else ""
+                )
+                log_fn(
+                    f"  ✓ Loaded {len(indices)} transitions from {demo_file.name}{subsample_info}"
+                )
+
+        except Exception as e:
+            if log_fn:
+                log_fn(f"  Warning: Failed to load {demo_file.name}: {e}")
+            continue
+
+    if log_fn:
+        log_fn(f"Expert demonstrations loaded: {total_loaded} total transitions")
+
+    return total_loaded
