@@ -1,6 +1,6 @@
 train:
   start_steps: 10_000 # number of random action steps to collect before training begins
-  total_steps: 1_000_000
+  total_steps: 2_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
   log_update_every: 400 # how often (in gradient updates) to log loss metrics (reduced from 2000 for frequent visibility)
   save_interval: 50_000 # how often (in steps) to save model checkpoints

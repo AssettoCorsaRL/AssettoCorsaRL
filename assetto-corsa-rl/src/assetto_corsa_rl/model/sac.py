@@ -57,10 +57,32 @@ class ActorNet(nn.Module):
         obs_dim,
         min_scale,
         max_scale,
+        use_lstm=True,
+        lstm_hidden_size=256,
+        lstm_layers=1,
+        stateful_inference=True,
     ):
         super().__init__()
         self.cnn = cnn
         self.obs_dim = obs_dim
+        self.use_lstm = bool(use_lstm)
+        self.stateful_inference = bool(stateful_inference)
+        self._context_state = None
+
+        lstm_hidden_size = int(lstm_hidden_size)
+        lstm_layers = int(lstm_layers)
+        if self.use_lstm:
+            self.context_lstm = nn.LSTM(
+                input_size=fusion_size,
+                hidden_size=lstm_hidden_size,
+                num_layers=lstm_layers,
+                batch_first=True,
+                device=device,
+            )
+            mlp_input_size = lstm_hidden_size
+        else:
+            self.context_lstm = None
+            mlp_input_size = fusion_size
 
         def make_lin(i, o):
             if use_noisy:
@@ -68,7 +90,7 @@ class ActorNet(nn.Module):
             return nn.Linear(i, o, device=device)
 
         self.mlp = nn.Sequential(
-            make_lin(fusion_size, num_cells),
+            make_lin(mlp_input_size, num_cells),
             nn.LeakyReLU(),
             nn.Dropout(p=dropout),
             make_lin(num_cells, num_cells),
@@ -77,50 +99,140 @@ class ActorNet(nn.Module):
             make_lin(num_cells, 2 * action_dim),
             BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
         )
-
         self._init_weights()
 
     def _init_weights(self):
         lrelu_gain = nn.init.calculate_gain("leaky_relu", 0.01)
-
+        if self.context_lstm is not None:
+            for name, param in self.context_lstm.named_parameters():
+                if "weight" in name:
+                    nn.init.orthogonal_(param)
+                elif "bias" in name:
+                    nn.init.zeros_(param)
         _init_orthogonal(self.mlp[0], gain=lrelu_gain)
         _init_orthogonal(self.mlp[3], gain=lrelu_gain)
         _init_orthogonal(self.mlp[6], gain=0.01)
-
-        # loc biases at 0 is fine.
-        # log_scale biases must start WITHIN [log(min), log(max)] so clamp doesn't kill gradients.
-        # log(0.01) = -4.6,  log(0.5) = -0.69,  midpoint = -2.65
         action_dim = self.mlp[6].out_features // 2
         with torch.no_grad():
-            # Access min/max from BoundedNormalParams (mlp[7])
-            log_min = self.mlp[7].log_scale_min  # [-4.6, -4.6, -4.6]
-            log_max = self.mlp[7].log_scale_max  # [-0.69, -0.69, -0.69]
-            mid = (log_min + log_max) / 2  # [-2.65, -2.65, -2.65]
-            self.mlp[6].bias[action_dim:] = mid
+            log_min = self.mlp[7].log_scale_min
+            log_max = self.mlp[7].log_scale_max
+            self.mlp[6].bias[action_dim:] = (log_min + log_max) / 2
 
-    def forward(self, pixels, vector=None):
-        img_feat = self.cnn(pixels)
+    def reset_context(self):
+        self._context_state = None
+
+    # ── NEW: sequence forward for training ────────────────────────────
+    def forward_sequence(self, obs_features, vector=None, lstm_state=None):
+        """
+        Args:
+            obs_features: (B, T, feat_dim) pre-computed CNN features
+            vector:       (B, T, obs_dim) or None
+            lstm_state:   optional (h_0, c_0) tuple
+        Returns:
+            {"loc": (B, T, act_dim), "scale": (B, T, act_dim)}, final_state
+        """
+        B, T, _ = obs_features.shape
         if vector is not None and self.obs_dim > 0:
+            x = torch.cat([obs_features, vector], dim=-1)
+        else:
+            x = obs_features
+
+        if self.context_lstm is not None:
+            lstm_out, final_state = self.context_lstm(x, lstm_state)
+        else:
+            lstm_out = x
+            final_state = None
+
+        out = self.mlp(lstm_out.reshape(B * T, -1))  # dict
+        return {
+            "loc": out["loc"].reshape(B, T, -1),
+            "scale": out["scale"].reshape(B, T, -1),
+        }, final_state
+
+    # ── existing single-step forward (inference) ──────────────────────
+    def forward(self, pixels, vector=None):
+        if pixels.ndim == 5:
+            b, t, c, h, w = pixels.shape
+            img_feat = self.cnn(pixels.view(b * t, c, h, w)).view(b, t, -1)
+        else:
+            img_feat = self.cnn(pixels)
+
+        if vector is not None and self.obs_dim > 0:
+            if img_feat.ndim == 3 and vector.ndim == 2:
+                vector = vector.unsqueeze(1)
             x = torch.cat([img_feat, vector], dim=-1)
         else:
             x = img_feat
+
+        # stateful single-step LSTM (inference only)
+        if self.context_lstm is not None:
+            seq = x.unsqueeze(1) if x.ndim == 2 else x
+            state = None
+            if (not self.training) and self.stateful_inference and self._context_state is not None:
+                h, c = self._context_state
+                if h.shape[1] == seq.shape[0]:
+                    state = (h, c)
+            out, new_state = self.context_lstm(seq, state)
+            if (not self.training) and self.stateful_inference:
+                self._context_state = (new_state[0].detach(), new_state[1].detach())
+            x = out[:, -1, :]
+        elif x.ndim == 3:
+            x = x[:, -1, :]
+
         return self.mlp(x)
 
 
 class CriticNet(nn.Module):
-    def __init__(self, encoder, cnn_output_size, action_dim, hidden, device, obs_dim):
+    """
+    LSTM processes observation features ONLY (no action).
+    Actions are injected after the LSTM into the MLP head.
+    This lets online/target LSTMs share the same obs pass.
+    """
+
+    def __init__(
+        self,
+        encoder,
+        cnn_output_size,
+        action_dim,
+        hidden,
+        device,
+        obs_dim,
+        use_lstm=False,
+        lstm_hidden_size=256,
+        lstm_layers=1,
+        stateful_inference=True,
+    ):
         super().__init__()
         self.cnn = encoder
         self.obs_dim = obs_dim
+        self.use_lstm = bool(use_lstm)
+        self.stateful_inference = bool(stateful_inference)
+        self._context_state = None
+        self.action_dim = action_dim
 
         self.action_embed = nn.Sequential(
             nn.Linear(action_dim, 128, device=device),
             nn.LeakyReLU(),
         )
 
-        fusion_size = cnn_output_size + 128 + obs_dim
+        # LSTM input: obs features only (NO action)
+        obs_fusion_size = cnn_output_size + obs_dim
+
+        if self.use_lstm:
+            self.context_lstm = nn.LSTM(
+                input_size=obs_fusion_size,
+                hidden_size=int(lstm_hidden_size),
+                num_layers=int(lstm_layers),
+                batch_first=True,
+                device=device,
+            )
+            fc_input_size = int(lstm_hidden_size) + 128  # lstm hidden + action embed
+        else:
+            self.context_lstm = None
+            fc_input_size = obs_fusion_size + 128
+
         self.fc = nn.Sequential(
-            nn.Linear(fusion_size, hidden, device=device),
+            nn.Linear(fc_input_size, hidden, device=device),
             nn.LayerNorm(hidden, device=device),
             nn.LeakyReLU(),
             nn.Linear(hidden, hidden, device=device),
@@ -130,13 +242,91 @@ class CriticNet(nn.Module):
         )
         self._init_weights()
 
-    def forward(self, pixels, action, vector=None):
-        img_features = self.cnn(pixels)
-        act = self.action_embed(action.flatten(start_dim=1))
-        parts = [img_features, act]
+    def _init_weights(self):
+        lrelu_gain = nn.init.calculate_gain("leaky_relu", 0.01)
+        if self.context_lstm is not None:
+            for name, param in self.context_lstm.named_parameters():
+                if "weight" in name:
+                    nn.init.orthogonal_(param)
+                elif "bias" in name:
+                    nn.init.zeros_(param)
+        _init_orthogonal(self.fc[0], gain=lrelu_gain)
+        _init_orthogonal(self.fc[3], gain=lrelu_gain)
+        _init_orthogonal(self.fc[6], gain=0.01)
+
+    def reset_context(self):
+        self._context_state = None
+
+    # ── NEW: split LSTM and Q-head for flexible composition ───────────
+
+    def forward_lstm(self, obs_features, vector=None, lstm_state=None):
+        """Run LSTM on observation features. Returns hidden states.
+
+        Args:
+            obs_features: (B, T, feat_dim)
+            vector:       (B, T, obs_dim) or None
+        Returns:
+            h: (B, T, hidden_dim), final_state
+        """
+        if vector is not None and self.obs_dim > 0:
+            lstm_input = torch.cat([obs_features, vector], dim=-1)
+        else:
+            lstm_input = obs_features
+
+        if self.context_lstm is not None:
+            h, state = self.context_lstm(lstm_input, lstm_state)
+        else:
+            h = lstm_input
+            state = None
+        return h, state
+
+    def forward_q(self, lstm_hidden, actions):
+        """Compute Q from pre-computed LSTM hidden + actions.
+
+        Args:
+            lstm_hidden: (B, T, hidden_dim)
+            actions:     (B, T, action_dim)
+        Returns:
+            q: (B, T, 1)
+        """
+        B, T, _ = lstm_hidden.shape
+        act_emb = self.action_embed(actions.reshape(B * T, -1)).reshape(B, T, -1)
+        x = torch.cat([lstm_hidden, act_emb], dim=-1)
+        return self.fc(x.reshape(B * T, -1)).reshape(B, T, 1)
+
+    def forward_sequence(self, obs_features, actions, vector=None, lstm_state=None):
+        """Combined LSTM + Q-head for convenience."""
+        h, state = self.forward_lstm(obs_features, vector, lstm_state)
+        q = self.forward_q(h, actions)
+        return q, state
+
+    # ── existing single-step forward (inference) ──────────────────────
+
+    def forward(self, pixels, action, vector=None, img_features=None):
+        if img_features is None:
+            img_features = self.cnn(pixels)
+
+        parts = [img_features]
         if vector is not None and self.obs_dim > 0:
             parts.append(vector)
-        x = torch.cat(parts, dim=-1)
+        obs_feat = torch.cat(parts, dim=-1)
+
+        if self.context_lstm is not None:
+            seq = obs_feat.unsqueeze(1)
+            state = None
+            if (not self.training) and self.stateful_inference and self._context_state is not None:
+                h, c = self._context_state
+                if h.shape[1] == seq.shape[0]:
+                    state = (h, c)
+            out, new_state = self.context_lstm(seq, state)
+            if (not self.training) and self.stateful_inference:
+                self._context_state = (new_state[0].detach(), new_state[1].detach())
+            obs_context = out[:, -1, :]
+        else:
+            obs_context = obs_feat
+
+        act_emb = self.action_embed(action.flatten(start_dim=1))
+        x = torch.cat([obs_context, act_emb], dim=-1)
         return self.fc(x)
 
 
@@ -174,6 +364,10 @@ class SACPolicy:
         actor_dropout: float = 0.0,
         vae_checkpoint_path: str = None,
         obs_dim: int = 0,
+        use_lstm: bool = False,
+        lstm_hidden_size: int = 256,
+        lstm_layers: int = 1,
+        stateful_inference: bool = True,
     ):
         if device is None:
             device = get_device()
@@ -242,6 +436,10 @@ class SACPolicy:
             obs_dim,
             min_scale,
             max_scale,
+            use_lstm=use_lstm,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_layers=lstm_layers,
+            stateful_inference=stateful_inference,
         )
 
         if obs_dim > 0:
@@ -293,13 +491,53 @@ class SACPolicy:
         # Targets use a frozen deepcopy updated via polyak in the trainer.
         critic_input_size = cnn_output_size + action_dim + obs_dim
 
-        q1_net = CriticNet(shared_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim)
-        q2_net = CriticNet(shared_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim)
+        q1_net = CriticNet(
+            shared_cnn,
+            cnn_output_size,
+            action_dim,
+            num_cells,
+            device,
+            obs_dim,
+            use_lstm=use_lstm,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_layers=lstm_layers,
+            stateful_inference=stateful_inference,
+        )
+        q2_net = CriticNet(
+            shared_cnn,
+            cnn_output_size,
+            action_dim,
+            num_cells,
+            device,
+            obs_dim,
+            use_lstm=use_lstm,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_layers=lstm_layers,
+            stateful_inference=stateful_inference,
+        )
         q1_net_target = CriticNet(
-            target_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim
+            target_cnn,
+            cnn_output_size,
+            action_dim,
+            num_cells,
+            device,
+            obs_dim,
+            use_lstm=use_lstm,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_layers=lstm_layers,
+            stateful_inference=stateful_inference,
         )
         q2_net_target = CriticNet(
-            target_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim
+            target_cnn,
+            cnn_output_size,
+            action_dim,
+            num_cells,
+            device,
+            obs_dim,
+            use_lstm=use_lstm,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_layers=lstm_layers,
+            stateful_inference=stateful_inference,
         )
 
         # Wrap in ValueOperator for state dict / parameter access,
@@ -314,8 +552,17 @@ class SACPolicy:
 
         print(
             f"SACPolicy initialized | obs_dim={obs_dim} | "
-            f"fusion_input={fusion_input_size} | critic_input={critic_input_size}"
+            f"fusion_input={fusion_input_size} | critic_input={critic_input_size} | "
+            f"use_lstm={use_lstm} | lstm_hidden={lstm_hidden_size}"
         )
+
+    def reset_context(self):
+        for m in [self.actor, self.q1, self.q2, self.q1_target, self.q2_target]:
+            if m is None:
+                continue
+            for sub in m.modules():
+                if hasattr(sub, "reset_context"):
+                    sub.reset_context()
 
     def sample_noise(self):
         """Resample noise for all noisy layers in the actor."""

@@ -100,6 +100,10 @@ def test(checkpoint, vae_checkpoint, max_steps, episodes, render):
         use_noisy=False,
         actor_dropout=0.0,
         vae_checkpoint_path=str(vae_checkpoint),
+        use_lstm=bool(config.get("use_lstm", False)),
+        lstm_hidden_size=int(config.get("lstm_hidden_size", 256)),
+        lstm_layers=int(config.get("lstm_layers", 1)),
+        stateful_inference=bool(config.get("stateful_inference", True)),
     )
 
     modules = agent.modules()

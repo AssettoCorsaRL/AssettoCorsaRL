@@ -30,7 +30,7 @@ except Exception:
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
     from assetto_corsa_rl.train.train_utils import load_expert_demonstrations  # type: ignore
 
-from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage, ListStorage
+from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
 
 try:
     from assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml
@@ -115,6 +115,10 @@ def _do_train():
         use_noisy=cfg.use_noisy,
         noise_sigma=cfg.noise_sigma,
         vae_checkpoint_path=vae_path,
+        use_lstm=getattr(cfg, "use_lstm", False),
+        lstm_hidden_size=getattr(cfg, "lstm_hidden_size", 256),
+        lstm_layers=getattr(cfg, "lstm_layers", 1),
+        stateful_inference=getattr(cfg, "stateful_inference", True),
     )
     modules = agent.modules()
 
@@ -225,13 +229,26 @@ def _do_train():
     target_entropy = -float(env.action_spec.shape[-1])
     log_info(f"Target entropy: {target_entropy}")
 
-    log_info("Using PrioritizedReplayBuffer with LazyTensorStorage (contiguous memory)")
-    storage = LazyTensorStorage(max_size=cfg.replay_size)
+    def _collate_sequence_batch(batch):
+        """Collate a list of sequence TensorDicts into a single batched TensorDict."""
+        if isinstance(batch, TensorDict):
+            return batch
+        if isinstance(batch, (list, tuple)) and len(batch) > 0:
+            keys = batch[0].keys()
+            result = {}
+            for k in keys:
+                result[k] = torch.stack([b[k] for b in batch], dim=0)
+            return TensorDict(result, batch_size=[len(batch)])
+        return batch
+
+    log_info("Using PrioritizedReplayBuffer with ListStorage")
+    storage = ListStorage(max_size=cfg.replay_size)
     rb = PrioritizedReplayBuffer(
         alpha=cfg.per_alpha,
         beta=cfg.per_beta,
         storage=storage,
         batch_size=cfg.batch_size,
+        collate_fn=_collate_sequence_batch,
     )
 
     replay_buffer_path = getattr(cfg, "replay_buffer_path", None)

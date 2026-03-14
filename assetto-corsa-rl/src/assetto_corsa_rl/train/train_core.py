@@ -5,10 +5,63 @@ import types
 
 import torch.multiprocessing as mp
 import torch
+from tensordict import TensorDict
 
 from .collector import CollectorWorker
 from .learner import LearnerWorker
 from .logging_utils import log_info, log_success, log_warning, log_error
+
+
+# ── Collation function for sequence batches ────────────────────────────────────
+
+
+def _collate_sequence_batch(batch):
+    """Collate a list of sequence TensorDicts into a single batched TensorDict.
+
+    When the replay buffer samples a batch of sequences (typically from ListStorage),
+    each item is a dict/TensorDict with:
+        features: (T+1, F)
+        actions: (T, A)
+        rewards: (T, 1)
+        dones: (T, 1)
+        terminated: (T, 1)
+        mask: (T, 1)
+        vector: (T+1, O) [optional]
+
+    This function stacks them along batch dimension to produce:
+        features: (B, T+1, F)
+        actions: (B, T, A)
+        etc.
+
+    Args:
+        batch: Either a TensorDict (if already batched), list of TensorDicts, or list of dicts
+
+    Returns:
+        TensorDict with batched tensors
+    """
+    if isinstance(batch, TensorDict):
+        # Already batched
+        return batch
+
+    if isinstance(batch, (list, tuple)) and len(batch) > 0:
+        # Extract keys from first item
+        first = batch[0]
+        if isinstance(first, TensorDict):
+            keys = first.keys()
+        elif isinstance(first, dict):
+            keys = first.keys()
+        else:
+            return batch  # Unknown format, return as-is
+
+        # Stack each key
+        result_dict = {}
+        for k in keys:
+            tensors = [b[k] for b in batch]
+            result_dict[k] = torch.stack(tensors, dim=0)
+
+        return TensorDict(result_dict, batch_size=[len(batch)])
+
+    return batch
 
 
 # ── subprocess entry-points ────────────────────────────────────────────────────
@@ -72,14 +125,15 @@ def _learner_process_fn(
     start_time,
 ):
     """Entry-point for the learner subprocess."""
-    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, LazyTensorStorage
+    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
 
-    storage = LazyTensorStorage(max_size=rb_kwargs["max_size"])
+    storage = ListStorage(max_size=rb_kwargs["max_size"])
     rb = PrioritizedReplayBuffer(
         alpha=rb_kwargs["alpha"],
         beta=rb_kwargs["beta"],
         storage=storage,
         batch_size=rb_kwargs["batch_size"],
+        collate_fn=_collate_sequence_batch,  # Custom collation for sequence batches
     )
 
     if getattr(cfg, "use_expert_demonstrations", False):

@@ -426,6 +426,20 @@ def load_expert_demonstrations(
                 (expert_indices.numel(),), expert_priority, dtype=torch.float32
             )
             rb.update_priority(expert_indices, expert_priorities.numpy())
+
+            existing_expert_indices = getattr(rb, "_expert_indices", None)
+            if (
+                isinstance(existing_expert_indices, torch.Tensor)
+                and existing_expert_indices.numel() > 0
+            ):
+                merged = torch.cat(
+                    [existing_expert_indices.view(-1).to(torch.long), expert_indices.view(-1)]
+                )
+                rb._expert_indices = torch.unique(merged, sorted=True)
+            else:
+                rb._expert_indices = expert_indices.view(-1).to(torch.long)
+            rb._expert_demo_epsilon = eps
+
             _emit(
                 "[expert-demo] Set priority="
                 f"{expert_priority:.6f} (max={max_priority:.6f} + eps={eps:.6f}) "

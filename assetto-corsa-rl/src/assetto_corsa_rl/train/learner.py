@@ -106,8 +106,17 @@ class LearnerWorker:
             1,
             int(getattr(cfg, "total_steps", 1_000_000)) * int(getattr(cfg, "updates_per_step", 1)),
         )
+        self._total_update_budget = _total_updates
         self.actor_scheduler = self._build_scheduler(self.actor_opt, _total_updates)
         self.critic_scheduler = self._build_scheduler(self.critic_opt, _total_updates)
+
+        self._expert_priority_refresh_updates = int(
+            getattr(cfg, "expert_priority_refresh_updates", 1000)
+        )
+        self._expert_priority_initial_bonus = float(getattr(cfg, "expert_demo_epsilon", 1e-3))
+        self._last_expert_bonus = max(0.0, self._expert_priority_initial_bonus)
+        self._last_expert_target_priority = 0.0
+        self._last_expert_base_priority = 0.0
 
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage).
@@ -159,9 +168,18 @@ class LearnerWorker:
     # === transition ingestion =====================================================================
 
     def _drain_transitions(self, max_items: int = 8192) -> int:
-        """Pull up to *max_items* transitions from the queue into the replay buffer.
+        """Pull sequence chunks from the queue into the replay buffer.
 
-        Returns the number of step transitions ingested (meta messages excluded).
+        Each item is either:
+        - A dict with "_meta" key (episode return, epsilon updates)
+        - A sequence dict from EpisodeAccumulator with keys:
+            features: (T+1, F)
+            actions:  (T, A)
+            rewards:  (T, 1)
+            dones:    (T, 1)
+            terminated: (T, 1)
+            mask:     (T, 1)
+            vector:   (T+1, O)  [optional]
         """
         count = 0
         for _ in range(max_items):
@@ -169,6 +187,8 @@ class LearnerWorker:
                 item = self.transitions_queue.get_nowait()
             except Exception:
                 break
+
+            # Meta messages (episode returns, epsilon, etc.)
             if isinstance(item, dict) and item.get("_meta"):
                 if "episode_return" in item:
                     self.episode_returns.append(float(item["episode_return"]))
@@ -177,23 +197,26 @@ class LearnerWorker:
                 if "epsilon" in item:
                     self._last_epsilon = float(item["epsilon"])
                 continue
-            td_data = {
-                "pixels": item["pixels"],
-                "action": item["action"],
-                "reward": item["reward"],
-                "next_pixels": item["next_pixels"],
-                "done": item["done"],
-            }
-            if "terminated" in item:
-                td_data["terminated"] = item["terminated"]
-            if "truncated" in item:
-                td_data["truncated"] = item["truncated"]
-            if "vector" in item:
-                td_data["vector"] = item["vector"]
-            if "next_vector" in item:
-                td_data["next_vector"] = item["next_vector"]
-            self.rb.add(TensorDict(td_data, batch_size=[]))
-            count += 1
+
+            # Sequence chunk from EpisodeAccumulator
+            # Convert to TensorDict for the replay buffer
+            td_data = {}
+            for k, v in item.items():
+                if isinstance(v, torch.Tensor):
+                    td_data[k] = v.cpu()
+
+            # Keep each sequence as a single replay item.
+            # Time is a data dimension inside tensors (features=(T+1,F), actions=(T,A), ...),
+            # not the TensorDict batch dimension.
+            td = TensorDict(td_data, batch_size=[])
+            self.rb.add(td)
+            # Count by the number of real timesteps in the sequence
+            mask = item.get("mask", None)
+            if mask is not None:
+                count += int(mask.sum().item())
+            else:
+                count += item["actions"].shape[0]
+
         return count
 
     # === weight broadcast (multi-process) ===================================================
@@ -206,124 +229,243 @@ class LearnerWorker:
                 self.shared_weights[k].copy_(v)
             self.weights_version.value += 1
 
-    # === gradient update ===========================================================================â”€
+    def _get_current_max_priority(self) -> float:
+        sampler_candidates = [
+            self.rb,
+            getattr(self.rb, "sampler", None),
+            getattr(self.rb, "_sampler", None),
+        ]
+        attrs = ("max_priority", "_max_priority")
+
+        for candidate in sampler_candidates:
+            if candidate is None:
+                continue
+            for attr in attrs:
+                value = getattr(candidate, attr, None)
+                if value is None:
+                    continue
+                try:
+                    value_f = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(value_f) and value_f > 0.0:
+                    return value_f
+        return 1.0
+
+    def _maybe_refresh_expert_priorities(self):
+        if not bool(getattr(self.cfg, "use_expert_demonstrations", False)):
+            return
+        if self._expert_priority_refresh_updates <= 0:
+            return
+        if self._updates_count <= 0:
+            return
+        if self._updates_count % self._expert_priority_refresh_updates != 0:
+            return
+
+        expert_indices = getattr(self.rb, "_expert_indices", None)
+        if not isinstance(expert_indices, torch.Tensor) or expert_indices.numel() == 0:
+            return
+
+        progress = min(1.0, float(self._updates_count) / float(max(1, self._total_update_budget)))
+        annealed_bonus = max(0.0, self._expert_priority_initial_bonus * (1.0 - progress))
+
+        current_max = self._get_current_max_priority()
+        base_priority = max(1e-6, current_max - max(0.0, self._last_expert_bonus))
+        target_priority = base_priority + annealed_bonus
+        per_max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
+        target_priority = float(np.clip(target_priority, 1e-6, per_max_priority))
+
+        idx = expert_indices.view(-1).to(torch.long).cpu()
+        priorities = np.full((idx.numel(),), target_priority, dtype=np.float32)
+        self.rb.update_priority(idx, priorities)
+
+        self._last_expert_bonus = annealed_bonus
+        self._last_expert_base_priority = base_priority
+        self._last_expert_target_priority = target_priority
+
+    def _to_device_fast(self, x: torch.Tensor, dtype=None) -> torch.Tensor:
+        """Move tensor to learner device, using pinned-memory async copies when possible."""
+        if not isinstance(x, torch.Tensor):
+            return x
+        if dtype is not None:
+            x = x.to(dtype=dtype)
+        if x.device.type == "cpu":
+            try:
+                x = x.pin_memory()
+            except Exception:
+                pass
+            return x.to(self.device, non_blocking=True)
+        return x.to(self.device)
+
+    def _unpack_batch(self, batch):
+        """Convert sampled batch to a properly batched dict of tensors.
+
+        Handles both ListStorage (returns list/stacked TensorDicts) and
+        LazyTensorStorage (returns a single TensorDict).
+
+        Args:
+            batch: Either a TensorDict, list of TensorDicts, or similar
+
+        Returns:
+            Dict with keys mapping to tensors (already batched)
+        """
+        if isinstance(batch, (list, tuple)):
+            # ListStorage: batch is a list of TensorDicts or dicts
+            stacked = {}
+            keys = batch[0].keys() if hasattr(batch[0], "keys") else batch[0].keys()
+            for k in keys:
+                tensors = [b[k] for b in batch]
+                stacked[k] = torch.stack(tensors, dim=0)
+            return stacked
+        elif isinstance(batch, TensorDict):
+            # Already batched TensorDict - convert to dict
+            return {k: batch[k] for k in batch.keys()}
+        else:
+            # Assume it's already a dict
+            return batch
+
+    # === gradient update ===========================================================================
 
     def _do_update(self):
+        """Perform one gradient update using sequence chunks from the replay buffer."""
+
         if self._freeze_encoder_steps > 0:
             if self.total_steps < self._freeze_encoder_steps and not self._encoder_frozen:
                 self._set_encoder_requires_grad(False)
                 self._encoder_frozen = True
-                print(
-                    f"[INFO] Visual encoder frozen "
-                    f"(step {self.total_steps} < {self._freeze_encoder_steps})"
-                )
             elif self.total_steps >= self._freeze_encoder_steps and self._encoder_frozen:
                 self._set_encoder_requires_grad(True)
                 self._encoder_frozen = False
-                print(
-                    f"[INFO] Visual encoder unfrozen "
-                    f"(step {self.total_steps} >= {self._freeze_encoder_steps})"
-                )
 
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
         batch_indices = info.get("index", None)
 
-        pixels_b = batch["pixels"]
-        if isinstance(pixels_b, torch.Tensor) and not torch.is_floating_point(pixels_b):
-            pixels_b = unpack_pixels(pixels_b).to(self.device)
-        else:
-            pixels_b = pixels_b.to(self.device)
+        # ── Unpack sequence batch ──────────────────────────────────────
+        # features: (B, T+1, F) - precomputed CNN features
+        # actions:  (B, T, A)
+        # rewards:  (B, T, 1)
+        # dones:    (B, T, 1)
+        # mask:     (B, T, 1) - 1 for real steps, 0 for padding
+        # vector:   (B, T+1, O) [optional]
 
-        actions_b = batch["action"].to(self.device).to(torch.float32)
-        rewards_b = batch["reward"].to(self.device).view(-1, 1)
+        features = self._to_device_fast(batch["features"], dtype=torch.float32)
+        actions_b = self._to_device_fast(batch["actions"], dtype=torch.float32)
+        rewards_b = self._to_device_fast(batch["rewards"], dtype=torch.float32)
+        mask = self._to_device_fast(batch["mask"], dtype=torch.float32)
 
-        next_pixels_b = batch["next_pixels"]
-        if isinstance(next_pixels_b, torch.Tensor) and not torch.is_floating_point(next_pixels_b):
-            next_pixels_b = unpack_pixels(next_pixels_b).to(self.device)
-        else:
-            next_pixels_b = next_pixels_b.to(self.device)
-
-        dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
         if "terminated" in batch.keys():
-            terminated_b = batch["terminated"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
-            dones_b = torch.maximum(dones_b, terminated_b)
-        if "truncated" in batch.keys():
-            truncated_b = batch["truncated"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
-            dones_b = torch.maximum(dones_b, truncated_b)
+            terminal_mask = self._to_device_fast(batch["terminated"]).to(dtype=torch.float32)
+        else:
+            terminal_mask = self._to_device_fast(batch["dones"]).to(dtype=torch.float32)
 
-        vector_b = batch["vector"].to(self.device) if "vector" in batch.keys() else None
-        next_vector_b = (
-            batch["next_vector"].to(self.device) if "next_vector" in batch.keys() else None
+        vector_b = (
+            self._to_device_fast(batch["vector"], dtype=torch.float32)
+            if "vector" in batch.keys()
+            else None
         )
 
-        # ===== Critic Update =====
+        B, T_plus_1, F = features.shape
+        T = T_plus_1 - 1
+        A = actions_b.shape[-1]
+
+        # Split features into current (0..T-1) and next (1..T)
+        obs_features = features[:, :T, :]  # (B, T, F)
+        next_obs_features = features[:, 1:, :]  # (B, T, F)
+
+        # Split vector similarly if present
+        obs_vector = vector_b[:, :T, :] if vector_b is not None else None
+        next_obs_vector = vector_b[:, 1:, :] if vector_b is not None else None
+
+        alpha = self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
+
+        # ══════════════════════════════════════════════════════════════════
+        # CRITIC UPDATE
+        # ══════════════════════════════════════════════════════════════════
+
+        # ── Compute target Q values ────────────────────────────────────
         with torch.no_grad():
-            next_td_data = {"pixels": next_pixels_b}
-            if next_vector_b is not None:
-                next_td_data["vector"] = next_vector_b
-            next_td = TensorDict(next_td_data, batch_size=next_pixels_b.shape[0])
-            next_out = self.actor(next_td)
-            next_actions = fix_action_shape(
-                next_out["action"],
-                next_pixels_b.shape[0],
-                action_dim=self.env.action_spec.shape[-1],
+            # 1) Get next actions from actor (need to run actor LSTM on obs sequence)
+            actor_net = self.actor.module.module  # unwrap TensorDictModule + ProbabilisticActor
+            actor_params, next_actor_state = actor_net.forward_sequence(
+                next_obs_features, vector=next_obs_vector
             )
-            next_log_prob = next_out["action_log_prob"].view(-1, 1)
+            # Sample actions from the distribution
+            from torchrl.modules import TanhNormal
 
-            next_q1 = self.q1_target.module(next_pixels_b, next_actions, next_vector_b).view(-1, 1)
-            next_q2 = self.q2_target.module(next_pixels_b, next_actions, next_vector_b).view(-1, 1)
-            next_min_q = torch.min(next_q1, next_q2)
+            next_dist = TanhNormal(
+                loc=actor_params["loc"],
+                scale=actor_params["scale"],
+                low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
+                high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
+            )
+            next_actions = next_dist.rsample()  # (B, T, A)
+            next_log_prob = next_dist.log_prob(next_actions)  # (B, T) or (B, T, A)
+            if next_log_prob.dim() == 3:
+                next_log_prob = next_log_prob.sum(dim=-1, keepdim=True)  # (B, T, 1)
+            elif next_log_prob.dim() == 2:
+                next_log_prob = next_log_prob.unsqueeze(-1)  # (B, T, 1)
 
-            alpha = self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
+            # 2) Run target critic LSTMs on the NEXT observation sequence
+            #    Key insight: target critics process obs-only through LSTM,
+            #    then combine with actions in the Q-head
+            q1_target_net = self.q1_target.module
+            q2_target_net = self.q2_target.module
+
+            next_q1, _ = q1_target_net.forward_sequence(
+                next_obs_features, next_actions, vector=next_obs_vector
+            )
+            next_q2, _ = q2_target_net.forward_sequence(
+                next_obs_features, next_actions, vector=next_obs_vector
+            )
+            next_min_q = torch.min(next_q1, next_q2)  # (B, T, 1)
+
             next_v = next_min_q - alpha * next_log_prob
-            q_target = rewards_b + self.cfg.gamma * (1.0 - dones_b) * next_v
+            q_target = rewards_b + self.cfg.gamma * (1.0 - terminal_mask) * next_v
+
             min_q = float(getattr(self.cfg, "min_q_target", -1000.0))
             max_q = float(getattr(self.cfg, "max_q_target", 1000.0))
             q_target = torch.clamp(q_target, min=min_q, max=max_q)
 
-        actions_b = fix_action_shape(
-            actions_b, pixels_b.shape[0], action_dim=self.env.action_spec.shape[-1]
-        )
-        q1_pred = self.q1.module(pixels_b, actions_b, vector_b).view(-1, 1)
-        q2_pred = self.q2.module(pixels_b, actions_b, vector_b).view(-1, 1)
+        # ── Compute predicted Q values ─────────────────────────────────
+        # Online critics share the same LSTM obs pass, diverge at Q-head
+        q1_net = self.q1.module
+        q2_net = self.q2.module
 
-        # ── PER importance-sampling weights ───────────────────────────
-        # Without IS correction, PER introduces bias that destabilises
-        # the critic – a primary cause of catastrophic forgetting.
-        is_weights = info.get("_weight", None)
-        if is_weights is None:
-            is_weights = info.get("weight", None)
+        q1_pred, _ = q1_net.forward_sequence(obs_features, actions_b, vector=obs_vector)
+        q2_pred, _ = q2_net.forward_sequence(obs_features, actions_b, vector=obs_vector)
+
+        # ── PER importance-sampling weights ────────────────────────────
+        is_weights = info.get("_weight", info.get("weight", None))
         if is_weights is not None:
-            is_weights = is_weights.to(self.device).view(-1, 1).clamp(min=1e-4)
+            is_weights = self._to_device_fast(is_weights).view(B, 1, 1).clamp(min=1e-4)
         else:
-            is_weights = torch.ones_like(rewards_b)
+            is_weights = torch.ones(B, 1, 1, device=self.device)
 
+        # ── Masked Huber loss ──────────────────────────────────────────
+        q1_elementwise = F.smooth_l1_loss(q1_pred, q_target, reduction="none")  # (B,T,1)
+        q2_elementwise = F.smooth_l1_loss(q2_pred, q_target, reduction="none")
+
+        # Apply sequence mask: don't backprop through padded timesteps
+        q1_masked = (q1_elementwise * mask * is_weights).sum() / mask.sum().clamp(min=1)
+        q2_masked = (q2_elementwise * mask * is_weights).sum() / mask.sum().clamp(min=1)
+        critic_loss = q1_masked + q2_masked
+
+        # ── TD error for PER priorities ────────────────────────────────
         with torch.no_grad():
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
-            td_errors = torch.max(td_error_1, td_error_2).squeeze(-1)
+            # Per-sequence priority: mean over valid timesteps
+            td_errors_seq = torch.max(td_error_1, td_error_2)  # (B, T, 1)
+            # Masked mean per sequence
+            td_errors_per_seq = (td_errors_seq * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            td_errors = td_errors_per_seq.squeeze(-1)  # (B,)
+
             if batch_indices is not None:
-                indices_arr = batch_indices.flatten().cpu().numpy()
-                # Clip priorities to prevent runaway PER sampling
                 _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
-                new_priorities = np.clip(td_errors.cpu().numpy().copy(), 1e-6, _max_priority)
+                new_priorities = torch.clamp(td_errors, min=1e-6, max=_max_priority).cpu().numpy()
                 self.rb.update_priority(batch_indices, new_priorities)
 
-        beta = min(
-            1.0,
-            self.cfg.per_beta
-            + (1.0 - self.cfg.per_beta) * (self.total_steps / self.cfg.total_steps),
-        )
-        self.rb.beta = beta
-
-        # Huber loss (smooth_l1) instead of MSE – prevents quadratic
-        # gradient explosion on large TD errors, especially with PER.
-        q1_elementwise = F.smooth_l1_loss(q1_pred, q_target, reduction="none")
-        q2_elementwise = F.smooth_l1_loss(q2_pred, q_target, reduction="none")
-        q1_loss = (is_weights * q1_elementwise).mean()
-        q2_loss = (is_weights * q2_elementwise).mean()
-        critic_loss = q1_loss + q2_loss
-
+        # ── Explained variance ─────────────────────────────────────────
         with torch.no_grad():
             q_var = torch.var(q_target)
             q1_explained_var = 1 - torch.var(q_target - q1_pred) / (q_var + 1e-8)
@@ -337,97 +479,94 @@ class LearnerWorker:
         )
         self.critic_opt.step()
         self._critic_updates_count += 1
-        # log_info(
-        #     f"[Critic Update #{self._critic_updates_count}] "
-        #     f"Q1_loss={q1_loss.item():.4f}, Q2_loss={q2_loss.item():.4f}, "
-        #     f"total_critic_loss={critic_loss.item():.4f}"
-        # )
 
-        # ===== Actor Update =====
+        # Update PER beta
+        beta = min(
+            1.0,
+            self.cfg.per_beta
+            + (1.0 - self.cfg.per_beta) * (self.total_steps / self.cfg.total_steps),
+        )
+        self.rb.beta = beta
+
+        # ══════════════════════════════════════════════════════════════════
+        # ACTOR UPDATE (delayed)
+        # ══════════════════════════════════════════════════════════════════
         self._updates_count += 1
+        self._maybe_refresh_expert_priorities()
+
         if self._updates_count % self._actor_update_delay == 0:
-            td_in_data = {"pixels": pixels_b}
-            if vector_b is not None:
-                td_in_data["vector"] = vector_b
-            td_in = TensorDict(td_in_data, batch_size=pixels_b.shape[0])
-            out = self.actor(td_in)
-            new_actions = fix_action_shape(
-                out["action"],
-                pixels_b.shape[0],
-                action_dim=self.env.action_spec.shape[-1],
+            # Re-run actor LSTM to get fresh actions for the current obs sequence
+            actor_params, _ = actor_net.forward_sequence(obs_features, vector=obs_vector)
+
+            from torchrl.modules import TanhNormal
+
+            dist = TanhNormal(
+                loc=actor_params["loc"],
+                scale=actor_params["scale"],
+                low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
+                high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
             )
+            new_actions = dist.rsample()  # (B, T, A)
+            log_prob_new = dist.log_prob(new_actions)
+            if log_prob_new.dim() == 3:
+                log_prob_new = log_prob_new.sum(dim=-1, keepdim=True)
+            elif log_prob_new.dim() == 2:
+                log_prob_new = log_prob_new.unsqueeze(-1)
 
-            log_prob_new = out["action_log_prob"]
-            if log_prob_new is None:
-                print(f"WARNING: No log_prob returned! Actor output keys: {list(out.keys())}")
-                log_prob_new = torch.zeros((new_actions.shape[0], 1), device=self.device)
-            if log_prob_new.ndim == 1:
-                log_prob_new = log_prob_new.view(-1, 1)
+            # Q-values for new actions: reuse the same LSTM hidden states
+            # by running forward_sequence with new actions
+            # Note: we detach the critic LSTM to prevent actor gradients
+            # flowing through critic parameters
+            with torch.no_grad():
+                q1_h, _ = q1_net.forward_lstm(obs_features, vector=obs_vector)
+                q2_h, _ = q2_net.forward_lstm(obs_features, vector=obs_vector)
 
-            if self._updates_count % self._log_update_every == 0:
-                try:
-                    loc_scale_dict = {
-                        "actor/loc_mean": out["loc"].mean().item(),
-                        "actor/loc_std": out["loc"].std().item(),
-                        "actor/loc_max": out["loc"].max().item(),
-                        "actor/scale_mean": out["scale"].mean().item(),
-                        "actor/scale_min": out["scale"].min().item(),
-                        "actor/scale_max": out["scale"].max().item(),
-                    }
-                    if self.log_queue is not None:
-                        try:
-                            self.log_queue.put_nowait(
-                                {"step": self.total_steps, "data": loc_scale_dict}
-                            )
-                        except Exception as e:
-                            print(f"[WARNING] Failed to log actor metrics to queue: {e}")
-                            # Fallback to direct wandb logging
-                            try:
-                                wandb.log(loc_scale_dict, step=self.total_steps)
-                            except Exception as e2:
-                                print(f"[ERROR] Direct wandb.log also failed: {e2}")
-                    else:
-                        wandb.log(loc_scale_dict, step=self.total_steps)
-                except Exception as e:
-                    print(f"[WARNING] Exception in actor metric logging: {e}")
-
-            q1_new = self.q1.module(pixels_b, new_actions, vector_b).view(-1, 1)
-            q2_new = self.q2.module(pixels_b, new_actions, vector_b).view(-1, 1)
+            q1_new = q1_net.forward_q(q1_h.detach(), new_actions)  # (B, T, 1)
+            q2_new = q2_net.forward_q(q2_h.detach(), new_actions)
             min_q_new = torch.min(q1_new, q2_new)
 
-            actor_loss = (alpha.detach() * log_prob_new - min_q_new).mean()
+            # Masked actor loss
+            actor_loss_elementwise = alpha.detach() * log_prob_new - min_q_new  # (B, T, 1)
+            actor_loss = (actor_loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
 
             self.actor_opt.zero_grad()
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
             self.actor_opt.step()
             self._actor_updates_count += 1
-            log_info(
-                f"[Actor Update #{self._actor_updates_count}] "
-                f"actor_loss={actor_loss.item():.4f}, "
-                f"mean_log_prob={log_prob_new.mean().item():.4f}"
-            )
 
-            # ===== Alpha Update =====
+            # ── Alpha update ───────────────────────────────────────────
             alpha_loss = None
             if self.log_alpha is not None and self.alpha_opt is not None:
                 with torch.no_grad():
                     entropy_error = log_prob_new + self.target_entropy
-                alpha_loss = -(self.log_alpha * entropy_error).mean()
+                alpha_loss_elementwise = -(self.log_alpha * entropy_error)
+                alpha_loss = (alpha_loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+
                 self.alpha_opt.zero_grad()
                 alpha_loss.backward()
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
                 self._alpha_updates_count += 1
-                log_info(
-                    f"[Alpha Update #{self._alpha_updates_count}] "
-                    f"alpha_loss={alpha_loss.item():.4f}, "
-                    f"alpha={self.log_alpha.exp().item():.4f}"
-                )
+
                 alpha_min = float(getattr(self.cfg, "alpha_min", 0.01))
                 alpha_max = float(getattr(self.cfg, "alpha_max", 1.0))
                 with torch.no_grad():
                     self.log_alpha.clamp_(min=math.log(alpha_min), max=math.log(alpha_max))
+
+            # ── Logging ────────────────────────────────────────────────
+            if self._updates_count % self._log_update_every == 0:
+                try:
+                    loc_scale_dict = {
+                        "actor/loc_mean": actor_params["loc"].mean().item(),
+                        "actor/loc_std": actor_params["loc"].std().item(),
+                        "actor/scale_mean": actor_params["scale"].mean().item(),
+                        "actor/scale_min": actor_params["scale"].min().item(),
+                        "actor/scale_max": actor_params["scale"].max().item(),
+                    }
+                    self._log(loc_scale_dict)
+                except Exception:
+                    pass
         else:
             actor_loss = None
             alpha_loss = None
@@ -442,73 +581,46 @@ class LearnerWorker:
         if self.critic_scheduler is not None:
             self.critic_scheduler.step()
 
-        # ===== Logging (throttled) =====
+        # ── Periodic detailed logging ──────────────────────────────────
         if self._updates_count % self._log_update_every != 0:
             return
+
         try:
             current_entropy = -log_prob_new.mean().item() if log_prob_new is not None else 0.0
             log_dict = {
                 "loss/critic_loss": critic_loss.item(),
-                "loss/q1_loss": q1_loss.item(),
-                "loss/q2_loss": q2_loss.item(),
-                "loss/actor_loss": (actor_loss.item() if actor_loss is not None else 0.0),
-                "critic/mean_q_value": (min_q_new.mean().item() if min_q_new is not None else 0.0),
+                "loss/q1_loss": q1_masked.item(),
+                "loss/q2_loss": q2_masked.item(),
+                "loss/actor_loss": actor_loss.item() if actor_loss is not None else 0.0,
                 "critic/q_target_mean": q_target.mean().item(),
-                "critic/next_v_mean": next_v.mean().item(),
                 "critic/q1_explained_variance": q1_explained_var.item(),
                 "critic/q2_explained_variance": q2_explained_var.item(),
-                "actor/mean_log_prob": (
-                    log_prob_new.mean().item() if log_prob_new is not None else 0.0
-                ),
                 "actor/entropy": current_entropy,
-                "actor/target_entropy": self.target_entropy,
-                "actor/entropy_gap": current_entropy - self.target_entropy,
                 "actor/alpha": alpha.item(),
-                "actor/alpha_loss": (alpha_loss.item() if alpha_loss is not None else 0.0),
-                "reward/rewards_per_step_mean": rewards_b.mean().item(),
-                "reward/rewards_per_step_max": rewards_b.max().item(),
-                "reward/rewards_per_step_min": rewards_b.min().item(),
-                "actions/actions_std": actions_b.std().item(),
-                "actions/sampled_action_mean": (
-                    new_actions.mean().item() if new_actions is not None else 0.0
-                ),
-                "actions/sampled_action_std": (
-                    new_actions.std().item() if new_actions is not None else 0.0
-                ),
                 "per/td_error_mean": td_errors.mean().item(),
-                "per/td_error_max": td_errors.max().item(),
-                "per/td_error_min": td_errors.min().item(),
                 "per/beta": beta,
-                "per/is_weight_mean": is_weights.mean().item(),
-                "per/is_weight_max": is_weights.max().item(),
-                "pacing/cumul_memories_used": self._cumul_used,
-                "pacing/cumul_memories_should_have_been_used": self._cumul_should,
-                "pacing/pacing_lag": max(0, self._cumul_should - self._cumul_used),
-                "lr/actor_lr": self.actor_opt.param_groups[0]["lr"],
-                "lr/critic_lr": self.critic_opt.param_groups[0]["lr"],
                 "updates/critic_updates_count": self._critic_updates_count,
                 "updates/actor_updates_count": self._actor_updates_count,
-                "updates/alpha_updates_count": self._alpha_updates_count,
             }
-            if getattr(self.cfg, "use_noisy", False):
-                log_dict.update(self._collect_noisy_stats(self.actor, "actor"))
-                log_dict.update(self._collect_noisy_stats(self.q1, "q1"))
-            if self.log_queue is not None:
-                try:
-                    self.log_queue.put_nowait({"step": self.total_steps, "data": log_dict})
-                except Exception as e:
-                    print(f"[WARNING] Failed to log metrics to queue: {e}")
-                    # Fallback to direct wandb logging
-                    try:
-                        wandb.log(log_dict, step=self.total_steps)
-                    except Exception as e2:
-                        print(f"[ERROR] Direct wandb.log also failed: {e2}")
-            else:
-                wandb.log(log_dict, step=self.total_steps)
+            self._log(log_dict)
         except Exception as e:
-            print(f"[ERROR] Exception in update logging: {e}")
+            print(f"[ERROR] logging: {e}")
 
-    # === noisy layer diagnostics ================================================================
+    def _log(self, data: dict):
+        """Send metrics to the log queue or wandb directly."""
+        if self.log_queue is not None:
+            try:
+                self.log_queue.put_nowait({"step": self.total_steps, "data": data})
+            except Exception:
+                try:
+                    wandb.log(data, step=self.total_steps)
+                except Exception:
+                    pass
+        else:
+            try:
+                wandb.log(data, step=self.total_steps)
+            except Exception:
+                pass
 
     def _collect_noisy_stats(self, net, prefix: str) -> dict:
         """Return sigma/mu stats for all FactorisedNoisyLayer modules in *net*."""
@@ -531,20 +643,11 @@ class LearnerWorker:
 
     def _soft_update_target(self):
         tau = self.cfg.tau
-        # Q1/Q2 share a CNN encoder; Q1_target/Q2_target share a target CNN.
-        # Track updated data pointers so the shared CNN is polyak-updated
-        # exactly once (not twice).
-        updated_ptrs = set()
-        for param, target_param in zip(self.q1.parameters(), self.q1_target.parameters()):
-            ptr = target_param.data_ptr()
-            if ptr not in updated_ptrs:
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-                updated_ptrs.add(ptr)
-        for param, target_param in zip(self.q2.parameters(), self.q2_target.parameters()):
-            ptr = target_param.data_ptr()
-            if ptr not in updated_ptrs:
-                target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-                updated_ptrs.add(ptr)
+        with torch.no_grad():
+            for p, tp in zip(self.q1.parameters(), self.q1_target.parameters()):
+                tp.data.lerp_(p.data, tau)
+            for p, tp in zip(self.q2.parameters(), self.q2_target.parameters()):
+                tp.data.lerp_(p.data, tau)
 
     # === LR scheduler factory =============================================================
 
@@ -650,6 +753,10 @@ class LearnerWorker:
                     "use_noisy": getattr(self.cfg, "use_noisy", False),
                     "num_cells": getattr(self.cfg, "num_cells", 256),
                     "vae_checkpoint_path": getattr(self.cfg, "vae_checkpoint_path", None),
+                    "use_lstm": getattr(self.cfg, "use_lstm", False),
+                    "lstm_hidden_size": getattr(self.cfg, "lstm_hidden_size", 256),
+                    "lstm_layers": getattr(self.cfg, "lstm_layers", 1),
+                    "stateful_inference": getattr(self.cfg, "stateful_inference", True),
                 },
             }
 

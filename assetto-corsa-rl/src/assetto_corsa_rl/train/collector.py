@@ -2,6 +2,7 @@ import torch
 import queue
 from tensordict import TensorDict
 
+from .sequence_utils import EpisodeAccumulator
 from .train_utils import (
     OrnsteinUhlenbeckNoise,
     expand_actions_for_envs,
@@ -72,6 +73,30 @@ class CollectorWorker:
         self._ou_noise_decay_steps = int(getattr(cfg, "ou_noise_decay_steps", 100_000))
         self._ou_noise_scale = float(getattr(cfg, "ou_noise_scale", 0.3))
 
+        # ── sequence accumulator ──────────────────────────────
+        seq_len = int(getattr(cfg, "seq_len", 16))
+        seq_overlap = int(getattr(cfg, "seq_overlap", 8))
+        burn_in = int(getattr(cfg, "burn_in", 4))
+        self.episode_accum = EpisodeAccumulator(
+            seq_len=seq_len, overlap=seq_overlap, burn_in=burn_in
+        )
+        self._seq_stride = seq_len - seq_overlap
+
+        # grab the frozen CNN from the actor for feature pre-computation
+        self.shared_cnn = None
+        for m in self.actor.modules():
+            if hasattr(m, "cnn"):
+                self.shared_cnn = m.cnn
+                break
+        assert self.shared_cnn is not None, "Could not find CNN in actor"
+
+        self._reset_actor_context()
+
+    def _reset_actor_context(self):
+        for m in self.actor.modules():
+            if hasattr(m, "reset_context"):
+                m.reset_context()
+
     # ── async entry-point (multi-process) ─────────────────────────────────
 
     def run(self):
@@ -113,14 +138,16 @@ class CollectorWorker:
     # ── core step ─────────────────────────────────────────────────────────
 
     def _step_and_store(self):
-        """Take one step per env, push transitions (and optional meta msgs) to the queue."""
+        """Take one step per env, accumulate into sequences, push complete sequences."""
         target_batch = self.current_td.batch_size
+
         with torch.no_grad():
             inner_obs = get_inner(self.current_td)
             pixels_only = inner_obs["pixels"]
             if pixels_only.dim() == 3:
                 pixels_only = pixels_only.unsqueeze(0)
             vector_obs = inner_obs.get("vector", None)
+
             actor_input_data = {"pixels": pixels_only}
             if vector_obs is not None:
                 if vector_obs.dim() == 1:
@@ -207,11 +234,6 @@ class CollectorWorker:
             if "terminated" in td_next.keys()
             else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
         )
-        truncated = (
-            td_next["truncated"].view(self.cfg.num_envs).to(self.device).to(torch.bool)
-            if "truncated" in td_next.keys()
-            else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
-        )
 
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
@@ -220,57 +242,52 @@ class CollectorWorker:
         if next_pixels.ndim == 3:
             next_pixels = next_pixels.unsqueeze(0)
 
-        # Extract vector obs from current and next observations
         cur_vector = inner_obs.get("vector", None)
         next_vector = td_next.get("vector", None)
 
+        # Precompute CNN features (encoder is shared, frozen during collection)
+        with torch.no_grad():
+            feat = self.shared_cnn(pixels.to(self.device))
+            next_feat = self.shared_cnn(next_pixels.to(self.device))
+
         for i in range(self.cfg.num_envs):
             transition = {
-                "pixels": pack_pixels(pixels[i]),
-                "action": actions[i].to(torch.float32).cpu(),
+                "features": feat[i].cpu(),
+                "next_features": next_feat[i].cpu(),
+                "action": actions[i].cpu().float(),
                 "reward": rewards[i].unsqueeze(0).cpu(),
-                "next_pixels": pack_pixels(next_pixels[i]),
                 "done": dones[i].unsqueeze(0).cpu(),
                 "terminated": terminated[i].unsqueeze(0).cpu(),
-                "truncated": truncated[i].unsqueeze(0).cpu(),
             }
             if cur_vector is not None:
                 v = cur_vector[i] if cur_vector.dim() > 1 else cur_vector
-                transition["vector"] = v.to(torch.float32).cpu()
+                transition["vector"] = v.cpu().float()
             if next_vector is not None:
                 nv = next_vector[i] if next_vector.dim() > 1 else next_vector
-                transition["next_vector"] = nv.to(torch.float32).cpu()
-            while True:
-                try:
-                    self.transitions_queue.put(transition, timeout=0.05)
-                    break
-                except queue.Full:
-                    if self.stop_event is not None and self.stop_event.is_set():
-                        break
-                    continue
-                except Exception as e:
-                    log_info(f"[COLLECTOR] Failed to enqueue transition: {e}")
-                    break
+                transition["next_vector"] = nv.cpu().float()
+
+            self.episode_accum.add(transition)
+
+            for seq in self.episode_accum.maybe_emit():
+                self._enqueue(seq)
 
         self._handle_episode_end(rewards, dones)
         self._maybe_reset(td_next, dones)
         self.total_steps += self.cfg.num_envs
 
-        # Log when exiting start_steps phase
-        start_steps = int(getattr(self.cfg, "start_steps", 0))
-        if not self._end_start_steps_logged and self.total_steps >= start_steps > 0:
-            log_info(f"[COLLECTOR] Random exploration phase complete! ({self.total_steps:,} steps)")
-            log_info(f"[COLLECTOR] Beginning policy learning...")
-            self._end_start_steps_logged = True
-
     def _handle_episode_end(self, rewards, dones):
         rewards = rewards.to(self.current_episode_return.device)
         dones = dones.to(self.current_episode_return.device)
         self.current_episode_return += rewards
-        # Reset OU noise on episode boundaries for fresh trajectories
+
         done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
         if done_indices.numel() > 0:
             self.ou_noise.reset(env_indices=done_indices)
+
+            # flush remaining transitions as padded sequence
+            for seq in self.episode_accum.flush():
+                self._enqueue(seq)
+
         for i, d in enumerate(dones):
             if d.item():
                 ep_ret = float(self.current_episode_return[i].item())
@@ -285,6 +302,7 @@ class CollectorWorker:
         if "next" in td_next.keys() and "pixels" in td_next["next"].keys():
             self.current_td = td_next["next"]
         if dones.any():
+            self._reset_actor_context()
             try:
                 reset_td = self.env.reset()
                 self.current_td = (
@@ -299,6 +317,15 @@ class CollectorWorker:
                 self.current_episode_return[idx] = 0.0
             except Exception:
                 self.current_episode_return = torch.zeros_like(self.current_episode_return)
+
+    def _enqueue(self, item):
+        while True:
+            try:
+                self.transitions_queue.put(item, timeout=0.05)
+                break
+            except queue.Full:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    break
 
     # ── weight sync (multi-process) ───────────────────────────────────────
 

@@ -16,6 +16,7 @@ model:
   expert_demonstrations_path: "D:/acrl/AssetoCorsaRL/datasets/demonstrations" # path to directory containing demo_batch_*.npz files
   expert_demo_subsample: null # sample every Nth frame from expert demos (null = use all)
   expert_demo_epsilon: 0.01 # expert PER priority = current max priority + this epsilon
+  expert_priority_refresh_updates: 1000 # refresh expert PER priority every N gradient updates (annealed to 0 bonus over training)
 
   gamma: 0.99
   tau: 0.01
@@ -42,6 +43,14 @@ model:
   #* noisy - IGNORE IF use_noisy=false
   use_noisy: false
   noise_sigma: 0.45
+
+  #* recurrent context
+  use_lstm: true
+  lstm_hidden_size: 256
+  lstm_layers: 1
+  seq_len: 16 # training sequence length
+  burn_in: 4 # warm-up steps (no loss computed)
+  seq_overlap: 8 # overlap between consecutive chunks
 
   #* exploration - IGNORE IF use_noisy=true
   explore_start: 0

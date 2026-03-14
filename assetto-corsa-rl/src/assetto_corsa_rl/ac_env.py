@@ -114,6 +114,107 @@ class AssettoCorsa(gym.Env):
         self._meters_advanced = 0.0
         self._last_speed = 0.0
         self._current_racing_line_index = 0
+        self._low_speed_start_time = None
+
+    def _compute_racing_line_context(self, data: Dict[str, Any]) -> Dict[str, float]:
+        defaults = {
+            "rl_distance_to_centerline": 0.0,
+            "rl_heading_error_rad": 0.0,
+            "rl_curve_lookahead_short": 0.0,
+            "rl_curve_lookahead_mid": 0.0,
+            "rl_curve_lookahead_far": 0.0,
+        }
+
+        if self.racing_line_positions is None:
+            return defaults
+
+        try:
+            position = np.array(
+                data.get("car", {}).get("world_location", [0.0, 0.0, 0.0]), dtype=np.float32
+            )
+            if position.shape[0] < 3:
+                return defaults
+
+            n = len(self.racing_line_positions)
+            if n < 4:
+                return defaults
+
+            closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=100)
+            next_idx = (closest_idx + 1) % n
+            prev_idx = (closest_idx - 1) % n
+
+            p0 = self.racing_line_positions[closest_idx]
+            p1 = self.racing_line_positions[next_idx]
+            p_prev = self.racing_line_positions[prev_idx]
+
+            seg = p1 - p0
+            seg_xy = seg[:2]
+            seg_norm = float(np.linalg.norm(seg_xy))
+
+            # Signed lateral offset to centerline (left/right of tangent) in meters.
+            if seg_norm > 1e-6:
+                rel_xy = position[:2] - p0[:2]
+                cross_z = seg_xy[0] * rel_xy[1] - seg_xy[1] * rel_xy[0]
+                signed_lateral = float(cross_z / seg_norm)
+            else:
+                signed_lateral = 0.0
+
+            # Heading error from velocity vs tangent direction in XY.
+            velocity = np.array(
+                data.get("car", {}).get("velocity", [0.0, 0.0, 0.0]), dtype=np.float32
+            )
+            vel_xy = velocity[:2]
+            vel_norm = float(np.linalg.norm(vel_xy))
+            if seg_norm > 1e-6 and vel_norm > 1e-6:
+                tangent = seg_xy / seg_norm
+                vel_dir = vel_xy / vel_norm
+                dot = float(np.clip(np.dot(tangent, vel_dir), -1.0, 1.0))
+                # signed angle via atan2(cross, dot)
+                cross = float(tangent[0] * vel_dir[1] - tangent[1] * vel_dir[0])
+                heading_err = float(np.arctan2(cross, dot))
+            else:
+                heading_err = 0.0
+
+            def _signed_curvature_at(idx: int) -> float:
+                i0 = (idx - 1) % n
+                i1 = idx % n
+                i2 = (idx + 1) % n
+                a = self.racing_line_positions[i0][:2]
+                b = self.racing_line_positions[i1][:2]
+                c = self.racing_line_positions[i2][:2]
+
+                ab = b - a
+                bc = c - b
+                ca = a - c
+                lab = float(np.linalg.norm(ab))
+                lbc = float(np.linalg.norm(bc))
+                lca = float(np.linalg.norm(ca))
+                denom = lab * lbc * lca
+                if denom < 1e-6:
+                    return 0.0
+
+                # Signed 2D triangle area * 2
+                area2 = float(ab[0] * (c - a)[1] - ab[1] * (c - a)[0])
+                # κ = 2 * area2 / (|ab|*|bc|*|ca|), signed in XY plane
+                return float((2.0 * area2) / denom)
+
+            def _mean_curvature(offsets) -> float:
+                vals = [_signed_curvature_at((closest_idx + o) % n) for o in offsets]
+                return float(np.mean(vals)) if vals else 0.0
+
+            curve_short = _mean_curvature([2, 4, 6])
+            curve_mid = _mean_curvature([8, 12, 16])
+            curve_far = _mean_curvature([20, 28, 36])
+
+            return {
+                "rl_distance_to_centerline": signed_lateral,
+                "rl_heading_error_rad": heading_err,
+                "rl_curve_lookahead_short": curve_short,
+                "rl_curve_lookahead_mid": curve_mid,
+                "rl_curve_lookahead_far": curve_far,
+            }
+        except Exception:
+            return defaults
 
     def _build_observation_keys_from_config(self, input_config: Dict[str, bool]) -> list:
         """Build list of observation keys from input configuration dict.
@@ -178,6 +279,7 @@ class AssettoCorsa(gym.Env):
         session = data["session"]
         stats = data["stats"]
         tyres = data["tyres"]
+        rl_ctx = self._compute_racing_line_context(data)
 
         # TODO: verify all these work
 
@@ -301,6 +403,17 @@ class AssettoCorsa(gym.Env):
                         scalar_val = float(val) if val != -1 else 0.0
                     angle_values.append(scalar_val)
                 return float(np.mean(angle_values))
+
+            case "rl_distance_to_centerline":
+                return float(rl_ctx["rl_distance_to_centerline"])
+            case "rl_heading_error_rad":
+                return float(rl_ctx["rl_heading_error_rad"])
+            case "rl_curve_lookahead_short":
+                return float(rl_ctx["rl_curve_lookahead_short"])
+            case "rl_curve_lookahead_mid":
+                return float(rl_ctx["rl_curve_lookahead_mid"])
+            case "rl_curve_lookahead_far":
+                return float(rl_ctx["rl_curve_lookahead_far"])
 
             case _ if key.startswith("tyre_") and "_temp_" in key:
                 _, tyre_idx, _, temp_pos = key.split("_")
@@ -468,7 +581,7 @@ class AssettoCorsa(gym.Env):
             + meters_progress
             * self.reward_per_m_advanced_along_centerline  # progress along racing line
             - off_track * 0.5  # penalty for being off track
-            - (speed if damage > 0 else 0.0)
+            - (damage / 100)
         )
         self._last_speed = speed
         return reward
@@ -480,9 +593,19 @@ class AssettoCorsa(gym.Env):
         terminated = False
         truncated = False
 
+        speed_mph = float(data.get("car", {}).get("speed_mph", 0.0))
+        now = time.monotonic()
+        if speed_mph < 10.0:
+            if self._low_speed_start_time is None:
+                self._low_speed_start_time = now
+            elif now - self._low_speed_start_time > 3.0:
+                truncated = True
+        else:
+            self._low_speed_start_time = None
+
         if data["lap"]["get_lap_count"] == 2:
             truncated = True
-        if sum(data["car"]["damage"]) > 0:
+        if sum(data["car"]["damage"]) > 150:
             terminated = True
 
         if self._episode_step >= self.max_episode_steps:
@@ -502,6 +625,7 @@ class AssettoCorsa(gym.Env):
         self._current_racing_line_index = 0
         self._meters_advanced = 0.0
         self._last_speed = 0.0
+        self._low_speed_start_time = None
 
         self.controller.reset()
         self.controller.update()
@@ -848,6 +972,12 @@ def main() -> None:
         "tyre_3_temp_i": True,
         "tyre_3_temp_m": True,
         "tyre_3_temp_o": True,
+        # Racing-line localization / turn-shape preview
+        "rl_distance_to_centerline": True,
+        "rl_heading_error_rad": True,
+        "rl_curve_lookahead_short": True,
+        "rl_curve_lookahead_mid": True,
+        "rl_curve_lookahead_far": True,
     }
 
     normalization_bounds = {
@@ -898,6 +1028,11 @@ def main() -> None:
         "tyre_3_temp_i": [0, 150],
         "tyre_3_temp_m": [0, 150],
         "tyre_3_temp_o": [0, 150],
+        "rl_distance_to_centerline": [-15, 15],
+        "rl_heading_error_rad": [-3.1416, 3.1416],
+        "rl_curve_lookahead_short": [-0.3, 0.3],
+        "rl_curve_lookahead_mid": [-0.3, 0.3],
+        "rl_curve_lookahead_far": [-0.3, 0.3],
     }
 
     env = AssettoCorsa(
@@ -956,10 +1091,37 @@ def main() -> None:
             # obs, reward, terminated, truncated, info = env.step(action)
 
             reward = env._calculate_reward(obs, env._last_obs)
-            terminated = env._check_done(obs, env._last_obs)
-            truncated = False
+            terminated, truncated = env._check_done(obs, env._last_obs)
+
+            key_to_idx = {k: i for i, k in enumerate(env.observation_keys)}
+
+            def _v(name: str):
+                idx = key_to_idx.get(name, None)
+                if idx is None:
+                    return 0.0, 0.0
+                raw = float(raw_values[idx])
+                norm = float(obs[idx]) if args.normalize else raw
+                return raw, norm
+
+            d_raw, d_norm = _v("rl_distance_to_centerline")
+            h_raw, h_norm = _v("rl_heading_error_rad")
+            cs_raw, cs_norm = _v("rl_curve_lookahead_short")
+            cm_raw, cm_norm = _v("rl_curve_lookahead_mid")
+            cf_raw, cf_norm = _v("rl_curve_lookahead_far")
 
             print(f"Reward: {reward:.4f} | current_index: {env._current_racing_line_index}")
+            print(
+                "RL raw  | "
+                f"d={d_raw:+.3f}m "
+                f"head={h_raw:+.3f}rad "
+                f"curve[s,m,f]=[{cs_raw:+.4f}, {cm_raw:+.4f}, {cf_raw:+.4f}]"
+            )
+            print(
+                "RL norm | "
+                f"d={d_norm:+.3f} "
+                f"head={h_norm:+.3f} "
+                f"curve[s,m,f]=[{cs_norm:+.3f}, {cm_norm:+.3f}, {cf_norm:+.3f}]"
+            )
 
             if terminated or truncated:
                 print("\nEpisode done, resetting...")
