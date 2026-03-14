@@ -4,7 +4,7 @@ This script records image observations and user inputs (steering, throttle, brak
 from Assetto Corsa to create a dataset for pretraining the SAC actor.
 
 Usage:
-    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations4 --duration 999999999999 --display --display-scale 5.0 --reset-interval -1
+    acrl ac record-demonstrations --config-path assetto-corsa-rl/configs/ac/env_config.yaml  --output-dir datasets/demonstrations --duration 999999999999 --display --display-scale 5.0 --reset-interval -1
 
 Controls:
     - Press Ctrl+C to stop recording early
@@ -266,18 +266,31 @@ class DemonstrationRecorder:
         """Extract observation values from telemetry data based on input_config.
 
         Applies normalization if enabled and normalization bounds are available.
+        Normalization: (value - min) / (max - min) * 2 - 1  => maps to [-1, 1]
         """
         if data is None or not self.observation_keys:
             return None
 
-        obs_values = [
-            self._env_helper._extract_value_from_data(key, data) for key in self.observation_keys
-        ]
+        obs_values = []
+        for key in self.observation_keys:
+            try:
+                val = self._env_helper._extract_value_from_data(key, data)
+                obs_values.append(val)
+            except Exception as e:
+                print(f"[Warning] Failed to extract {key}: {e}")
+                obs_values.append(0.0)
+
         obs = np.array(obs_values, dtype=np.float32)
 
         # Apply normalization if enabled
         if self.normalize_observations and self.normalization_bounds:
-            obs = self._env_helper._normalize_vector(obs)
+            for i, key in enumerate(self.observation_keys):
+                if key in self.normalization_bounds:
+                    bounds = self.normalization_bounds[key]
+                    min_val, max_val = bounds[0], bounds[1]
+                    # Normalize to [-1, 1]
+                    obs[i] = (obs[i] - min_val) / (max_val - min_val + 1e-8) * 2.0 - 1.0
+                    obs[i] = np.clip(obs[i], -1.0, 1.0)
 
         return obs
 
@@ -392,13 +405,14 @@ class DemonstrationRecorder:
             pass
 
         observation = self._extract_observation(data)
-
         reward = self._calculate_reward(data)
 
         self.frames.append(stacked.copy())
         self.actions.append(action.copy())
         self.rewards.append(reward)
-        if observation is not None:
+
+        # Always append observations if input_config has enabled keys
+        if self.observation_keys and observation is not None:
             self.observations.append(observation.copy())
         self.metadata.append(
             {
@@ -442,9 +456,12 @@ class DemonstrationRecorder:
             "rewards": np.array(self.rewards, dtype=np.float32),
         }
 
+        # Save observations if they were recorded
         if self.observations:
             save_dict["observations"] = np.array(self.observations, dtype=np.float32)
-            save_dict["observation_keys"] = np.array(self.observation_keys, dtype=object)
+
+        # Always save observation keys and metadata for reference
+        save_dict["observation_keys"] = np.array(self.observation_keys, dtype=object)
 
         # Include metadata and configuration
         save_dict["metadata"] = np.array(self.metadata, dtype=object)
@@ -459,7 +476,11 @@ class DemonstrationRecorder:
             json.dump(self._config_metadata, f, indent=2)
 
         self.saved_samples += len(self.frames)
-        obs_info = f" with {len(self.observation_keys)} obs dims" if self.observations else ""
+        obs_info = (
+            f" with {len(self.observation_keys)} obs dims (normalized)" if self.observations else ""
+        )
+        if not self.observations and self.observation_keys:
+            obs_info = f" (configured for {len(self.observation_keys)} obs dims but none recorded)"
         print(
             f"✓ Saved {len(self.frames)} samples{obs_info} to {filename} (total: {self.saved_samples})"
         )
@@ -581,27 +602,53 @@ def main(
     if config_path:
         try:
             import yaml
-            from pathlib import Path
 
-            cfg_path = Path(config_path)
+            cfg_path = Path(config_path).expanduser().resolve()
             with open(cfg_path, "r") as f:
-                cfg_data = yaml.safe_load(f)
-                input_config = cfg_data.get("environment", {}).get("inputs", {})
-                if input_config:
-                    enabled_count = sum(1 for v in input_config.values() if v)
-                    print(
-                        f"✓ Loaded input config: {enabled_count}/{len(input_config)} inputs enabled"
-                    )
+                cfg_data = yaml.safe_load(f) or {}
 
-                # Load normalization configuration if available
-                normalization_config = cfg_data.get("environment", {}).get("normalization", {})
-                if normalization_config:
-                    normalize_observations = normalization_config.get(
-                        "normalize_observations", False
-                    )
-                    normalization_bounds = normalization_config.get("bounds", {})
-                    if normalize_observations and normalization_bounds:
-                        print(f"✓ Loaded normalization bounds for {len(normalization_bounds)} keys")
+            if not isinstance(cfg_data, dict):
+                raise ValueError("YAML root must be a mapping")
+
+            env_cfg = cfg_data.get("environment", {})
+            if not isinstance(env_cfg, dict):
+                env_cfg = {}
+
+            input_config = env_cfg.get("inputs", cfg_data.get("inputs", {}))
+            if not isinstance(input_config, dict):
+                input_config = {}
+
+            enabled_count = sum(1 for v in input_config.values() if bool(v))
+            if not input_config or enabled_count == 0:
+                print(
+                    f"Error: No enabled observation inputs found in config: {cfg_path}\n"
+                    "Expected keys under 'environment.inputs' (or top-level 'inputs')."
+                )
+                return
+
+            print(
+                f"✓ Loaded input config from {cfg_path}: {enabled_count}/{len(input_config)} inputs enabled"
+            )
+
+            normalize_observations = bool(
+                env_cfg.get(
+                    "normalize_observations",
+                    cfg_data.get("normalize_observations", False),
+                )
+            )
+            normalization_bounds = env_cfg.get(
+                "normalization_bounds",
+                cfg_data.get("normalization_bounds", {}),
+            )
+            if not isinstance(normalization_bounds, dict):
+                normalization_bounds = {}
+
+            if normalize_observations and normalization_bounds:
+                print(f"✓ Loaded normalization bounds for {len(normalization_bounds)} keys")
+            elif normalize_observations:
+                print(
+                    "Warning: normalize_observations is enabled but no normalization_bounds were found"
+                )
 
         except Exception as e:
             print(f"Warning: Could not load config from {config_path}: {e}")

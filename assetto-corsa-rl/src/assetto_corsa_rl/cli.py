@@ -15,17 +15,20 @@ from assetto_corsa_rl.cli_registry import get_registered_commands
 
 
 def _find_scripts_dir():
+    # Check package-internal scripts first (most reliable)
+    package_scripts = Path(__file__).parent / "scripts"
+    if package_scripts.exists() and list(package_scripts.glob("**/ac")):
+        return package_scripts
+
+    # Then check development scripts
     dev_scripts = Path(__file__).parent.parent.parent / "scripts"
-    if dev_scripts.exists():
+    if dev_scripts.exists() and list(dev_scripts.glob("**/ac")):
         return dev_scripts
 
+    # Then check installed location
     installed_scripts = Path(sys.prefix) / "share" / "assetto_corsa_rl" / "scripts"
-    if installed_scripts.exists():
+    if installed_scripts.exists() and list(installed_scripts.glob("**/ac")):
         return installed_scripts
-
-    package_scripts = Path(__file__).parent / "scripts"
-    if package_scripts.exists():
-        return package_scripts
 
     return None
 

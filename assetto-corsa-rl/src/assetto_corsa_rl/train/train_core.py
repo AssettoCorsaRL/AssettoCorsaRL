@@ -82,9 +82,31 @@ def _learner_process_fn(
         batch_size=rb_kwargs["batch_size"],
     )
 
+    if getattr(cfg, "use_expert_demonstrations", False):
+        expert_demo_path = getattr(cfg, "expert_demonstrations_path", None)
+        if expert_demo_path:
+            from assetto_corsa_rl.train.train_utils import load_expert_demonstrations
+            from assetto_corsa_rl.train.logging_utils import log_info, log_success, log_warning
+
+            log_info("[LEARNER] Loading expert demonstrations into replay buffer...")
+            expert_count = load_expert_demonstrations(
+                rb,
+                demo_dir=expert_demo_path,
+                subsample=getattr(cfg, "expert_demo_subsample", None),
+                demo_epsilon=getattr(cfg, "expert_demo_epsilon", 1e-3),
+                log_fn=log_info,
+            )
+            if expert_count > 0:
+                log_success(
+                    f"[LEARNER] Loaded {expert_count} expert transitions into replay buffer"
+                )
+            else:
+                log_warning("[LEARNER] No expert demonstrations were loaded")
+
     log_alpha = torch.nn.Parameter(
         torch.tensor(log_alpha_value, dtype=torch.float32, device=device)
     )
+
     alpha_lr = float(getattr(cfg, "alpha_lr", 3e-4))
     alpha_opt = torch.optim.Adam([log_alpha], lr=alpha_lr)
 
@@ -363,16 +385,20 @@ def _flush_log_queue(log_queue: mp.Queue) -> None:
     while True:
         try:
             item = log_queue.get_nowait()
-        except Exception:
+        except queue.Empty:
+            break
+        except Exception as e:
+            print(f"[ERROR] Exception getting from log_queue: {type(e).__name__}: {e}")
             break
         if not isinstance(item, dict):
+            print(f"[WARNING] Invalid log queue item type: {type(item)}")
             continue
         step = item.pop("step", None)
         data = item.pop("data", item)  # support both {step, data} and flat dicts
         try:
             wandb.log(data, step=step)
         except Exception as e:
-            print(f"Warning: wandb.log failed: {e}")
+            print(f"[ERROR] wandb.log failed: {type(e).__name__}: {e}")
 
 
 def collect_initial_data(env, rb, cfg, current_td, device):

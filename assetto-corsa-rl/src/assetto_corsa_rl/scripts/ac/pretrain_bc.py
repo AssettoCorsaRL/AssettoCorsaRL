@@ -76,8 +76,6 @@ class DemonstrationDataset(Dataset):
         self.frames = []
         self.actions = []
         self.rewards = []
-        self.observations = []
-        self.observation_keys = None
 
         print(f"Loading {len(self.batch_files)} demonstration batches...")
         for batch_file in self.batch_files:
@@ -86,40 +84,16 @@ class DemonstrationDataset(Dataset):
                 self.frames.append(data["frames"])
                 self.actions.append(data["actions"])
                 self.rewards.append(data["rewards"])
-                self.observations.append(data["observations"])
-                if self.observation_keys is None and "observation_keys" in data:
-                    self.observation_keys = data["observation_keys"].tolist()
             except Exception as e:
                 raise RuntimeError(f"Failed to load {batch_file}: {e}")
 
         self.frames = np.concatenate(self.frames, axis=0)
         self.actions = np.concatenate(self.actions, axis=0)
         self.rewards = np.concatenate(self.rewards, axis=0)
-        self.observations = np.concatenate(self.observations, axis=0)
 
         print(
             f"  Rewards: min={self.rewards.min():.4f}, max={self.rewards.max():.4f}, mean={self.rewards.mean():.4f}"
         )
-
-        self.obs_min = self.observations.min(axis=0, keepdims=True).astype(np.float32)
-        self.obs_max = self.observations.max(axis=0, keepdims=True).astype(np.float32)
-        self.obs_mean = self.observations.mean(axis=0, keepdims=True).astype(np.float32)
-        self.obs_range = self.obs_max - self.obs_min
-        self.obs_range = np.where(self.obs_range < 1e-6, 1.0, self.obs_range)
-
-        self.obs_normalizations_values = {}
-        print(f"  {'Key':<25} {'Min':>12} {'Max':>12} {'Mean':>12} {'Range':>12}")
-        print(f"  {'-'*25} {'-'*12} {'-'*12} {'-'*12} {'-'*12}")
-        for i, key in enumerate(self.observation_keys):
-            min_val = float(self.obs_min[0, i])
-            max_val = float(self.obs_max[0, i])
-            mean_val = float(self.obs_mean[0, i])
-            range_val = float(self.obs_range[0, i])
-            key_short = key[:24] if len(key) > 24 else key
-            self.obs_normalizations_values[key] = (min_val, range_val)
-            print(
-                f"  {key_short:<25} {min_val:>12.4f} {max_val:>12.4f} {mean_val:>12.4f} {range_val:>12.4f}"
-            )
 
         print(f"  Frames shape: {self.frames.shape}")
         print(f"  Actions shape: {self.actions.shape}")
@@ -207,9 +181,6 @@ class DemonstrationDataset(Dataset):
             next_frames_tensor = torch.flip(next_frames_tensor, dims=[-1])
             actions[0] = -actions[0]  # invert steering
 
-        obs = self.observations[actual_idx].astype(np.float32)
-        normalized_obs = (obs - self.obs_min.flatten()) / self.obs_range.flatten()
-
         is_done = 0.0
         if next_idx >= len(self.frames) - 1:
             is_done = 1.0
@@ -218,7 +189,6 @@ class DemonstrationDataset(Dataset):
             "frames": frames_tensor,
             "next_frames": next_frames_tensor,
             "actions": torch.from_numpy(actions),
-            "observations": torch.from_numpy(normalized_obs),
             "rewards": torch.tensor([self.rewards[actual_idx]], dtype=torch.float32),
             "dones": torch.tensor([is_done], dtype=torch.float32),
         }

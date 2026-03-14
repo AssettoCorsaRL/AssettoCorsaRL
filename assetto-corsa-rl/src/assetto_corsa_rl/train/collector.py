@@ -1,4 +1,5 @@
 import torch
+import queue
 from tensordict import TensorDict
 
 from .train_utils import (
@@ -201,6 +202,16 @@ class CollectorWorker:
         td_next = get_inner(next_td)
 
         rewards, dones = extract_reward_and_done(td_next, self.cfg.num_envs, self.device)
+        terminated = (
+            td_next["terminated"].view(self.cfg.num_envs).to(self.device).to(torch.bool)
+            if "terminated" in td_next.keys()
+            else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
+        )
+        truncated = (
+            td_next["truncated"].view(self.cfg.num_envs).to(self.device).to(torch.bool)
+            if "truncated" in td_next.keys()
+            else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
+        )
 
         pixels = self.current_td["pixels"]
         next_pixels = td_next["pixels"]
@@ -220,6 +231,8 @@ class CollectorWorker:
                 "reward": rewards[i].unsqueeze(0).cpu(),
                 "next_pixels": pack_pixels(next_pixels[i]),
                 "done": dones[i].unsqueeze(0).cpu(),
+                "terminated": terminated[i].unsqueeze(0).cpu(),
+                "truncated": truncated[i].unsqueeze(0).cpu(),
             }
             if cur_vector is not None:
                 v = cur_vector[i] if cur_vector.dim() > 1 else cur_vector
@@ -227,10 +240,17 @@ class CollectorWorker:
             if next_vector is not None:
                 nv = next_vector[i] if next_vector.dim() > 1 else next_vector
                 transition["next_vector"] = nv.to(torch.float32).cpu()
-            try:
-                self.transitions_queue.put_nowait(transition)
-            except Exception:
-                pass  # back-pressure: drop transition if queue is full
+            while True:
+                try:
+                    self.transitions_queue.put(transition, timeout=0.05)
+                    break
+                except queue.Full:
+                    if self.stop_event is not None and self.stop_event.is_set():
+                        break
+                    continue
+                except Exception as e:
+                    log_info(f"[COLLECTOR] Failed to enqueue transition: {e}")
+                    break
 
         self._handle_episode_end(rewards, dones)
         self._maybe_reset(td_next, dones)

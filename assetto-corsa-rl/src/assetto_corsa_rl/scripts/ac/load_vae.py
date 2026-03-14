@@ -1,7 +1,7 @@
 """Load a trained VAE and inspect encoder/decoder outputs on environment frames.
 
 Example:
-    acrl ac load-vae --ckpt loss=0.1031.ckpt
+    acrl ac load-vae --ckpt loss=0.1050.ckpt
 """
 
 from __future__ import annotations
@@ -115,6 +115,14 @@ def _recon_display(
     return key
 
 
+def _print_latent_stats(z: torch.Tensor, step: int) -> None:
+    z_detached = z.detach()
+    z_min = float(z_detached.min().item())
+    z_max = float(z_detached.max().item())
+    z_mean = float(z_detached.mean().item())
+    print(f"[latent] step={step} min={z_min:.6f} max={z_max:.6f} mean={z_mean:.6f}")
+
+
 @cli_command(
     group="ac", name="load-vae", help="Load and inspect a trained VAE on environment frames"
 )
@@ -149,6 +157,7 @@ def main(ckpt, env, frames, image_shape, device):
     if env == "gym":
         env = create_gym_env(height=img_h, width=img_w, device=device, num_envs=1)
         td = env.reset()
+        step_idx = 0
 
         try:
             while True:
@@ -157,7 +166,10 @@ def main(ckpt, env, frames, image_shape, device):
 
                 x = graystack_to_rgb_input(pixels_sample.cpu(), frames).to(device)
                 with torch.no_grad():
-                    recon = vae(x)
+                    z = vae.encode(x)
+                    recon = vae.decode(z)
+
+                _print_latent_stats(z, step_idx)
 
                 key = _recon_display(x, recon)
                 if key in (ord("q"), 27):
@@ -166,6 +178,7 @@ def main(ckpt, env, frames, image_shape, device):
                 action_shape = env.action_spec.shape
                 action = torch.zeros((env.num_workers, *action_shape), device=device)
                 td = env.step(action)
+                step_idx += 1
 
                 time.sleep(0.01)
         except KeyboardInterrupt:
@@ -186,6 +199,7 @@ def main(ckpt, env, frames, image_shape, device):
         fr = torch.from_numpy(initial_img[..., 0].astype(np.float32) / 255.0)
         for _ in range(frames):
             frame_buf.append(fr.clone())
+        step_idx = 0
 
         try:
             while True:
@@ -193,7 +207,10 @@ def main(ckpt, env, frames, image_shape, device):
                 x = graystack_to_rgb_input(stacked, frames).to(device)
 
                 with torch.no_grad():
-                    recon = vae(x)
+                    z = vae.encode(x)
+                    recon = vae.decode(z)
+
+                _print_latent_stats(z, step_idx)
 
                 key = _recon_display(x, recon)
                 if key in (ord("q"), 27):
@@ -214,6 +231,8 @@ def main(ckpt, env, frames, image_shape, device):
                         [torch.from_numpy(initial_img[..., 0].astype(np.float32) / 255.0)] * frames,
                         maxlen=frames,
                     )
+
+                step_idx += 1
 
                 time.sleep(0.01)
         except KeyboardInterrupt:

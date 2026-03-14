@@ -74,6 +74,9 @@ class LearnerWorker:
         self._updates_count = 0
         self._updates_per_step = int(getattr(cfg, "updates_per_step", 1))
         self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
+        self._critic_updates_count = 0
+        self._actor_updates_count = 0
+        self._alpha_updates_count = 0
 
         self._cumul_used: int = int(getattr(cfg, "cumul_memories_used", 0))
         self._cumul_should: int = int(getattr(cfg, "cumul_memories_should_have_been_used", 0))
@@ -81,13 +84,10 @@ class LearnerWorker:
         self._encoder_frozen = False
         self._last_epsilon = 0.0  # updated from collector meta messages
 
-        _rb_max = int(getattr(cfg, "replay_size", 1_000_000))
-        self._sample_counts = np.zeros(_rb_max, dtype=np.int32)
-        self._max_uses: int = int(
-            getattr(cfg, "number_times_single_memory_is_used_before_discard", 32)
+        _default_log_updates = int(getattr(cfg, "updates_per_step", 1)) * int(
+            getattr(cfg, "log_interval", 1000)
         )
-        self._last_expired_count: int = 0
-        self._log_update_every: int = int(getattr(cfg, "log_update_every", 100))
+        self._log_update_every: int = int(getattr(cfg, "log_update_every", _default_log_updates))
 
         if getattr(cfg, "compile_models", False):
             log_info("Applying torch.compile to actor / critic networks...")
@@ -184,6 +184,10 @@ class LearnerWorker:
                 "next_pixels": item["next_pixels"],
                 "done": item["done"],
             }
+            if "terminated" in item:
+                td_data["terminated"] = item["terminated"]
+            if "truncated" in item:
+                td_data["truncated"] = item["truncated"]
             if "vector" in item:
                 td_data["vector"] = item["vector"]
             if "next_vector" in item:
@@ -240,6 +244,12 @@ class LearnerWorker:
             next_pixels_b = next_pixels_b.to(self.device)
 
         dones_b = batch["done"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
+        if "terminated" in batch.keys():
+            terminated_b = batch["terminated"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
+            dones_b = torch.maximum(dones_b, terminated_b)
+        if "truncated" in batch.keys():
+            truncated_b = batch["truncated"].to(self.device).view(-1, 1).to(dtype=rewards_b.dtype)
+            dones_b = torch.maximum(dones_b, truncated_b)
 
         vector_b = batch["vector"].to(self.device) if "vector" in batch.keys() else None
         next_vector_b = (
@@ -297,12 +307,7 @@ class LearnerWorker:
                 # Clip priorities to prevent runaway PER sampling
                 _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
                 new_priorities = np.clip(td_errors.cpu().numpy().copy(), 1e-6, _max_priority)
-                self._sample_counts[indices_arr] += 1
-                expired_mask = self._sample_counts[indices_arr] >= self._max_uses
-                _expired = int(expired_mask.sum())
-                self._sample_counts[indices_arr[expired_mask]] = 0
                 self.rb.update_priority(batch_indices, new_priorities)
-                self._last_expired_count = _expired
 
         beta = min(
             1.0,
@@ -331,6 +336,12 @@ class LearnerWorker:
             self.cfg.max_grad_norm,
         )
         self.critic_opt.step()
+        self._critic_updates_count += 1
+        # log_info(
+        #     f"[Critic Update #{self._critic_updates_count}] "
+        #     f"Q1_loss={q1_loss.item():.4f}, Q2_loss={q2_loss.item():.4f}, "
+        #     f"total_critic_loss={critic_loss.item():.4f}"
+        # )
 
         # ===== Actor Update =====
         self._updates_count += 1
@@ -364,13 +375,21 @@ class LearnerWorker:
                         "actor/scale_max": out["scale"].max().item(),
                     }
                     if self.log_queue is not None:
-                        self.log_queue.put_nowait(
-                            {"step": self.total_steps, "data": loc_scale_dict}
-                        )
+                        try:
+                            self.log_queue.put_nowait(
+                                {"step": self.total_steps, "data": loc_scale_dict}
+                            )
+                        except Exception as e:
+                            print(f"[WARNING] Failed to log actor metrics to queue: {e}")
+                            # Fallback to direct wandb logging
+                            try:
+                                wandb.log(loc_scale_dict, step=self.total_steps)
+                            except Exception as e2:
+                                print(f"[ERROR] Direct wandb.log also failed: {e2}")
                     else:
                         wandb.log(loc_scale_dict, step=self.total_steps)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[WARNING] Exception in actor metric logging: {e}")
 
             q1_new = self.q1.module(pixels_b, new_actions, vector_b).view(-1, 1)
             q2_new = self.q2.module(pixels_b, new_actions, vector_b).view(-1, 1)
@@ -382,6 +401,12 @@ class LearnerWorker:
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
             self.actor_opt.step()
+            self._actor_updates_count += 1
+            log_info(
+                f"[Actor Update #{self._actor_updates_count}] "
+                f"actor_loss={actor_loss.item():.4f}, "
+                f"mean_log_prob={log_prob_new.mean().item():.4f}"
+            )
 
             # ===== Alpha Update =====
             alpha_loss = None
@@ -393,6 +418,12 @@ class LearnerWorker:
                 alpha_loss.backward()
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
+                self._alpha_updates_count += 1
+                log_info(
+                    f"[Alpha Update #{self._alpha_updates_count}] "
+                    f"alpha_loss={alpha_loss.item():.4f}, "
+                    f"alpha={self.log_alpha.exp().item():.4f}"
+                )
                 alpha_min = float(getattr(self.cfg, "alpha_min", 0.01))
                 alpha_max = float(getattr(self.cfg, "alpha_max", 1.0))
                 with torch.no_grad():
@@ -450,13 +481,14 @@ class LearnerWorker:
                 "per/beta": beta,
                 "per/is_weight_mean": is_weights.mean().item(),
                 "per/is_weight_max": is_weights.max().item(),
-                "buffer/expired_this_batch": self._last_expired_count,
-                "buffer/expired_fraction": self._last_expired_count / max(1, self.cfg.batch_size),
                 "pacing/cumul_memories_used": self._cumul_used,
                 "pacing/cumul_memories_should_have_been_used": self._cumul_should,
                 "pacing/pacing_lag": max(0, self._cumul_should - self._cumul_used),
                 "lr/actor_lr": self.actor_opt.param_groups[0]["lr"],
                 "lr/critic_lr": self.critic_opt.param_groups[0]["lr"],
+                "updates/critic_updates_count": self._critic_updates_count,
+                "updates/actor_updates_count": self._actor_updates_count,
+                "updates/alpha_updates_count": self._alpha_updates_count,
             }
             if getattr(self.cfg, "use_noisy", False):
                 log_dict.update(self._collect_noisy_stats(self.actor, "actor"))
@@ -464,12 +496,17 @@ class LearnerWorker:
             if self.log_queue is not None:
                 try:
                     self.log_queue.put_nowait({"step": self.total_steps, "data": log_dict})
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[WARNING] Failed to log metrics to queue: {e}")
+                    # Fallback to direct wandb logging
+                    try:
+                        wandb.log(log_dict, step=self.total_steps)
+                    except Exception as e2:
+                        print(f"[ERROR] Direct wandb.log also failed: {e2}")
             else:
                 wandb.log(log_dict, step=self.total_steps)
         except Exception as e:
-            print("Warning: wandb logging failed (updates):", e)
+            print(f"[ERROR] Exception in update logging: {e}")
 
     # === noisy layer diagnostics ================================================================
 
@@ -580,11 +617,19 @@ class LearnerWorker:
                     "epsilon": epsilon,
                 }
                 if self.log_queue is not None:
-                    self.log_queue.put_nowait({"step": self.total_steps, "data": stats_dict})
+                    try:
+                        self.log_queue.put_nowait({"step": self.total_steps, "data": stats_dict})
+                    except Exception as e:
+                        print(f"[WARNING] Failed to log stats to queue: {e}")
+                        # Fallback to direct wandb logging
+                        try:
+                            wandb.log(stats_dict, step=self.total_steps)
+                        except Exception as e2:
+                            print(f"[ERROR] Direct wandb.log also failed: {e2}")
                 else:
                     wandb.log(stats_dict, step=self.total_steps)
             except Exception as e:
-                print("Warning: wandb logging failed (_maybe_log_and_save):", e)
+                print(f"[ERROR] Exception in _maybe_log_and_save: {e}")
             self._last_log_steps = self.total_steps
 
         if self.total_steps - self._last_save_steps >= self.cfg.save_interval:
@@ -626,13 +671,13 @@ class LearnerWorker:
         if self.total_steps - self._last_save_rb_steps >= rb_save_interval:
             rb_dir = Path("./models")
             rb_dir.mkdir(parents=True, exist_ok=True)
-            rb_path = rb_dir / f"replay_buffer_{self.total_steps}.pkl"
+            rb_path = rb_dir / f"replay_buffer_{self.total_steps}.pt"
             try:
                 min_free_space_gb = getattr(self.cfg, "min_free_space_gb", 10)
                 min_free_space_bytes = min_free_space_gb * 1024 * 1024 * 1024
                 stat = shutil.disk_usage(rb_dir)
                 available_space = stat.free
-                existing_buffers = sorted(rb_dir.glob("replay_buffer_*.pkl"))
+                existing_buffers = sorted(rb_dir.glob("replay_buffer_*.pt"))
                 while existing_buffers and available_space < min_free_space_bytes:
                     oldest_buffer = existing_buffers.pop(0)
                     buffer_size = oldest_buffer.stat().st_size
@@ -649,17 +694,27 @@ class LearnerWorker:
                         "Skipping replay buffer save."
                     )
                 else:
-                    rb_state = {
-                        "buffer": self.rb._storage._storage,
-                        "sampler_state": {
-                            "alpha": getattr(self.rb._sampler, "_alpha", None),
-                            "beta": getattr(self.rb._sampler, "_beta", None),
-                        },
-                        "total_steps": self.total_steps,
-                        "buffer_size": len(self.rb),
-                    }
-                    with open(rb_path, "wb") as f:
-                        pickle.dump(rb_state, f)
+                    # Try torch.save first (better for torch tensors and LazyTensorStorage)
+                    # Fallback to pickle if torch.save fails
+                    try:
+                        rb_state = {
+                            "buffer": self.rb._storage._storage,
+                            "sampler_state": {
+                                "alpha": getattr(self.rb._sampler, "_alpha", None),
+                                "beta": getattr(self.rb._sampler, "_beta", None),
+                            },
+                            "total_steps": self.total_steps,
+                            "buffer_size": len(self.rb),
+                        }
+                        torch.save(rb_state, rb_path)
+                    except (RuntimeError, ValueError, TypeError) as e:
+                        # LazyTensorStorage may have closed file handles - try pickle
+                        if "closed file" in str(e).lower():
+                            # Silently skip if storage is in invalid state
+                            return
+                        with open(rb_path, "wb") as f:
+                            pickle.dump(rb_state, f)
+
                     saved_size = rb_path.stat().st_size
                     remaining_space = shutil.disk_usage(rb_dir).free
                     print(
@@ -670,4 +725,6 @@ class LearnerWorker:
                     )
                     self._last_save_rb_steps = self.total_steps
             except Exception as e:
-                print(f"Warning: Failed to save replay buffer: {e}")
+                # Log but don't fail training if buffer save fails
+                # (buffer can be restored from expert demos on restart)
+                log_warning(f"Failed to save replay buffer: {e}")

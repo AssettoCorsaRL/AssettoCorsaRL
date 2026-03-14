@@ -468,25 +468,27 @@ class AssettoCorsa(gym.Env):
             + meters_progress
             * self.reward_per_m_advanced_along_centerline  # progress along racing line
             - off_track * 0.5  # penalty for being off track
-            - (50.0 + speed * 5.0 if damage > 0 else 0.0)
+            - (speed if damage > 0 else 0.0)
         )
         self._last_speed = speed
         return reward
 
-    def _check_done(self, obs: np.ndarray, data: Optional[Dict]) -> bool:
-        if self._episode_step >= self.max_episode_steps:
-            return True
+    def _check_done(self, obs, data):
+        if data is None or data.get("car") is None:
+            return False, False
 
-        if data is None or data.get("car") is None or data.get("lap") is None:
-            return False
+        terminated = False
+        truncated = False
 
         if data["lap"]["get_lap_count"] == 2:
-            return True
-
+            truncated = True
         if sum(data["car"]["damage"]) > 0:
-            return True
+            terminated = True
 
-        return False
+        if self._episode_step >= self.max_episode_steps:
+            truncated = True
+
+        return terminated, truncated
 
     def reset(
         self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
@@ -531,11 +533,6 @@ class AssettoCorsa(gym.Env):
             self._last_speed = 0.0
 
         info = {"episode_step": self._episode_step}
-
-        if self.ai_racer:
-            success = self.telemetry.send_ctrl_c()
-            if not success:
-                print("Warning: send_ctrl_c failed during env.reset()")
 
         time.sleep(1.5)
 
@@ -586,8 +583,7 @@ class AssettoCorsa(gym.Env):
 
         reward = self._calculate_reward(obs, data)
 
-        terminated = self._check_done(obs, data)
-        truncated = False
+        terminated, truncated = self._check_done(obs, data)
 
         self._episode_step += 1
 

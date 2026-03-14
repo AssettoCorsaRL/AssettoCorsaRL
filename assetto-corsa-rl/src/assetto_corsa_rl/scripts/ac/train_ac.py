@@ -3,6 +3,7 @@
 import time
 import math
 import sys
+import os
 import yaml
 from pathlib import Path
 
@@ -59,12 +60,12 @@ def _do_train():
             wandb_kwargs["entity"] = cfg.wandb_entity
         if getattr(cfg, "wandb_name", None):
             wandb_kwargs["name"] = cfg.wandb_name
-        wandb_run = wandb.init(**wandb_kwargs)
-        # ── Sweep override ────────────────────────────────────────────────
-        # wandb.agent injects swept hyper-parameters via wandb.config.
-        # Write them back to cfg so the rest of the code picks them up
-        # automatically (optimizers, replay buffer, etc. are built later).
-        if wandb.run is not None:
+        wandb.init(**wandb_kwargs)
+        is_sweep_run = bool(
+            (wandb.run is not None and getattr(wandb.run, "sweep_id", None))
+            or os.getenv("WANDB_SWEEP_ID")
+        )
+        if wandb.run is not None and is_sweep_run:
             for k, v in dict(wandb.config).items():
                 if hasattr(cfg, k) and not k.startswith("_"):
                     setattr(cfg, k, v)
@@ -239,8 +240,12 @@ def _do_train():
         try:
             import pickle
 
-            with open(replay_buffer_path, "rb") as f:
-                rb_state = pickle.load(f)
+            # Support both .pt (torch) and .pkl (pickle) formats
+            if replay_buffer_path.endswith(".pt"):
+                rb_state = torch.load(replay_buffer_path, weights_only=False)
+            else:
+                with open(replay_buffer_path, "rb") as f:
+                    rb_state = pickle.load(f)
 
             if "buffer" in rb_state:
                 rb._storage._storage = rb_state["buffer"]
@@ -271,12 +276,12 @@ def _do_train():
         if expert_demo_path:
             log_info("Loading expert demonstrations into replay buffer...")
             expert_subsample = getattr(cfg, "expert_demo_subsample", None)
-            expert_priority = getattr(cfg, "expert_demo_priority", 1.0)
+            expert_demo_epsilon = getattr(cfg, "expert_demo_epsilon", 1e-3)
             expert_count = load_expert_demonstrations(
                 rb,
                 demo_dir=expert_demo_path,
                 subsample=expert_subsample,
-                priority=expert_priority,
+                demo_epsilon=expert_demo_epsilon,
                 log_fn=log_info,
             )
             if expert_count > 0:
@@ -329,56 +334,6 @@ def _do_train():
 def train():
     """Train SAC agent in Assetto Corsa."""
     _do_train()
-
-
-@cli_command(group="ac", name="sweep", help="Run a WandB hyperparameter sweep")
-def sweep():
-    """Create a WandB sweep and run the agent for *sweep_count* trials.
-
-    Set the WANDB_SWEEP_ID env-var to join an existing sweep instead of
-    creating a new one.  Set sweep_count in train_config.yaml to control
-    how many trials this agent runs.
-    """
-    import os
-
-    cfg = load_cfg_from_yaml()
-    sweep_count = int(getattr(cfg, "sweep_count", 20))
-
-    # Locate sweep_config.yaml next to the other ac configs.
-    try:
-        from importlib.resources import files
-
-        sweep_cfg_path = Path(files("assetto_corsa_rl")) / "configs" / "ac" / "sweep_config.yaml"
-    except Exception:
-        sweep_cfg_path = (
-            Path(__file__).resolve().parents[4] / "configs" / "ac" / "sweep_config.yaml"
-        )
-
-    with open(sweep_cfg_path, "r") as f:
-        sweep_config = yaml.safe_load(f)
-
-    project = getattr(cfg, "wandb_project", "AssetoCorsaRL-AssettoCorsa")
-    entity = getattr(cfg, "wandb_entity", None)
-
-    # Join an existing sweep or create a new one.
-    sweep_id_env = os.environ.get("WANDB_SWEEP_ID")
-    if sweep_id_env:
-        sweep_id = sweep_id_env
-        print(f"Joining existing sweep: {sweep_id}")
-    else:
-        init_kwargs = {"project": project}
-        if entity:
-            init_kwargs["entity"] = entity
-        sweep_id = wandb.sweep(sweep_config, **init_kwargs)
-        print(f"Created sweep: {sweep_id}")
-
-    print(f"Running {sweep_count} trial(s) via wandb.agent …")
-    wandb.agent(
-        sweep_id,
-        function=_do_train,
-        count=sweep_count,
-        project=project,
-    )
 
 
 if __name__ == "__main__":

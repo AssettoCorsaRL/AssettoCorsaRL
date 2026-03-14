@@ -71,21 +71,6 @@ class OrnsteinUhlenbeckNoise:
         self.state = self.state + dx
         return self.state.clone()
 
-    def reset(self, env_indices=None):
-        """Reset noise state (e.g. on episode end)."""
-        if env_indices is None:
-            self.state = self.mu.clone()
-        else:
-            self.state[env_indices] = self.mu[env_indices].clone()
-
-    def sample(self) -> torch.Tensor:
-        """Return next OU noise sample (num_envs, action_dim)."""
-        dx = self.theta * (self.mu - self.state) * self.dt + self.sigma * math.sqrt(
-            self.dt
-        ) * torch.randn_like(self.state)
-        self.state = self.state + dx
-        return self.state.clone()
-
 
 def reduce_value_to_batch(x, batch_size):
     try:
@@ -140,10 +125,15 @@ def extract_reward_and_done(td, num_envs, device):
     else:
         raise KeyError(f"Unexpected TensorDict structure. Keys: {td.keys()}")
 
+    def _flag_or_zeros(key: str) -> torch.Tensor:
+        if key in td.keys():
+            return td[key].view(num_envs).to(device).to(torch.bool)
+        return torch.zeros(num_envs, dtype=torch.bool, device=device)
+
     dones = torch.zeros(num_envs, dtype=torch.bool, device=device)
-    dones |= td["done"].view(num_envs).to(device).to(torch.bool)
-    dones |= td["terminated"].view(num_envs).to(device).to(torch.bool)
-    dones |= td["truncated"].view(num_envs).to(device).to(torch.bool)
+    dones |= _flag_or_zeros("done")
+    dones |= _flag_or_zeros("terminated")
+    dones |= _flag_or_zeros("truncated")
     return rewards, dones
 
 
@@ -275,65 +265,106 @@ def load_expert_demonstrations(
     rb,
     demo_dir: str,
     subsample: int = None,
-    priority: float = 1.0,
+    demo_epsilon: float = 1e-3,
     log_fn=None,
 ):
-    """Load expert demonstrations from npz files into the replay buffer.
-
-    Args:
-        rb: Prioritized replay buffer to populate
-        demo_dir: Path to directory containing demo_batch_*.npz files
-        subsample: If set, sample every Nth frame (default None = use all)
-        priority: PER priority value for expert transitions
-        log_fn: Optional logging function (e.g. log_info)
-
-    Returns:
-        Total number of transitions loaded
-    """
+    """Load expert demonstrations from npz files into the replay buffer."""
     from pathlib import Path
     import numpy as np
 
+    def _get_current_max_priority(replay_buffer) -> float:
+        sampler_candidates = [
+            replay_buffer,
+            getattr(replay_buffer, "sampler", None),
+            getattr(replay_buffer, "_sampler", None),
+        ]
+        attrs = ("max_priority", "_max_priority")
+
+        for candidate in sampler_candidates:
+            if candidate is None:
+                continue
+            for attr in attrs:
+                value = getattr(candidate, attr, None)
+                if value is None:
+                    continue
+                try:
+                    value_f = float(value)
+                except Exception:
+                    continue
+                if math.isfinite(value_f) and value_f > 0.0:
+                    return value_f
+        return 1.0
+
+    def _emit(msg: str):
+        print(msg)
+        if log_fn is not None:
+            try:
+                log_fn(msg)
+            except Exception:
+                pass
+
     demo_path = Path(demo_dir)
     if not demo_path.exists():
-        if log_fn:
-            log_fn(f"Expert demonstrations directory not found: {demo_dir}")
+        _emit(f"[expert-demo] Directory not found: {demo_dir}")
         return 0
 
     demo_files = sorted(demo_path.glob("demo_batch_*.npz"))
     if not demo_files:
-        if log_fn:
-            log_fn(f"No demo_batch_*.npz files found in {demo_dir}")
+        _emit(f"[expert-demo] No demo_batch_*.npz files found in: {demo_dir}")
         return 0
 
     total_loaded = 0
+    added_indices: list[int] = []
     for demo_file in demo_files:
         try:
-            data = np.load(demo_file, allow_pickle=True)
-            frames = data["frames"]  # [N, C, H, W]
-            actions = data["actions"]  # [N, action_dim]
-            rewards = data["rewards"]  # [N]
+            with np.load(demo_file, allow_pickle=True) as data:
+                # Required keys
+                required = ["frames", "actions", "rewards"]
+                missing_required = [k for k in required if k not in data.files]
+                if missing_required:
+                    _emit(
+                        f"[expert-demo] WARNING: {demo_file.name} missing required keys "
+                        f"{missing_required}. Skipping file."
+                    )
+                    continue
 
-            observations = None
-            if "observations" in data:
-                observations = data["observations"]  # [N, obs_dim]
+                frames = data["frames"]
+                actions = data["actions"]
+                rewards = data["rewards"]
+
+                observations = None
+                if "observations" in data.files:
+                    observations = data["observations"]
+                else:
+                    _emit(
+                        f"[expert-demo] WARNING: {demo_file.name} has no 'observations'. "
+                        f"Loading transitions without vector/next_vector."
+                    )
+
+                file_truncated = None
+                if "truncated" in data.files:
+                    file_truncated = data["truncated"]
+                elif "truncateds" in data.files:
+                    file_truncated = data["truncateds"]
 
             num_samples = len(frames)
-
             indices = list(range(num_samples))
             if subsample and subsample > 1:
                 indices = indices[::subsample]
 
             for idx in indices:
-                current_pixels = torch.from_numpy(frames[idx]).unsqueeze(0)  # [1, C, H, W]
-
+                current_pixels = torch.from_numpy(frames[idx]).unsqueeze(0)
                 if idx + 1 < len(frames):
                     next_pixels = torch.from_numpy(frames[idx + 1]).unsqueeze(0)
                 else:
                     next_pixels = current_pixels.clone()
 
-                action = torch.from_numpy(actions[idx]).unsqueeze(0)  # [1, action_dim]
-                reward = torch.from_numpy(rewards[idx : idx + 1])  # [1]
+                action = torch.from_numpy(actions[idx]).unsqueeze(0)
+                reward = torch.from_numpy(rewards[idx : idx + 1])
                 done = torch.zeros(1, dtype=torch.bool)
+                truncated = torch.zeros(1, dtype=torch.bool)
+                if file_truncated is not None and idx < len(file_truncated):
+                    truncated = torch.tensor([bool(file_truncated[idx])], dtype=torch.bool)
 
                 transition = TensorDict(
                     {
@@ -342,6 +373,7 @@ def load_expert_demonstrations(
                         "reward": reward.float().cpu(),
                         "next_pixels": pack_pixels(next_pixels[0]),
                         "done": done.cpu(),
+                        "truncated": truncated.cpu(),
                     },
                     batch_size=[],
                 )
@@ -355,23 +387,51 @@ def load_expert_demonstrations(
                     else:
                         transition["next_vector"] = transition["vector"].clone()
 
-                rb.add(transition)
+                added_idx = rb.add(transition)
+                if added_idx is not None:
+                    if isinstance(added_idx, torch.Tensor):
+                        flat_idx = added_idx.detach().cpu().view(-1).tolist()
+                        added_indices.extend(int(i) for i in flat_idx)
+                    elif isinstance(added_idx, (list, tuple)):
+                        added_indices.extend(int(i) for i in added_idx)
+                    else:
+                        try:
+                            added_indices.append(int(added_idx))
+                        except Exception:
+                            pass
                 total_loaded += 1
 
-            if log_fn:
-                subsample_info = (
-                    f" (subsampled 1/{subsample})" if subsample and subsample > 1 else ""
-                )
-                log_fn(
-                    f"  ✓ Loaded {len(indices)} transitions from {demo_file.name}{subsample_info}"
-                )
+            # _emit(
+            #     f"[expert-demo] Loaded {len(indices)} transitions from {demo_file.name}{subsample_info}"
+            # )
 
         except Exception as e:
-            if log_fn:
-                log_fn(f"  Warning: Failed to load {demo_file.name}: {e}")
+            _emit(f"[expert-demo] WARNING: Failed to load {demo_file.name}: {e}")
             continue
 
-    if log_fn:
-        log_fn(f"Expert demonstrations loaded: {total_loaded} total transitions")
+    _emit(f"[expert-demo] Total loaded transitions: {total_loaded}")
+
+    if total_loaded > 0:
+        try:
+            eps = max(0.0, float(demo_epsilon))
+            max_priority = _get_current_max_priority(rb)
+            expert_priority = max_priority + eps
+
+            if added_indices:
+                expert_indices = torch.tensor(added_indices, dtype=torch.long)
+            else:
+                expert_indices = torch.arange(total_loaded, dtype=torch.long)
+
+            expert_priorities = torch.full(
+                (expert_indices.numel(),), expert_priority, dtype=torch.float32
+            )
+            rb.update_priority(expert_indices, expert_priorities.numpy())
+            _emit(
+                "[expert-demo] Set priority="
+                f"{expert_priority:.6f} (max={max_priority:.6f} + eps={eps:.6f}) "
+                f"for {expert_indices.numel()} expert transitions"
+            )
+        except Exception as e:
+            _emit(f"[expert-demo] WARNING: Could not set priorities: {e}")
 
     return total_loaded

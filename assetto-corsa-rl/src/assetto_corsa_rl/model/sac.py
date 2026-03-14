@@ -10,9 +10,18 @@ from tensordict.nn import TensorDictModule
 from tensordict import TensorDict
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
+import torch.nn.functional as F
 
 # Local noisy layers (optional)
 from .noisy import NoisyLazyLinear
+
+
+def _init_orthogonal(module, gain=1.0):
+    """Apply orthogonal init to a Linear or Conv2d layer."""
+    if isinstance(module, (nn.Linear, nn.Conv2d)):
+        nn.init.orthogonal_(module.weight, gain=gain)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
 
 
 class BoundedNormalParams(nn.Module):
@@ -22,9 +31,15 @@ class BoundedNormalParams(nn.Module):
         self.register_buffer("max_scale", max_scale)
         self.register_buffer("scale_range", max_scale - min_scale)
 
+        self.register_buffer("log_scale_min", torch.log(min_scale))
+        self.register_buffer("log_scale_max", torch.log(max_scale))
+
     def forward(self, x):
-        loc, scale_raw = x.chunk(2, dim=-1)
-        scale = self.min_scale + torch.sigmoid(scale_raw) * self.scale_range
+        loc, log_scale = x.chunk(2, dim=-1)
+        # soft clamp - gradients flow everywhere
+        log_scale = self.log_scale_max - F.softplus(self.log_scale_max - log_scale)
+        log_scale = self.log_scale_min + F.softplus(log_scale - self.log_scale_min)
+        scale = torch.exp(log_scale)
         return {"loc": loc, "scale": scale}
 
 
@@ -63,6 +78,26 @@ class ActorNet(nn.Module):
             BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
         )
 
+        self._init_weights()
+
+    def _init_weights(self):
+        lrelu_gain = nn.init.calculate_gain("leaky_relu", 0.01)
+
+        _init_orthogonal(self.mlp[0], gain=lrelu_gain)
+        _init_orthogonal(self.mlp[3], gain=lrelu_gain)
+        _init_orthogonal(self.mlp[6], gain=0.01)
+
+        # loc biases at 0 is fine.
+        # log_scale biases must start WITHIN [log(min), log(max)] so clamp doesn't kill gradients.
+        # log(0.01) = -4.6,  log(0.5) = -0.69,  midpoint = -2.65
+        action_dim = self.mlp[6].out_features // 2
+        with torch.no_grad():
+            # Access min/max from BoundedNormalParams (mlp[7])
+            log_min = self.mlp[7].log_scale_min  # [-4.6, -4.6, -4.6]
+            log_max = self.mlp[7].log_scale_max  # [-0.69, -0.69, -0.69]
+            mid = (log_min + log_max) / 2  # [-2.65, -2.65, -2.65]
+            self.mlp[6].bias[action_dim:] = mid
+
     def forward(self, pixels, vector=None):
         img_feat = self.cnn(pixels)
         if vector is not None and self.obs_dim > 0:
@@ -73,23 +108,31 @@ class ActorNet(nn.Module):
 
 
 class CriticNet(nn.Module):
-    def __init__(self, encoder, critic_input_size, hidden, device, obs_dim):
+    def __init__(self, encoder, cnn_output_size, action_dim, hidden, device, obs_dim):
         super().__init__()
         self.cnn = encoder
         self.obs_dim = obs_dim
+
+        self.action_embed = nn.Sequential(
+            nn.Linear(action_dim, 128, device=device),
+            nn.LeakyReLU(),
+        )
+
+        fusion_size = cnn_output_size + 128 + obs_dim
         self.fc = nn.Sequential(
-            nn.Linear(critic_input_size, hidden, device=device),
+            nn.Linear(fusion_size, hidden, device=device),
             nn.LayerNorm(hidden, device=device),
-            nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Linear(hidden, hidden, device=device),
             nn.LayerNorm(hidden, device=device),
-            nn.Tanh(),
+            nn.LeakyReLU(),
             nn.Linear(hidden, 1, device=device),
         )
+        self._init_weights()
 
     def forward(self, pixels, action, vector=None):
         img_features = self.cnn(pixels)
-        act = action.flatten(start_dim=1)
+        act = self.action_embed(action.flatten(start_dim=1))
         parts = [img_features, act]
         if vector is not None and self.obs_dim > 0:
             parts.append(vector)
@@ -180,8 +223,8 @@ class SACPolicy:
         self.shared_cnn = shared_cnn
         self.target_cnn = target_cnn
 
-        min_scale = torch.tensor([0.1, 0.1, 0.1], device=device)
-        max_scale = torch.tensor([1.0, 1.0, 1.0], device=device)
+        min_scale = torch.tensor([0.01, 0.01, 0.01], device=device)
+        max_scale = torch.tensor([0.5, 0.5, 0.5], device=device)
 
         # ── Actor ─────────────────────────────────────────────────────────
         # Fuses CNN features with optional telemetry vector
@@ -250,10 +293,14 @@ class SACPolicy:
         # Targets use a frozen deepcopy updated via polyak in the trainer.
         critic_input_size = cnn_output_size + action_dim + obs_dim
 
-        q1_net = CriticNet(shared_cnn, critic_input_size, num_cells, device, obs_dim)
-        q2_net = CriticNet(shared_cnn, critic_input_size, num_cells, device, obs_dim)
-        q1_net_target = CriticNet(target_cnn, critic_input_size, num_cells, device, obs_dim)
-        q2_net_target = CriticNet(target_cnn, critic_input_size, num_cells, device, obs_dim)
+        q1_net = CriticNet(shared_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim)
+        q2_net = CriticNet(shared_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim)
+        q1_net_target = CriticNet(
+            target_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim
+        )
+        q2_net_target = CriticNet(
+            target_cnn, cnn_output_size, action_dim, num_cells, device, obs_dim
+        )
 
         # Wrap in ValueOperator for state dict / parameter access,
         # but call via .module() directly in trainer to pass raw tensors
