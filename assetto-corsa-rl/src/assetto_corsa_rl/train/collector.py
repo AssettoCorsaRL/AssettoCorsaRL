@@ -90,6 +90,10 @@ class CollectorWorker:
                 break
         assert self.shared_cnn is not None, "Could not find CNN in actor"
 
+        # Rollout should use inference behavior for recurrent state carry.
+        # (Actor forward keeps context only when not in training mode.)
+        self.actor.eval()
+
         self._reset_actor_context()
 
     def _reset_actor_context(self):

@@ -18,7 +18,6 @@ try:
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
-    from assetto_corsa_rl.train.train_utils import load_expert_demonstrations  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
@@ -28,7 +27,6 @@ except Exception:
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
-    from assetto_corsa_rl.train.train_utils import load_expert_demonstrations  # type: ignore
 
 from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
 
@@ -288,27 +286,16 @@ def _do_train():
         log_warning(f"Replay buffer path specified but file not found: {replay_buffer_path}")
 
     # ── Load expert demonstrations (if enabled) ────────────────────────
-    if getattr(cfg, "use_expert_demonstrations", False):
-        expert_demo_path = getattr(cfg, "expert_demonstrations_path", None)
-        if expert_demo_path:
-            log_info("Loading expert demonstrations into replay buffer...")
-            expert_subsample = getattr(cfg, "expert_demo_subsample", None)
-            expert_demo_epsilon = getattr(cfg, "expert_demo_epsilon", 1e-3)
-            expert_count = load_expert_demonstrations(
-                rb,
-                demo_dir=expert_demo_path,
-                subsample=expert_subsample,
-                demo_epsilon=expert_demo_epsilon,
-                log_fn=log_info,
-            )
-            if expert_count > 0:
-                log_success(f"Loaded {expert_count} expert transitions into replay buffer")
-            else:
-                log_warning("No expert demonstrations were loaded")
-        else:
-            log_warning(
-                "Expert demonstrations enabled but expert_demonstrations_path not specified"
-            )
+    # In async mode, demos are loaded inside the learner subprocess only.
+    use_async = bool(getattr(cfg, "use_async", False))
+    if getattr(cfg, "use_expert_demonstrations", False) and not use_async:
+        log_warning(
+            "Skipping expert demonstrations: current replay buffer stores sequence chunks "
+            "(features/actions/...), while demo loader emits single-step transitions "
+            "(pixels/next_pixels)."
+        )
+    elif getattr(cfg, "use_expert_demonstrations", False) and use_async:
+        log_info("Expert demonstrations will be loaded by LearnerWorker (async mode)")
 
     total_steps = 0
     episode_returns = []

@@ -12,7 +12,7 @@ model:
   replay_buffer_path: null
 
   #* expert demonstrations (always in buffer)
-  use_expert_demonstrations: true # enable loading expert demos into replay buffer
+  use_expert_demonstrations: false # enable loading expert demos into replay buffer
   expert_demonstrations_path: "D:/acrl/AssetoCorsaRL/datasets/demonstrations" # path to directory containing demo_batch_*.npz files
   expert_demo_subsample: null # sample every Nth frame from expert demos (null = use all)
   expert_demo_epsilon: 0.01 # expert PER priority = current max priority + this epsilon
@@ -36,8 +36,8 @@ model:
 
   load_initial: true
 
-  per_alpha: 0.3 # less aggressive prioritization for stability
-  per_beta: 0.6
+  per_alpha: 0.4 # less aggressive prioritization for stability
+  per_beta: 0.4
   per_max_priority: 100.0 # clip PER priorities to prevent runaway sampling
 
   #* noisy - IGNORE IF use_noisy=false
@@ -45,7 +45,7 @@ model:
   noise_sigma: 0.45
 
   #* recurrent context
-  use_lstm: true
+  use_lstm: false
   lstm_hidden_size: 256
   lstm_layers: 1
   seq_len: 16 # training sequence length

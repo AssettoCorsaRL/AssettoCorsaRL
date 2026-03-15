@@ -296,12 +296,13 @@ def load_expert_demonstrations(
         return 1.0
 
     def _emit(msg: str):
-        print(msg)
         if log_fn is not None:
             try:
                 log_fn(msg)
+                return
             except Exception:
                 pass
+        print(msg)
 
     demo_path = Path(demo_dir)
     if not demo_path.exists():

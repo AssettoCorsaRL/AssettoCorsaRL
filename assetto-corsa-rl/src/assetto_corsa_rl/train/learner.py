@@ -93,7 +93,13 @@ class LearnerWorker:
             log_info("Applying torch.compile to actor / critic networks...")
             try:
                 _mode = str(getattr(cfg, "compile_mode", "reduce-overhead"))
-                actor.module.module = torch.compile(actor.module.module, mode=_mode)
+                actor_seq_net = self._get_actor_sequence_net()
+                if getattr(getattr(actor, "module", None), "module", None) is actor_seq_net:
+                    actor.module.module = torch.compile(actor_seq_net, mode=_mode)
+                elif getattr(actor, "module", None) is actor_seq_net:
+                    actor.module = torch.compile(actor_seq_net, mode=_mode)
+                else:
+                    torch.compile(actor_seq_net, mode=_mode)
                 q1.module = torch.compile(q1.module, mode=_mode)
                 q2.module = torch.compile(q2.module, mode=_mode)
                 q1_target.module = torch.compile(q1_target.module, mode=_mode)
@@ -117,6 +123,35 @@ class LearnerWorker:
         self._last_expert_bonus = max(0.0, self._expert_priority_initial_bonus)
         self._last_expert_target_priority = 0.0
         self._last_expert_base_priority = 0.0
+
+    def _get_actor_sequence_net(self):
+        """Return underlying actor net that implements ``forward_sequence``."""
+        actor_module = getattr(self.actor, "module", None)
+        if actor_module is not None and hasattr(actor_module, "forward_sequence"):
+            return actor_module
+
+        inner = getattr(actor_module, "module", None) if actor_module is not None else None
+        if inner is not None and hasattr(inner, "forward_sequence"):
+            return inner
+
+        if isinstance(inner, torch.nn.ModuleList):
+            for sub in inner:
+                if hasattr(sub, "forward_sequence"):
+                    return sub
+                sub_inner = getattr(sub, "module", None)
+                if sub_inner is not None and hasattr(sub_inner, "forward_sequence"):
+                    return sub_inner
+
+        if isinstance(actor_module, torch.nn.ModuleList):
+            for sub in actor_module:
+                if hasattr(sub, "forward_sequence"):
+                    return sub
+
+        for sub in self.actor.modules():
+            if hasattr(sub, "forward_sequence"):
+                return sub
+
+        raise RuntimeError("Unable to locate actor sequence net with forward_sequence().")
 
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage).
@@ -210,11 +245,15 @@ class LearnerWorker:
             # not the TensorDict batch dimension.
             td = TensorDict(td_data, batch_size=[])
             self.rb.add(td)
-            # Count by the number of real timesteps in the sequence
-            mask = item.get("mask", None)
-            if mask is not None:
-                count += int(mask.sum().item())
+            # Count collected env-steps (not masked train-steps) for schedule consistency.
+            real_len = item.get("real_len", None)
+            if real_len is not None:
+                if isinstance(real_len, torch.Tensor):
+                    count += int(real_len.item())
+                else:
+                    count += int(real_len)
             else:
+                # Backward compatibility for old queue items
                 count += item["actions"].shape[0]
 
         return count
@@ -364,7 +403,7 @@ class LearnerWorker:
             else None
         )
 
-        B, T_plus_1, F = features.shape
+        B, T_plus_1, feature_dim = features.shape
         T = T_plus_1 - 1
         A = actions_b.shape[-1]
 
@@ -385,7 +424,7 @@ class LearnerWorker:
         # ── Compute target Q values ────────────────────────────────────
         with torch.no_grad():
             # 1) Get next actions from actor (need to run actor LSTM on obs sequence)
-            actor_net = self.actor.module.module  # unwrap TensorDictModule + ProbabilisticActor
+            actor_net = self._get_actor_sequence_net()
             actor_params, next_actor_state = actor_net.forward_sequence(
                 next_obs_features, vector=next_obs_vector
             )
@@ -446,8 +485,9 @@ class LearnerWorker:
         q2_elementwise = F.smooth_l1_loss(q2_pred, q_target, reduction="none")
 
         # Apply sequence mask: don't backprop through padded timesteps
-        q1_masked = (q1_elementwise * mask * is_weights).sum() / mask.sum().clamp(min=1)
-        q2_masked = (q2_elementwise * mask * is_weights).sum() / mask.sum().clamp(min=1)
+        weighted_mask_sum = (mask * is_weights).sum().clamp(min=1e-6)
+        q1_masked = (q1_elementwise * mask * is_weights).sum() / weighted_mask_sum
+        q2_masked = (q2_elementwise * mask * is_weights).sum() / weighted_mask_sum
         critic_loss = q1_masked + q2_masked
 
         # ── TD error for PER priorities ────────────────────────────────
@@ -587,20 +627,105 @@ class LearnerWorker:
 
         try:
             current_entropy = -log_prob_new.mean().item() if log_prob_new is not None else 0.0
+
+            # Compute rich statistics for logging
             log_dict = {
+                # ── Loss metrics ──────────────────────────────────────
                 "loss/critic_loss": critic_loss.item(),
                 "loss/q1_loss": q1_masked.item(),
                 "loss/q2_loss": q2_masked.item(),
                 "loss/actor_loss": actor_loss.item() if actor_loss is not None else 0.0,
+                "loss/alpha_loss": alpha_loss.item() if alpha_loss is not None else 0.0,
+                # ── Critic Q-value statistics ─────────────────────────
                 "critic/q_target_mean": q_target.mean().item(),
+                "critic/q_target_std": q_target.std().item(),
+                "critic/q_target_min": q_target.min().item(),
+                "critic/q_target_max": q_target.max().item(),
+                "critic/q1_pred_mean": q1_pred.mean().item(),
+                "critic/q1_pred_std": q1_pred.std().item(),
+                "critic/q1_pred_min": q1_pred.min().item(),
+                "critic/q1_pred_max": q1_pred.max().item(),
+                "critic/q2_pred_mean": q2_pred.mean().item(),
+                "critic/q2_pred_std": q2_pred.std().item(),
+                "critic/q2_pred_min": q2_pred.min().item(),
+                "critic/q2_pred_max": q2_pred.max().item(),
+                "critic/td_error_mean": td_errors.mean().item(),
+                "critic/td_error_std": td_errors.std().item() if td_errors.numel() > 1 else 0.0,
+                "critic/td_error_min": td_errors.min().item(),
+                "critic/td_error_max": td_errors.max().item(),
                 "critic/q1_explained_variance": q1_explained_var.item(),
                 "critic/q2_explained_variance": q2_explained_var.item(),
+                # ── Next Q-value and advantage statistics ──────────────
+                "critic/next_q_mean": next_min_q.mean().item(),
+                "critic/next_q_std": next_min_q.std().item(),
+                "critic/next_q_min": next_min_q.min().item(),
+                "critic/next_q_max": next_min_q.max().item(),
+                "critic/advantage_mean": (
+                    (min_q_new.mean() - next_min_q.mean()).item() if min_q_new is not None else 0.0
+                ),
+                # ── Actor policy statistics ───────────────────────────
                 "actor/entropy": current_entropy,
+                "actor/entropy_loss_scalar": (
+                    (alpha.detach() * current_entropy) if log_prob_new is not None else 0.0
+                ),
                 "actor/alpha": alpha.item(),
+                "actor/log_alpha": self.log_alpha.item() if self.log_alpha is not None else 0.0,
+                # ── Action statistics (per action dim) ────────────────
+                "action/steer_mean": (
+                    new_actions[:, :, 0].mean().item() if new_actions is not None else 0.0
+                ),
+                "action/steer_std": (
+                    new_actions[:, :, 0].std().item() if new_actions is not None else 0.0
+                ),
+                "action/gas_mean": (
+                    new_actions[:, :, 1].mean().item() if new_actions is not None else 0.0
+                ),
+                "action/gas_std": (
+                    new_actions[:, :, 1].std().item() if new_actions is not None else 0.0
+                ),
+                "action/brake_mean": (
+                    new_actions[:, :, 2].mean().item() if new_actions is not None else 0.0
+                ),
+                "action/brake_std": (
+                    new_actions[:, :, 2].std().item() if new_actions is not None else 0.0
+                ),
+                # ── Policy parameters (mu, sigma) ────────────────────
+                "actor/loc_mean": (
+                    actor_params["loc"].mean().item() if "loc" in actor_params else 0.0
+                ),
+                "actor/loc_std": actor_params["loc"].std().item() if "loc" in actor_params else 0.0,
+                "actor/scale_mean": (
+                    actor_params["scale"].mean().item() if "scale" in actor_params else 0.0
+                ),
+                "actor/scale_std": (
+                    actor_params["scale"].std().item() if "scale" in actor_params else 0.0
+                ),
+                # ── Log probability (entropy from policy output) ───────
+                "actor/log_prob_mean": (
+                    log_prob_new.mean().item() if log_prob_new is not None else 0.0
+                ),
+                "actor/log_prob_std": (
+                    log_prob_new.std().item() if log_prob_new is not None else 0.0
+                ),
+                "actor/log_prob_min": (
+                    log_prob_new.min().item() if log_prob_new is not None else 0.0
+                ),
+                # ── Reward statistics ─────────────────────────────────
+                "reward/batch_mean": rewards_b.mean().item(),
+                "reward/batch_std": rewards_b.std().item(),
+                "reward/batch_min": rewards_b.min().item(),
+                "reward/batch_max": rewards_b.max().item(),
+                # ── Sequence masking statistics ───────────────────────
+                "batch/valid_ratio": (mask.sum() / mask.numel()).item(),
+                "batch/total_steps": (mask.sum()).item(),
+                # ── PER statistics ────────────────────────────────────
                 "per/td_error_mean": td_errors.mean().item(),
                 "per/beta": beta,
+                # ── Update counts ─────────────────────────────────────
                 "updates/critic_updates_count": self._critic_updates_count,
                 "updates/actor_updates_count": self._actor_updates_count,
+                "updates/alpha_updates_count": self._alpha_updates_count,
+                "updates/total_env_steps": self.total_steps,
             }
             self._log(log_dict)
         except Exception as e:
@@ -622,7 +747,30 @@ class LearnerWorker:
             except Exception:
                 pass
 
-    def _collect_noisy_stats(self, net, prefix: str) -> dict:
+    def _get_grad_norms(self, net) -> dict:
+        """Compute gradient statistics for a network."""
+        total_norm = 0.0
+        norms = []
+        for p in net.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.detach().norm(2).item()
+                norms.append(param_norm)
+                total_norm += param_norm**2
+        total_norm = total_norm**0.5
+
+        if norms:
+            return {
+                "grad_norm_mean": sum(norms) / len(norms),
+                "grad_norm_max": max(norms),
+                "grad_norm_min": min(norms),
+                "total_grad_norm": total_norm,
+            }
+        return {
+            "grad_norm_mean": 0.0,
+            "grad_norm_max": 0.0,
+            "grad_norm_min": 0.0,
+            "total_grad_norm": 0.0,
+        }
         """Return sigma/mu stats for all FactorisedNoisyLayer modules in *net*."""
         from assetto_corsa_rl.model.noisy import FactorisedNoisyLayer  # type: ignore
 
@@ -712,13 +860,48 @@ class LearnerWorker:
                 f"Buffer: {len(self.rb)}, Time: {elapsed:.1f}s, Eps: {epsilon:.3f}"
             )
             try:
+                # Compute episode statistics
+                last_1 = self.episode_returns[-1:] if self.episode_returns else [0.0]
+                last_10 = self.episode_returns[-10:]
+                last_100 = last
+
+                def safe_std(vals):
+                    if len(vals) < 2:
+                        return 0.0
+                    return (sum((x - sum(vals) / len(vals)) ** 2 for x in vals) / len(vals)) ** 0.5
+
                 stats_dict = {
                     "steps": self.total_steps,
-                    "reward/rewards_per_environment_mean": avg_return,
-                    "buffer": len(self.rb),
-                    "time": elapsed,
-                    "epsilon": epsilon,
+                    # ── Episode return statistics ──────────────────────
+                    "episode/return_latest": last_1[0] if last_1 else 0.0,
+                    "episode/return_mean_10": sum(last_10) / len(last_10) if last_10 else 0.0,
+                    "episode/return_std_10": safe_std(last_10) if last_10 else 0.0,
+                    "episode/return_min_10": min(last_10) if last_10 else 0.0,
+                    "episode/return_max_10": max(last_10) if last_10 else 0.0,
+                    "episode/return_mean_100": avg_return,
+                    "episode/return_std_100": safe_std(last_100) if last_100 else 0.0,
+                    "episode/return_min_100": min(last_100) if last_100 else 0.0,
+                    "episode/return_max_100": max(last_100) if last_100 else 0.0,
+                    # ── Buffer statistics ──────────────────────────────
+                    "buffer/size": len(self.rb),
+                    "buffer/capacity": getattr(self.cfg, "replay_size", 1000000),
+                    "buffer/fill_ratio": len(self.rb) / getattr(self.cfg, "replay_size", 1000000),
+                    # ── Scheduling ─────────────────────────────────────
+                    "exploration/epsilon": epsilon,
+                    "time/elapsed_seconds": elapsed,
+                    "time/hours": elapsed / 3600.0,
+                    "throughput/steps_per_sec": self.total_steps / elapsed if elapsed > 0 else 0.0,
+                    "throughput/steps_per_hour": (
+                        self.total_steps / (elapsed / 3600.0) if elapsed > 0 else 0.0
+                    ),
+                    # ── Learning rate schedule (if available) ──────────
+                    "schedule/actor_lr": self.actor_opt.param_groups[0].get("lr", 0.0),
+                    "schedule/critic_lr": self.critic_opt.param_groups[0].get("lr", 0.0),
+                    "schedule/alpha_lr": (
+                        self.alpha_opt.param_groups[0].get("lr", 0.0) if self.alpha_opt else 0.0
+                    ),
                 }
+
                 if self.log_queue is not None:
                     try:
                         self.log_queue.put_nowait({"step": self.total_steps, "data": stats_dict})

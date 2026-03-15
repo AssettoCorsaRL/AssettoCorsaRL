@@ -29,7 +29,7 @@ class AssettoCorsa(gym.Env):
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
-        constant_reward_per_ms: float = -0.2,
+        constant_reward_per_ms: float = -0.5,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.05,
         include_image: bool = False,
@@ -581,8 +581,12 @@ class AssettoCorsa(gym.Env):
             + meters_progress
             * self.reward_per_m_advanced_along_centerline  # progress along racing line
             - off_track * 0.5  # penalty for being off track
-            - (damage / 100)
+            - (damage / 135)
         )
+
+        # if speed < 10.0:
+        #     reward -= 0.1 * (1.0 - speed / 10.0)
+
         self._last_speed = speed
         return reward
 
@@ -595,7 +599,7 @@ class AssettoCorsa(gym.Env):
 
         speed_mph = float(data.get("car", {}).get("speed_mph", 0.0))
         now = time.monotonic()
-        if speed_mph < 10.0:
+        if speed_mph < 2.5:
             if self._low_speed_start_time is None:
                 self._low_speed_start_time = now
             elif now - self._low_speed_start_time > 3.0:
@@ -605,8 +609,8 @@ class AssettoCorsa(gym.Env):
 
         if data["lap"]["get_lap_count"] == 2:
             truncated = True
-        if sum(data["car"]["damage"]) > 150:
-            terminated = True
+        # if sum(data["car"]["damage"]) > 150:
+        #     terminated = True
 
         if self._episode_step >= self.max_episode_steps:
             truncated = True

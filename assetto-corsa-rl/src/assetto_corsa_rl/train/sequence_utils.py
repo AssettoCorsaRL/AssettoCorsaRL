@@ -36,6 +36,9 @@ class EpisodeAccumulator:
         if len(self._buf) >= 4:
             real_len = len(self._buf)
             chunk = list(self._buf)
+            chunk_burn_in = self.burn_in if self._emitted_first else 0
+            # Keep at least one trainable timestep when possible
+            chunk_burn_in = min(chunk_burn_in, max(0, real_len - 1))
             while len(chunk) < self.seq_len:
                 pad = {k: torch.zeros_like(v) for k, v in chunk[-1].items()}
                 pad["done"] = torch.ones_like(pad["done"])
@@ -44,8 +47,10 @@ class EpisodeAccumulator:
                 pad["next_features"] = chunk[-1]["next_features"].clone()
                 pad["features"] = chunk[-1]["next_features"].clone()
                 chunk.append(pad)
-            out.append(self._pack(chunk[: self.seq_len], real_len=real_len, burn_in=0))
+            out.append(self._pack(chunk[: self.seq_len], real_len=real_len, burn_in=chunk_burn_in))
         self._buf.clear()
+        # New episode starts fresh: no overlap burn-in carry across episode boundary
+        self._emitted_first = False
         return out
 
     @staticmethod
@@ -88,6 +93,7 @@ class EpisodeAccumulator:
             "dones": torch.stack([t["done"] for t in transitions]),  # (T, 1)
             "terminated": torch.stack([t["terminated"] for t in transitions]),  # (T, 1)
             "mask": mask,  # (T, 1) - 1 for trainable, 0 for padding/burn-in
+            "real_len": torch.tensor(real_len, dtype=torch.int64),
         }
         if "vector" in transitions[0]:
             vecs = [t["vector"] for t in transitions]

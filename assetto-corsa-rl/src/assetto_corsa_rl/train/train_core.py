@@ -53,6 +53,17 @@ def _collate_sequence_batch(batch):
         else:
             return batch  # Unknown format, return as-is
 
+        first_key_set = set(keys)
+        for i, item in enumerate(batch[1:], start=1):
+            item_keys = set(item.keys()) if hasattr(item, "keys") else set()
+            if item_keys != first_key_set:
+                raise RuntimeError(
+                    "Replay batch contains mixed schemas and cannot be collated. "
+                    f"Sample[0] keys={sorted(first_key_set)}, sample[{i}] keys={sorted(item_keys)}. "
+                    "This usually happens when expert transition data (pixels/next_pixels) "
+                    "is mixed with sequence chunks (features/actions/...)."
+                )
+
         # Stack each key
         result_dict = {}
         for k in keys:
@@ -137,25 +148,13 @@ def _learner_process_fn(
     )
 
     if getattr(cfg, "use_expert_demonstrations", False):
-        expert_demo_path = getattr(cfg, "expert_demonstrations_path", None)
-        if expert_demo_path:
-            from assetto_corsa_rl.train.train_utils import load_expert_demonstrations
-            from assetto_corsa_rl.train.logging_utils import log_info, log_success, log_warning
+        from assetto_corsa_rl.train.logging_utils import log_warning
 
-            log_info("[LEARNER] Loading expert demonstrations into replay buffer...")
-            expert_count = load_expert_demonstrations(
-                rb,
-                demo_dir=expert_demo_path,
-                subsample=getattr(cfg, "expert_demo_subsample", None),
-                demo_epsilon=getattr(cfg, "expert_demo_epsilon", 1e-3),
-                log_fn=log_info,
-            )
-            if expert_count > 0:
-                log_success(
-                    f"[LEARNER] Loaded {expert_count} expert transitions into replay buffer"
-                )
-            else:
-                log_warning("[LEARNER] No expert demonstrations were loaded")
+        log_warning(
+            "[LEARNER] Skipping expert demonstrations: current replay buffer stores "
+            "sequence chunks (features/actions/...), while demo loader emits single-step "
+            "transitions (pixels/next_pixels)."
+        )
 
     log_alpha = torch.nn.Parameter(
         torch.tensor(log_alpha_value, dtype=torch.float32, device=device)
@@ -237,12 +236,30 @@ class Trainer:
         self.rb = rb
         self.cfg = cfg
         self.device = device
+        self.actor = actor
+        self.q1 = q1
+        self.q2 = q2
+        self.q1_target = q1_target
+        self.q2_target = q2_target
+        self.actor_opt = actor_opt
+        self.critic_opt = critic_opt
+        self.log_alpha = log_alpha
+        self.alpha_opt = alpha_opt
+        self.target_entropy = target_entropy
         self.storage = storage
         self.env_kwargs = env_kwargs or {}
         self.total_steps = 0
         self.start_time = time.time()
+        self._episode_returns = []
+        self._current_episode_return = torch.zeros(1, device=device)
 
         self._queue: queue.Queue = queue.Queue()
+
+        use_async = bool(getattr(cfg, "use_async", False))
+        if use_async:
+            self.collector = None
+            self.learner = None
+            return
 
         self.collector = CollectorWorker(
             cfg=cfg,
@@ -277,23 +294,36 @@ class Trainer:
 
     @property
     def episode_returns(self):
-        return self.learner.episode_returns
+        if self.learner is not None:
+            return self.learner.episode_returns
+        return self._episode_returns
 
     @episode_returns.setter
     def episode_returns(self, v):
-        self.learner.episode_returns = v
+        if self.learner is not None:
+            self.learner.episode_returns = v
+        else:
+            self._episode_returns = list(v)
 
     @property
     def current_episode_return(self):
-        return self.collector.current_episode_return
+        if self.collector is not None:
+            return self.collector.current_episode_return
+        return self._current_episode_return
 
     @current_episode_return.setter
     def current_episode_return(self, v):
-        self.collector.current_episode_return = v
+        if self.collector is not None:
+            self.collector.current_episode_return = v
+        else:
+            self._current_episode_return = v
 
     # ── synchronous single-process training loop ───────────────────────────
 
     def run(self, total_steps: int = 0):
+        if self.collector is None or self.learner is None:
+            raise RuntimeError("Synchronous run() requires non-async worker initialization")
+
         self.total_steps = total_steps
         self.collector.total_steps = total_steps
         self.learner.total_steps = total_steps
@@ -321,8 +351,14 @@ class Trainer:
         """Spawn collector and learner as separate processes using
         torch.multiprocessing for asynchronous, decoupled training."""
 
+        if self.actor is None or self.q1 is None or self.q2 is None:
+            raise RuntimeError("Async run requires actor/critic modules")
+
+        if self.log_alpha is None:
+            raise RuntimeError("Async run requires log_alpha parameter")
+
         actor_state = {
-            k: v.cpu().clone().share_memory_() for k, v in self.learner.actor.state_dict().items()
+            k: v.cpu().clone().share_memory_() for k, v in self.actor.state_dict().items()
         }
 
         weights_lock = mp.Lock()
@@ -334,12 +370,12 @@ class Trainer:
 
         stop_event = mp.Event()
 
-        actor_for_learner = copy.deepcopy(self.learner.actor).cpu()
-        actor_for_collector = copy.deepcopy(self.learner.actor).cpu()
-        q1_mp = copy.deepcopy(self.learner.q1).cpu()
-        q2_mp = copy.deepcopy(self.learner.q2).cpu()
-        q1_target_mp = copy.deepcopy(self.learner.q1_target).cpu()
-        q2_target_mp = copy.deepcopy(self.learner.q2_target).cpu()
+        actor_for_learner = copy.deepcopy(self.actor).cpu()
+        actor_for_collector = copy.deepcopy(self.actor).cpu()
+        q1_mp = copy.deepcopy(self.q1).cpu()
+        q2_mp = copy.deepcopy(self.q2).cpu()
+        q1_target_mp = copy.deepcopy(self.q1_target).cpu()
+        q2_target_mp = copy.deepcopy(self.q2_target).cpu()
 
         if hasattr(self.env, "close"):
             try:
@@ -384,8 +420,8 @@ class Trainer:
                 q2_target=q2_target_mp,
                 actor_lr=float(getattr(self.cfg, "actor_lr", getattr(self.cfg, "lr", 3e-4))),
                 critic_lr=float(getattr(self.cfg, "critic_lr", getattr(self.cfg, "lr", 3e-4))),
-                log_alpha_value=float(self.learner.log_alpha.data.cpu().item()),
-                target_entropy=self.learner.target_entropy,
+                log_alpha_value=float(self.log_alpha.data.cpu().item()),
+                target_entropy=self.target_entropy,
                 action_dim=int(self.env.action_spec.shape[-1]),
                 transitions_queue=transitions_queue,
                 device=self.device,
@@ -395,7 +431,7 @@ class Trainer:
                 log_queue=log_queue,
                 stop_event=stop_event,
                 total_steps=total_steps,
-                episode_returns=list(self.learner.episode_returns),
+                episode_returns=list(self.episode_returns),
                 start_time=self.start_time,
             ),
             daemon=True,
