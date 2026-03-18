@@ -237,7 +237,7 @@ def main(
     in_channels = 3 * frames
     if xb.ndim != 4 or xb.size(1) != in_channels:
         raise RuntimeError(f"Unexpected batch shape {xb.shape}, expected (B, {in_channels}, H, W)")
-    print(f"✓ Batch shape verified: {xb.shape}")
+    print(f"Batch shape verified: {xb.shape}")
 
     model = ConvVAE(
         z_dim=1024,
@@ -267,7 +267,7 @@ def main(
 
             if encoder_state:
                 model.load_state_dict(encoder_state, strict=False)
-                print(f"✓ Loaded {len(encoder_state)} encoder parameters")
+                print(f"Loaded {len(encoder_state)} encoder parameters")
             else:
                 print("Warning: No encoder parameters found in checkpoint")
         except Exception as e:
@@ -296,15 +296,15 @@ def main(
     if torch.cuda.is_available() and gpus != 0:
         accelerator = "cuda"
         devices = gpus if gpus > 0 else torch.cuda.device_count()
-        print(f"✓ Using CUDA with {devices} device(s)")
+        print(f"Using CUDA with {devices} device(s)")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         accelerator = "mps"
         devices = 1
-        print("✓ Using MPS")
+        print("Using MPS")
     else:
         accelerator = None
         devices = None
-        print("✓ Using CPU")
+        print("Using CPU")
 
     trainer = pl.Trainer(
         max_epochs=epochs,

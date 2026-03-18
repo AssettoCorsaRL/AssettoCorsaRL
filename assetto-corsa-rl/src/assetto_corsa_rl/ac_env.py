@@ -3,6 +3,7 @@ import numpy as np
 from gymnasium import spaces
 from typing import Optional, Dict, Any, Tuple
 import time
+import math
 import json
 from pathlib import Path
 import cv2
@@ -32,6 +33,9 @@ class AssettoCorsa(gym.Env):
         constant_reward_per_ms: float = -0.5,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.05,
+        low_speed_threshold_mph: float = 2.5,
+        low_speed_truncate_seconds: float = 5,
+        low_speed_resume_mph: float = 3.0,
         include_image: bool = False,
         use_ac_ai_racer: bool = True,
         observation_image_shape: Tuple[int, int] = (84, 84),
@@ -50,13 +54,16 @@ class AssettoCorsa(gym.Env):
         self.constant_reward_per_ms = constant_reward_per_ms
         self.reward_per_m_advanced_along_centerline = reward_per_m_advanced_along_centerline
         self.final_speed_reward_per_m_per_s = final_speed_reward_per_m_per_s
+        self.low_speed_threshold_mph = float(low_speed_threshold_mph)
+        self.low_speed_truncate_seconds = float(low_speed_truncate_seconds)
+        self.low_speed_resume_mph = float(low_speed_resume_mph)
 
         self.normalize_observations = normalize_observations
         self.normalization_bounds = normalization_bounds or {}
 
         self.racing_line = None
         self.racing_line_positions = None
-        self.racing_line_segment_lengths = None  # Precomputed arc lengths
+        self.racing_line_segment_lengths = None
         self._load_racing_line(racing_line_path)
 
         self.action_space = spaces.Box(
@@ -114,7 +121,9 @@ class AssettoCorsa(gym.Env):
         self._meters_advanced = 0.0
         self._last_speed = 0.0
         self._current_racing_line_index = 0
-        self._low_speed_start_time = None
+        self._low_speed_duration_s = 0.0
+        self._last_done_check_time = time.monotonic()
+        self._telemetry_missing_start_time = None
 
     def _compute_racing_line_context(self, data: Dict[str, Any]) -> Dict[str, float]:
         defaults = {
@@ -151,7 +160,7 @@ class AssettoCorsa(gym.Env):
             seg_xy = seg[:2]
             seg_norm = float(np.linalg.norm(seg_xy))
 
-            # Signed lateral offset to centerline (left/right of tangent) in meters.
+            #  lateral offset to centerline (left/right of tangent) in meters.
             if seg_norm > 1e-6:
                 rel_xy = position[:2] - p0[:2]
                 cross_z = seg_xy[0] * rel_xy[1] - seg_xy[1] * rel_xy[0]
@@ -159,7 +168,7 @@ class AssettoCorsa(gym.Env):
             else:
                 signed_lateral = 0.0
 
-            # Heading error from velocity vs tangent direction in XY.
+            # heading error from velocity vs tangent direction in XY.
             velocity = np.array(
                 data.get("car", {}).get("velocity", [0.0, 0.0, 0.0]), dtype=np.float32
             )
@@ -193,7 +202,7 @@ class AssettoCorsa(gym.Env):
                 if denom < 1e-6:
                     return 0.0
 
-                # Signed 2D triangle area * 2
+                # signed 2D triangle area * 2
                 area2 = float(ab[0] * (c - a)[1] - ab[1] * (c - a)[0])
                 # κ = 2 * area2 / (|ab|*|bc|*|ca|), signed in XY plane
                 return float((2.0 * area2) / denom)
@@ -264,7 +273,6 @@ class AssettoCorsa(gym.Env):
                 [self._extract_value_from_data(key, data) for key in self.observation_keys],
                 dtype=np.float32,
             )
-            # Apply normalization if enabled
             if self.normalize_observations:
                 vector = self._normalize_vector(vector)
 
@@ -280,8 +288,6 @@ class AssettoCorsa(gym.Env):
         stats = data["stats"]
         tyres = data["tyres"]
         rl_ctx = self._compute_racing_line_context(data)
-
-        # TODO: verify all these work
 
         match key:
             case "speed_kmh":
@@ -484,12 +490,11 @@ class AssettoCorsa(gym.Env):
         positions = np.array([[p["x"], p["y"], p["z"]] for p in lap["positions"]])
         self.racing_line_positions = positions
 
-        # Precompute segment lengths for efficient arc length calculation
         segments = positions[1:] - positions[:-1]
         segment_lengths = np.linalg.norm(segments, axis=1)
         self.racing_line_segment_lengths = segment_lengths
 
-        # avoid unicode characters in logs to prevent encoding issues on some consoles
+        # avoid unicode characters in logs
         total_length = float(np.sum(segment_lengths))
         print(
             f"Loaded racing line with {len(positions)} points (total length: {total_length:.1f}m)"
@@ -557,7 +562,6 @@ class AssettoCorsa(gym.Env):
         return total
 
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
-    #! UNTESTED WITH PRETRAINED AGENTS
     def _calculate_reward(self, obs, data):
         position = np.array(data["car"]["world_location"][:3])
         current_meters = self._calculate_meters_advanced(position)
@@ -591,21 +595,40 @@ class AssettoCorsa(gym.Env):
         return reward
 
     def _check_done(self, obs, data):
-        if data is None or data.get("car") is None:
-            return False, False
-
         terminated = False
         truncated = False
 
-        speed_mph = float(data.get("car", {}).get("speed_mph", 0.0))
         now = time.monotonic()
-        if speed_mph < 2.5:
-            if self._low_speed_start_time is None:
-                self._low_speed_start_time = now
-            elif now - self._low_speed_start_time > 3.0:
-                truncated = True
-        else:
-            self._low_speed_start_time = None
+        dt = max(0.0, now - self._last_done_check_time)
+        self._last_done_check_time = now
+
+        self._telemetry_missing_start_time = None
+
+        car = data.get("car", {})
+        try:
+            speed_mph = float(car.get("speed_mph", 0.0))
+        except Exception:
+            speed_mph = 0.0
+
+        if not math.isfinite(speed_mph) or speed_mph < 0.0:
+            velocity = car.get("velocity", [0.0, 0.0, 0.0])
+            try:
+                speed_mph = float(
+                    np.linalg.norm(velocity) * 2.2369362920544
+                )  # meters/h^2 -> miles/h^2
+            except Exception:
+                speed_mph = 0.0
+
+        if speed_mph < self.low_speed_threshold_mph:
+            self._low_speed_duration_s += dt
+        elif speed_mph > self.low_speed_resume_mph:
+            self._low_speed_duration_s = 0.0
+
+        if self._low_speed_duration_s >= self.low_speed_truncate_seconds:
+            truncated = True
+
+        if truncated:
+            self._low_speed_duration_s = 0.0
 
         if data["lap"]["get_lap_count"] == 2:
             truncated = True
@@ -629,7 +652,9 @@ class AssettoCorsa(gym.Env):
         self._current_racing_line_index = 0
         self._meters_advanced = 0.0
         self._last_speed = 0.0
-        self._low_speed_start_time = None
+        self._low_speed_duration_s = 0.0
+        self._last_done_check_time = time.monotonic()
+        self._telemetry_missing_start_time = None
 
         self.controller.reset()
         self.controller.update()
@@ -703,8 +728,6 @@ class AssettoCorsa(gym.Env):
         self.controller.right_trigger_float(value_float=throttle)
         self.controller.left_trigger_float(value_float=brake)
         self.controller.update()
-
-        time.sleep(0.02)
 
         obs = self._get_observation()
         data = self._last_obs
@@ -951,19 +974,19 @@ def main() -> None:
         "lap_delta": False,
         "current_sector": False,
         "invalid_lap": False,
-        # Track/Session info
+        # track/Session info
         "track_length": False,
         "air_temp": False,
         "road_temp": False,
         "session_status": False,
-        # Tyre info (per-tyre averages)
+        # tyre info (per-tyre averages)
         "tyre_wear_avg": True,
         "tyre_pressure_avg": True,
         "tyre_temp_avg": True,
         "tyre_dirty_avg": False,
         "tyre_slip_ratio_avg": True,
         "tyre_slip_angle_avg": True,
-        # Individual tyre temps (front-left, front-right, rear-left, rear-right)
+        # individual tyre temps (front-left, front-right, rear-left, rear-right)
         "tyre_0_temp_i": True,
         "tyre_0_temp_m": True,
         "tyre_0_temp_o": True,
@@ -976,7 +999,7 @@ def main() -> None:
         "tyre_3_temp_i": True,
         "tyre_3_temp_m": True,
         "tyre_3_temp_o": True,
-        # Racing-line localization / turn-shape preview
+        # racing-line localization / turn-shape preview
         "rl_distance_to_centerline": True,
         "rl_heading_error_rad": True,
         "rl_curve_lookahead_short": True,
@@ -1069,13 +1092,11 @@ def main() -> None:
 
             data = env._last_obs
 
-            # Extract raw values before normalization
             raw_values = np.array(
                 [env._extract_value_from_data(key, data) for key in env.observation_keys],
                 dtype=np.float32,
             )
 
-            # Get normalized observation (if enabled in env)
             obs = env._get_observation()
 
             # print("-" * 150)

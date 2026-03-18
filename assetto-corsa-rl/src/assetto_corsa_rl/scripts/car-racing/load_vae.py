@@ -87,7 +87,7 @@ def load_vae_model(checkpoint_path: str, z_dim: int, in_channels: int, device: t
 
     model = model.to(device)
     model.eval()
-    print(f"✓ Loaded VAE from {checkpoint_path}")
+    print(f"Loaded VAE from {checkpoint_path}")
     return model
 
 
@@ -195,7 +195,7 @@ def run_visualization(
             episode += 1
             controller.reset = False
 
-    print(f"\n✓ Session ended after {episode-1} episodes")
+    print(f"\nSession ended after {episode-1} episodes")
     env.close()
     plt.close()
 

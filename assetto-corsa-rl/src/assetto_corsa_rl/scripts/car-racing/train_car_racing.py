@@ -143,7 +143,7 @@ def train():
     # check if VAE encoders are trainable
     if vae_path:
         trainable_count = sum(1 for p in actor.parameters() if p.requires_grad)
-        print(f"✓ VAE encoders are trainable with target networks for stability")
+        print(f"VAE encoders are trainable with target networks for stability")
         print(f"  Actor has {trainable_count} trainable parameter groups")
 
     print("Networks:")

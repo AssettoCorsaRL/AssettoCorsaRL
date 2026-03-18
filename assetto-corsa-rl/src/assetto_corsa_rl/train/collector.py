@@ -1,8 +1,8 @@
 import torch
 import queue
+import types
 from tensordict import TensorDict
 
-from .sequence_utils import EpisodeAccumulator
 from .train_utils import (
     OrnsteinUhlenbeckNoise,
     expand_actions_for_envs,
@@ -12,6 +12,8 @@ from .train_utils import (
     sample_random_action,
 )
 from .logging_utils import log_info
+from .cpu_inference_utils import quantize_cnn_only, enable_cpu_optimizations
+from ..model.sac_inference import SACInferenceEngine
 
 
 class CollectorWorker:
@@ -42,19 +44,20 @@ class CollectorWorker:
         self._local_version = -1
         self.current_td = self.env.reset()
         self.current_episode_return = torch.zeros(cfg.num_envs, device=self.device)
+        self._queue_capacity = int(getattr(cfg, "queue_size", 0))
+        self._enqueue_full_count = 0
+        self._actor_infer_calls = 0
 
-        # Track whether we've logged the start of random exploration
         self._start_steps_logged = False
         self._end_start_steps_logged = False
         start_steps = int(getattr(self.cfg, "start_steps", 0))
         if start_steps > 0:
             log_info(f"[COLLECTOR] Beginning random exploration phase: {start_steps:,} steps")
 
-        # ── Ornstein-Uhlenbeck noise for coherent exploration ──────────
+        # ou noise (not just random jitter. waywaywayway better)
         action_dim = int(env.action_spec.shape[-1])
         ou_theta = getattr(cfg, "ou_theta", 0.15)
         ou_sigma = getattr(cfg, "ou_sigma", 0.3)
-        # Slight forward-driving bias: [steer=0, gas=0.4, brake=0]
         ou_mu_cfg = getattr(cfg, "ou_mu", None)
         if ou_mu_cfg is None:
             ou_mu_default = torch.zeros(action_dim, device=self.device)
@@ -73,14 +76,7 @@ class CollectorWorker:
         self._ou_noise_decay_steps = int(getattr(cfg, "ou_noise_decay_steps", 100_000))
         self._ou_noise_scale = float(getattr(cfg, "ou_noise_scale", 0.3))
 
-        # ── sequence accumulator ──────────────────────────────
-        seq_len = int(getattr(cfg, "seq_len", 16))
-        seq_overlap = int(getattr(cfg, "seq_overlap", 8))
-        burn_in = int(getattr(cfg, "burn_in", 4))
-        self.episode_accum = EpisodeAccumulator(
-            seq_len=seq_len, overlap=seq_overlap, burn_in=burn_in
-        )
-        self._seq_stride = seq_len - seq_overlap
+        self._cpu_inference_engine = None
 
         # grab the frozen CNN from the actor for feature pre-computation
         self.shared_cnn = None
@@ -90,9 +86,48 @@ class CollectorWorker:
                 break
         assert self.shared_cnn is not None, "Could not find CNN in actor"
 
-        # Rollout should use inference behavior for recurrent state carry.
-        # (Actor forward keeps context only when not in training mode.)
         self.actor.eval()
+
+        if str(self.device) == "cpu":
+            cpu_threads = int(getattr(cfg, "cpu_num_threads", 4))
+            quantize_cnn = bool(getattr(cfg, "quantize_cnn_only", True))
+
+            enable_cpu_optimizations(num_threads=cpu_threads)
+
+            if quantize_cnn:
+                quantize_cnn_only(self.actor, device=self.device, num_threads=cpu_threads)
+                log_info(f"[COLLECTOR] Applied INT8 quantization to CNN encoder (CPU inference)")
+
+            log_info(f"[COLLECTOR] CPU inference optimized: {cpu_threads} threads")
+
+            use_noisy = bool(getattr(self.cfg, "use_noisy", False))
+            if int(getattr(self.cfg, "num_envs", 1)) == 1 and not use_noisy:
+                try:
+                    backend = str(getattr(self.cfg, "cpu_inference_backend", "compile"))
+                    policy_like = types.SimpleNamespace(actor=self.actor)
+                    self._cpu_inference_engine = SACInferenceEngine(
+                        policy_like,
+                        backend=backend,
+                        quantize=bool(getattr(self.cfg, "quantize_actor", False)),
+                        channels_last=True,
+                        num_threads=cpu_threads,
+                        warmup=16,
+                        benchmark_n=32,
+                        deterministic=False,
+                        copy=False,
+                    )
+                    log_info(
+                        f"[COLLECTOR] SACInferenceEngine enabled for CPU actor inference (backend={backend})"
+                    )
+                except Exception as e:
+                    self._cpu_inference_engine = None
+                    log_info(
+                        f"[COLLECTOR] SACInferenceEngine init failed, falling back to actor forward: {e}"
+                    )
+            elif use_noisy:
+                log_info("[COLLECTOR] SACInferenceEngine disabled when use_noisy=true")
+            else:
+                log_info("[COLLECTOR] SACInferenceEngine disabled when num_envs>1")
 
         self._reset_actor_context()
 
@@ -101,24 +136,42 @@ class CollectorWorker:
             if hasattr(m, "reset_context"):
                 m.reset_context()
 
-    # ── async entry-point (multi-process) ─────────────────────────────────
+    #! Async entry point
 
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage)."""
         sync_every = int(getattr(self.cfg, "sync_every", 100))
+
         while self.stop_event is None or not self.stop_event.is_set():
             self._step_and_store()
+
             if self.weights_version is not None and self.total_steps % sync_every == 0:
                 self._sync_weights()
-            # Periodically broadcast epsilon so the learner can log it.
+            # broadcast epsilon so the learner can log it.
             if self.total_steps % sync_every == 0:
                 eps = self._exploration_epsilon()
+                queue_size = None
                 try:
-                    self.transitions_queue.put_nowait({"_meta": True, "epsilon": eps})
+                    queue_size = int(self.transitions_queue.qsize())
+                except Exception:
+                    queue_size = None
+
+                try:
+                    self.transitions_queue.put_nowait(
+                        {
+                            "_meta": True,
+                            "epsilon": eps,
+                            "queue_size": queue_size,
+                            "queue_capacity": self._queue_capacity,
+                            "collector/enqueue_full_count": self._enqueue_full_count,
+                            "collector/actor_infer_calls": self._actor_infer_calls,
+                        }
+                    )
                 except Exception:
                     pass
 
-    # ── helpers ───────────────────────────────────────────────────────────
+                self._enqueue_full_count = 0
+                self._actor_infer_calls = 0
 
     def _exploration_epsilon(self):
         """Linearly anneal epsilon from explore_start → explore_end over explore_steps.
@@ -139,11 +192,11 @@ class CollectorWorker:
         frac = min(1.0, float(self.total_steps) / float(steps))
         return float(start + (end - start) * frac)
 
-    # ── core step ─────────────────────────────────────────────────────────
-
     def _step_and_store(self):
         """Take one step per env, accumulate into sequences, push complete sequences."""
         target_batch = self.current_td.batch_size
+        start_steps = int(getattr(self.cfg, "start_steps", 0))
+        in_random_phase = self.total_steps < start_steps
 
         with torch.no_grad():
             inner_obs = get_inner(self.current_td)
@@ -160,40 +213,59 @@ class CollectorWorker:
             actor_input = TensorDict(actor_input_data, batch_size=[pixels_only.shape[0]])
             use_noisy = getattr(self.cfg, "use_noisy", False)
 
-            if use_noisy:
-                for m in self.actor.modules():
-                    if hasattr(m, "sample_noise"):
-                        m.sample_noise()
-
-            actor_output = self.actor(actor_input)
-            has_action = (
-                "action" in actor_output.keys()
-                and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
-            )
-            actor_action = actor_output["action"] if has_action else None
-
-            if use_noisy:
-                eps = 0.0
-                if actor_action is None:
+            actor_action = None
+            if not in_random_phase:
+                if use_noisy:
                     for m in self.actor.modules():
                         if hasattr(m, "sample_noise"):
                             m.sample_noise()
+
+                if self._cpu_inference_engine is not None:
+                    try:
+                        vector_for_engine = None
+                        if vector_obs is not None:
+                            vector_for_engine = (
+                                vector_obs[0] if vector_obs.dim() > 1 else vector_obs
+                            )
+                        action_1 = self._cpu_inference_engine.get_action(
+                            pixels_only[0],
+                            vector=vector_for_engine,
+                        )
+                        self._actor_infer_calls += 1
+                        actor_action = action_1.unsqueeze(0)
+                    except Exception:
+                        actor_action = None
+
+                if actor_action is None:
                     actor_output = self.actor(actor_input)
+                    self._actor_infer_calls += 1
                     has_action = (
                         "action" in actor_output.keys()
                         and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
                     )
                     actor_action = actor_output["action"] if has_action else None
+
+                if use_noisy and actor_action is None:
+                    for m in self.actor.modules():
+                        if hasattr(m, "sample_noise"):
+                            m.sample_noise()
+                    actor_output = self.actor(actor_input)
+                    self._actor_infer_calls += 1
+                    has_action = (
+                        "action" in actor_output.keys()
+                        and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
+                    )
+                    actor_action = actor_output["action"] if has_action else None
+
+            if use_noisy:
+                eps = 0.0
             else:
                 eps = self._exploration_epsilon()
-
-            start_steps = int(getattr(self.cfg, "start_steps", 0))
-            in_random_phase = self.total_steps < start_steps
 
             if in_random_phase:
                 # OU noise for coherent random exploration (car actually drives)
                 ou_sample = self.ou_noise.sample()
-                # Clip to action bounds: steer [-1,1], gas [0,1], brake [0,1]
+                # steer [-1,1], gas [0,1], brake [0,1]
                 actions = ou_sample.clone()
                 actions[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
                 if actions.shape[-1] >= 2:
@@ -214,7 +286,6 @@ class CollectorWorker:
                     else sample_random_action(self.cfg.num_envs, dev=self.device)
                 )
 
-            # Additive OU noise on policy actions (decaying) after random phase
             if not in_random_phase and actor_action is not None:
                 decay_frac = min(
                     1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
@@ -249,7 +320,6 @@ class CollectorWorker:
         cur_vector = inner_obs.get("vector", None)
         next_vector = td_next.get("vector", None)
 
-        # Precompute CNN features (encoder is shared, frozen during collection)
         with torch.no_grad():
             feat = self.shared_cnn(pixels.to(self.device))
             next_feat = self.shared_cnn(next_pixels.to(self.device))
@@ -270,10 +340,7 @@ class CollectorWorker:
                 nv = next_vector[i] if next_vector.dim() > 1 else next_vector
                 transition["next_vector"] = nv.cpu().float()
 
-            self.episode_accum.add(transition)
-
-            for seq in self.episode_accum.maybe_emit():
-                self._enqueue(seq)
+            self._enqueue(transition)
 
         self._handle_episode_end(rewards, dones)
         self._maybe_reset(td_next, dones)
@@ -287,10 +354,6 @@ class CollectorWorker:
         done_indices = dones.nonzero(as_tuple=False).squeeze(-1)
         if done_indices.numel() > 0:
             self.ou_noise.reset(env_indices=done_indices)
-
-            # flush remaining transitions as padded sequence
-            for seq in self.episode_accum.flush():
-                self._enqueue(seq)
 
         for i, d in enumerate(dones):
             if d.item():
@@ -307,6 +370,8 @@ class CollectorWorker:
             self.current_td = td_next["next"]
         if dones.any():
             self._reset_actor_context()
+            if self._cpu_inference_engine is not None:
+                self._cpu_inference_engine.reset()
             try:
                 reset_td = self.env.reset()
                 self.current_td = (
@@ -328,14 +393,13 @@ class CollectorWorker:
                 self.transitions_queue.put(item, timeout=0.05)
                 break
             except queue.Full:
+                self._enqueue_full_count += 1
                 if self.stop_event is not None and self.stop_event.is_set():
                     break
-
-    # ── weight sync (multi-process) ───────────────────────────────────────
 
     def _sync_weights(self):
         if self.weights_version is None or self.weights_version.value == self._local_version:
             return
         with self.weights_lock:
-            self.actor.load_state_dict(self.shared_weights)
+            self.actor.load_state_dict(self.shared_weights, strict=False)
             self._local_version = self.weights_version.value

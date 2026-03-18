@@ -74,6 +74,12 @@ class LearnerWorker:
         self._updates_count = 0
         self._updates_per_step = int(getattr(cfg, "updates_per_step", 1))
         self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
+        self._saturate_gpu = bool(getattr(cfg, "saturate_gpu", True))
+        self._max_updates_per_tick = max(
+            1,
+            int(getattr(cfg, "max_updates_per_tick", self._updates_per_step * 64)),
+        )
+        self._max_pacing_lag_batches = int(getattr(cfg, "max_pacing_lag_batches", 1000))
         self._critic_updates_count = 0
         self._actor_updates_count = 0
         self._alpha_updates_count = 0
@@ -83,6 +89,13 @@ class LearnerWorker:
         self._freeze_encoder_steps = getattr(cfg, "freeze_encoder_steps", 0)
         self._encoder_frozen = False
         self._last_epsilon = 0.0  # updated from collector meta messages
+        self._update_credit_current = 0
+        self._last_drain_count = 0
+        self._last_train_batches = 0
+        self._queue_size = -1
+        self._queue_capacity = int(getattr(cfg, "queue_size", 0))
+        self._collector_enqueue_full_count = 0
+        self._collector_actor_infer_calls = 0
 
         _default_log_updates = int(getattr(cfg, "updates_per_step", 1)) * int(
             getattr(cfg, "log_interval", 1000)
@@ -93,13 +106,12 @@ class LearnerWorker:
             log_info("Applying torch.compile to actor / critic networks...")
             try:
                 _mode = str(getattr(cfg, "compile_mode", "reduce-overhead"))
-                actor_seq_net = self._get_actor_sequence_net()
-                if getattr(getattr(actor, "module", None), "module", None) is actor_seq_net:
-                    actor.module.module = torch.compile(actor_seq_net, mode=_mode)
-                elif getattr(actor, "module", None) is actor_seq_net:
-                    actor.module = torch.compile(actor_seq_net, mode=_mode)
-                else:
-                    torch.compile(actor_seq_net, mode=_mode)
+                actor_net = self._resolve_actor_net()
+                compiled_actor = torch.compile(actor_net, mode=_mode)
+                if not self._set_actor_net(compiled_actor):
+                    log_warning(
+                        "Could not replace wrapped actor net with compiled module; using eager actor"
+                    )
                 q1.module = torch.compile(q1.module, mode=_mode)
                 q2.module = torch.compile(q2.module, mode=_mode)
                 q1_target.module = torch.compile(q1_target.module, mode=_mode)
@@ -124,71 +136,120 @@ class LearnerWorker:
         self._last_expert_target_priority = 0.0
         self._last_expert_base_priority = 0.0
 
-    def _get_actor_sequence_net(self):
-        """Return underlying actor net that implements ``forward_sequence``."""
+    def _resolve_actor_net(self):
+        """Return the underlying ActorNet exposing ``forward_features``.
+
+        TorchRL wrappers can vary across versions, e.g.:
+        - actor.module.module (TensorDictModule)
+        - actor.module[0].module (ModuleList wrapper)
+        - actor.module (already the raw net)
+        """
+        queue = [self.actor, getattr(self.actor, "module", None)]
+        visited = set()
+
+        while queue:
+            node = queue.pop(0)
+            if node is None:
+                continue
+
+            node_id = id(node)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+
+            if hasattr(node, "forward_features"):
+                return node
+
+            inner = getattr(node, "module", None)
+            if inner is not None:
+                queue.append(inner)
+
+            if isinstance(node, torch.nn.ModuleList):
+                queue.extend(list(node))
+
+            if isinstance(node, (list, tuple)):
+                queue.extend(list(node))
+
+        raise AttributeError("Could not resolve underlying actor network from actor wrappers")
+
+    def _set_actor_net(self, new_actor_net) -> bool:
+        """Best-effort replacement of the wrapped ActorNet (used for torch.compile)."""
         actor_module = getattr(self.actor, "module", None)
-        if actor_module is not None and hasattr(actor_module, "forward_sequence"):
-            return actor_module
+        if actor_module is None:
+            return False
 
-        inner = getattr(actor_module, "module", None) if actor_module is not None else None
-        if inner is not None and hasattr(inner, "forward_sequence"):
-            return inner
+        if hasattr(actor_module, "module"):
+            actor_module.module = new_actor_net
+            return True
 
-        if isinstance(inner, torch.nn.ModuleList):
-            for sub in inner:
-                if hasattr(sub, "forward_sequence"):
-                    return sub
-                sub_inner = getattr(sub, "module", None)
-                if sub_inner is not None and hasattr(sub_inner, "forward_sequence"):
-                    return sub_inner
+        if isinstance(actor_module, torch.nn.ModuleList) and len(actor_module) > 0:
+            first = actor_module[0]
+            if hasattr(first, "module"):
+                first.module = new_actor_net
+                return True
+            if hasattr(first, "forward_features"):
+                actor_module[0] = new_actor_net
+                return True
 
-        if isinstance(actor_module, torch.nn.ModuleList):
-            for sub in actor_module:
-                if hasattr(sub, "forward_sequence"):
-                    return sub
+        if hasattr(actor_module, "forward_features"):
+            self.actor.module = new_actor_net
+            return True
 
-        for sub in self.actor.modules():
-            if hasattr(sub, "forward_sequence"):
-                return sub
-
-        raise RuntimeError("Unable to locate actor sequence net with forward_sequence().")
+        return False
 
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage).
 
-        Gradient updates are paced to the data collection rate:
-        for every new transition, we earn ``updates_per_step`` update credits.
-        The learner only trains when it has credits, keeping the effective UTD
-        ratio equal to ``updates_per_step`` regardless of GPU speed.
+        By default, run in saturate mode (``saturate_gpu=true``):
+        consume accumulated update-credit as fast as possible (up to
+        ``max_updates_per_tick`` per loop iteration).
+
+        If ``saturate_gpu=false``, pace updates to the data collection rate:
+        for every new transition, earn ``updates_per_step`` update credits and
+        only train while credit is available.
+
+        Note:
+        Even in saturate mode, updates are bounded by collected-transition
+        credit to prevent runaway learner updates that can starve queue
+        draining and backpressure the collector.
         """
         _weight_push_every = max(1, self._updates_per_step)
         _update_credit = 0
-        # Allow a small burst when lots of transitions arrive at once, but
-        # cap to keep the loop responsive to stop_event / logging.
-        _max_updates_per_tick = self._updates_per_step * 64
+        _max_updates_per_tick = self._max_updates_per_tick
 
         while self.stop_event is None or not self.stop_event.is_set():
             n = self._drain_transitions()
+            self._last_drain_count = n
             self.total_steps += n
             _update_credit += n * self._updates_per_step
+            if self._max_pacing_lag_batches > 0:
+                _update_credit = min(_update_credit, self._max_pacing_lag_batches)
+            self._update_credit_current = _update_credit if not self._saturate_gpu else 0
 
             trained_this_iter = False
+            self._last_train_batches = 0
             start_steps = int(getattr(self.cfg, "start_steps", 0))
-            if (
-                _update_credit > 0
-                and self.total_steps >= start_steps
-                and len(self.rb) >= self.cfg.batch_size
-            ):
+            has_enough_data = (
+                self.total_steps >= start_steps and len(self.rb) >= self.cfg.batch_size
+            )
+
+            k = 0
+            if has_enough_data and _update_credit > 0:
                 k = min(_update_credit, _max_updates_per_tick)
+
+            if k > 0:
                 for _ in range(k):
                     self._do_update()
                 _update_credit -= k
+                self._update_credit_current = _update_credit
+                self._last_train_batches = k
                 if self._updates_count % _weight_push_every == 0:
                     self._push_weights()
                 trained_this_iter = True
 
             if not trained_this_iter:
                 time.sleep(0.001)
+
             self._maybe_log_and_save(epsilon=self._last_epsilon)
 
     def _set_encoder_requires_grad(self, requires_grad: bool):
@@ -203,18 +264,18 @@ class LearnerWorker:
     # === transition ingestion =====================================================================
 
     def _drain_transitions(self, max_items: int = 8192) -> int:
-        """Pull sequence chunks from the queue into the replay buffer.
+        """Pull single-step transitions from the queue into the replay buffer.
 
         Each item is either:
         - A dict with "_meta" key (episode return, epsilon updates)
-        - A sequence dict from EpisodeAccumulator with keys:
-            features: (T+1, F)
-            actions:  (T, A)
-            rewards:  (T, 1)
-            dones:    (T, 1)
-            terminated: (T, 1)
-            mask:     (T, 1)
-            vector:   (T+1, O)  [optional]
+        - A single-step transition dict with keys:
+            features: (F)
+            next_features: (F)
+            action: (A)
+            reward: (1)
+            done: (1)
+            terminated: (1)
+            vector/next_vector: (O) [optional]
         """
         count = 0
         for _ in range(max_items):
@@ -231,30 +292,25 @@ class LearnerWorker:
                         del self.episode_returns[:1_000]
                 if "epsilon" in item:
                     self._last_epsilon = float(item["epsilon"])
+                if "queue_size" in item and item["queue_size"] is not None:
+                    self._queue_size = int(item["queue_size"])
+                if "queue_capacity" in item and item["queue_capacity"] is not None:
+                    self._queue_capacity = int(item["queue_capacity"])
+                if "collector/enqueue_full_count" in item:
+                    self._collector_enqueue_full_count = int(item["collector/enqueue_full_count"])
+                if "collector/actor_infer_calls" in item:
+                    self._collector_actor_infer_calls = int(item["collector/actor_infer_calls"])
                 continue
 
-            # Sequence chunk from EpisodeAccumulator
-            # Convert to TensorDict for the replay buffer
+            # Convert transition dict to TensorDict for replay buffer
             td_data = {}
             for k, v in item.items():
                 if isinstance(v, torch.Tensor):
                     td_data[k] = v.cpu()
 
-            # Keep each sequence as a single replay item.
-            # Time is a data dimension inside tensors (features=(T+1,F), actions=(T,A), ...),
-            # not the TensorDict batch dimension.
             td = TensorDict(td_data, batch_size=[])
             self.rb.add(td)
-            # Count collected env-steps (not masked train-steps) for schedule consistency.
-            real_len = item.get("real_len", None)
-            if real_len is not None:
-                if isinstance(real_len, torch.Tensor):
-                    count += int(real_len.item())
-                else:
-                    count += int(real_len)
-            else:
-                # Backward compatibility for old queue items
-                count += item["actions"].shape[0]
+            count += 1
 
         return count
 
@@ -363,11 +419,23 @@ class LearnerWorker:
             # Assume it's already a dict
             return batch
 
+    @staticmethod
+    def _as_batch_column(x: torch.Tensor, batch_size: int) -> torch.Tensor:
+        """Return tensor as shape [B, 1] by reducing non-batch dims with mean."""
+        if x is None:
+            return x
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        if x.ndim == 0:
+            return x.view(1, 1).expand(batch_size, 1)
+        if x.ndim == 1:
+            return x.view(batch_size, 1)
+        return x.reshape(batch_size, -1).mean(dim=1, keepdim=True)
+
     # === gradient update ===========================================================================
 
     def _do_update(self):
-        """Perform one gradient update using sequence chunks from the replay buffer."""
-
+        """Perform one gradient update using single-step transitions from replay."""
         if self._freeze_encoder_steps > 0:
             if self.total_steps < self._freeze_encoder_steps and not self._encoder_frozen:
                 self._set_encoder_requires_grad(False)
@@ -379,41 +447,31 @@ class LearnerWorker:
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
         batch_indices = info.get("index", None)
 
-        # ── Unpack sequence batch ──────────────────────────────────────
-        # features: (B, T+1, F) - precomputed CNN features
-        # actions:  (B, T, A)
-        # rewards:  (B, T, 1)
-        # dones:    (B, T, 1)
-        # mask:     (B, T, 1) - 1 for real steps, 0 for padding
-        # vector:   (B, T+1, O) [optional]
-
         features = self._to_device_fast(batch["features"], dtype=torch.float32)
-        actions_b = self._to_device_fast(batch["actions"], dtype=torch.float32)
-        rewards_b = self._to_device_fast(batch["rewards"], dtype=torch.float32)
-        mask = self._to_device_fast(batch["mask"], dtype=torch.float32)
+        next_features = self._to_device_fast(batch["next_features"], dtype=torch.float32)
+        actions_b = self._to_device_fast(batch["action"], dtype=torch.float32)
+        rewards_b = self._to_device_fast(batch["reward"], dtype=torch.float32)
 
         if "terminated" in batch.keys():
-            terminal_mask = self._to_device_fast(batch["terminated"]).to(dtype=torch.float32)
+            done_mask = self._to_device_fast(batch["terminated"], dtype=torch.float32)
+        elif "done" in batch.keys():
+            done_mask = self._to_device_fast(batch["done"], dtype=torch.float32)
         else:
-            terminal_mask = self._to_device_fast(batch["dones"]).to(dtype=torch.float32)
+            done_mask = torch.zeros_like(rewards_b)
 
-        vector_b = (
+        obs_vector = (
             self._to_device_fast(batch["vector"], dtype=torch.float32)
             if "vector" in batch.keys()
             else None
         )
-
-        B, T_plus_1, feature_dim = features.shape
-        T = T_plus_1 - 1
-        A = actions_b.shape[-1]
-
-        # Split features into current (0..T-1) and next (1..T)
-        obs_features = features[:, :T, :]  # (B, T, F)
-        next_obs_features = features[:, 1:, :]  # (B, T, F)
-
-        # Split vector similarly if present
-        obs_vector = vector_b[:, :T, :] if vector_b is not None else None
-        next_obs_vector = vector_b[:, 1:, :] if vector_b is not None else None
+        next_obs_vector = (
+            self._to_device_fast(batch["next_vector"], dtype=torch.float32)
+            if "next_vector" in batch.keys()
+            else None
+        )
+        B = features.shape[0]
+        rewards_b = self._as_batch_column(rewards_b, B)
+        done_mask = self._as_batch_column(done_mask, B)
 
         alpha = self.log_alpha.exp() if self.log_alpha is not None else self.cfg.alpha
 
@@ -421,14 +479,9 @@ class LearnerWorker:
         # CRITIC UPDATE
         # ══════════════════════════════════════════════════════════════════
 
-        # ── Compute target Q values ────────────────────────────────────
         with torch.no_grad():
-            # 1) Get next actions from actor (need to run actor LSTM on obs sequence)
-            actor_net = self._get_actor_sequence_net()
-            actor_params, next_actor_state = actor_net.forward_sequence(
-                next_obs_features, vector=next_obs_vector
-            )
-            # Sample actions from the distribution
+            actor_net = self._resolve_actor_net()
+            actor_params = actor_net.forward_features(next_features, vector=next_obs_vector)
             from torchrl.modules import TanhNormal
 
             next_dist = TanhNormal(
@@ -437,72 +490,71 @@ class LearnerWorker:
                 low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
                 high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
             )
-            next_actions = next_dist.rsample()  # (B, T, A)
-            next_log_prob = next_dist.log_prob(next_actions)  # (B, T) or (B, T, A)
-            if next_log_prob.dim() == 3:
-                next_log_prob = next_log_prob.sum(dim=-1, keepdim=True)  # (B, T, 1)
-            elif next_log_prob.dim() == 2:
-                next_log_prob = next_log_prob.unsqueeze(-1)  # (B, T, 1)
+            next_actions = next_dist.rsample()
+            next_log_prob = next_dist.log_prob(next_actions)
+            if next_log_prob.dim() >= 2:
+                next_log_prob = next_log_prob.sum(dim=-1, keepdim=True)
+            next_log_prob = self._as_batch_column(next_log_prob, B)
 
-            # 2) Run target critic LSTMs on the NEXT observation sequence
-            #    Key insight: target critics process obs-only through LSTM,
-            #    then combine with actions in the Q-head
-            q1_target_net = self.q1_target.module
-            q2_target_net = self.q2_target.module
-
-            next_q1, _ = q1_target_net.forward_sequence(
-                next_obs_features, next_actions, vector=next_obs_vector
+            next_q1 = self.q1_target.module(
+                pixels=None,
+                action=next_actions,
+                vector=next_obs_vector,
+                img_features=next_features,
             )
-            next_q2, _ = q2_target_net.forward_sequence(
-                next_obs_features, next_actions, vector=next_obs_vector
+            next_q2 = self.q2_target.module(
+                pixels=None,
+                action=next_actions,
+                vector=next_obs_vector,
+                img_features=next_features,
             )
-            next_min_q = torch.min(next_q1, next_q2)  # (B, T, 1)
+            next_min_q = torch.min(next_q1, next_q2)
+            next_min_q = self._as_batch_column(next_min_q, B)
 
             next_v = next_min_q - alpha * next_log_prob
-            q_target = rewards_b + self.cfg.gamma * (1.0 - terminal_mask) * next_v
+            q_target = rewards_b + self.cfg.gamma * (1.0 - done_mask) * next_v
 
             min_q = float(getattr(self.cfg, "min_q_target", -1000.0))
             max_q = float(getattr(self.cfg, "max_q_target", 1000.0))
             q_target = torch.clamp(q_target, min=min_q, max=max_q)
 
-        # ── Compute predicted Q values ─────────────────────────────────
-        # Online critics share the same LSTM obs pass, diverge at Q-head
         q1_net = self.q1.module
         q2_net = self.q2.module
-
-        q1_pred, _ = q1_net.forward_sequence(obs_features, actions_b, vector=obs_vector)
-        q2_pred, _ = q2_net.forward_sequence(obs_features, actions_b, vector=obs_vector)
+        q1_pred = q1_net(pixels=None, action=actions_b, vector=obs_vector, img_features=features)
+        q2_pred = q2_net(pixels=None, action=actions_b, vector=obs_vector, img_features=features)
+        q1_pred = self._as_batch_column(q1_pred, B)
+        q2_pred = self._as_batch_column(q2_pred, B)
+        q_target = self._as_batch_column(q_target, B)
 
         # ── PER importance-sampling weights ────────────────────────────
         is_weights = info.get("_weight", info.get("weight", None))
         if is_weights is not None:
-            is_weights = self._to_device_fast(is_weights).view(B, 1, 1).clamp(min=1e-4)
+            is_weights = self._to_device_fast(is_weights).view(B, 1).clamp(min=1e-4)
         else:
-            is_weights = torch.ones(B, 1, 1, device=self.device)
+            is_weights = torch.ones(B, 1, device=self.device)
 
-        # ── Masked Huber loss ──────────────────────────────────────────
-        q1_elementwise = F.smooth_l1_loss(q1_pred, q_target, reduction="none")  # (B,T,1)
+        q1_elementwise = F.smooth_l1_loss(q1_pred, q_target, reduction="none")
         q2_elementwise = F.smooth_l1_loss(q2_pred, q_target, reduction="none")
-
-        # Apply sequence mask: don't backprop through padded timesteps
-        weighted_mask_sum = (mask * is_weights).sum().clamp(min=1e-6)
-        q1_masked = (q1_elementwise * mask * is_weights).sum() / weighted_mask_sum
-        q2_masked = (q2_elementwise * mask * is_weights).sum() / weighted_mask_sum
+        weighted_sum = is_weights.sum().clamp(min=1e-6)
+        q1_masked = (q1_elementwise * is_weights).sum() / weighted_sum
+        q2_masked = (q2_elementwise * is_weights).sum() / weighted_sum
         critic_loss = q1_masked + q2_masked
 
         # ── TD error for PER priorities ────────────────────────────────
         with torch.no_grad():
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
-            # Per-sequence priority: mean over valid timesteps
-            td_errors_seq = torch.max(td_error_1, td_error_2)  # (B, T, 1)
-            # Masked mean per sequence
-            td_errors_per_seq = (td_errors_seq * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-            td_errors = td_errors_per_seq.squeeze(-1)  # (B,)
+            td_errors = torch.max(td_error_1, td_error_2).reshape(B, -1)
+            td_errors_for_per = td_errors.max(dim=1).values
 
             if batch_indices is not None:
                 _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
-                new_priorities = torch.clamp(td_errors, min=1e-6, max=_max_priority).cpu().numpy()
+                new_priorities = (
+                    torch.clamp(td_errors_for_per, min=1e-6, max=_max_priority)
+                    .to(torch.float32)
+                    .cpu()
+                    .numpy()
+                )
                 self.rb.update_priority(batch_indices, new_priorities)
 
         # ── Explained variance ─────────────────────────────────────────
@@ -535,8 +587,8 @@ class LearnerWorker:
         self._maybe_refresh_expert_priorities()
 
         if self._updates_count % self._actor_update_delay == 0:
-            # Re-run actor LSTM to get fresh actions for the current obs sequence
-            actor_params, _ = actor_net.forward_sequence(obs_features, vector=obs_vector)
+            actor_net = self._resolve_actor_net()
+            actor_params = actor_net.forward_features(features, vector=obs_vector)
 
             from torchrl.modules import TanhNormal
 
@@ -546,28 +598,37 @@ class LearnerWorker:
                 low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
                 high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
             )
-            new_actions = dist.rsample()  # (B, T, A)
+            new_actions = dist.rsample()
             log_prob_new = dist.log_prob(new_actions)
-            if log_prob_new.dim() == 3:
+            if log_prob_new.dim() >= 2:
                 log_prob_new = log_prob_new.sum(dim=-1, keepdim=True)
-            elif log_prob_new.dim() == 2:
-                log_prob_new = log_prob_new.unsqueeze(-1)
+            log_prob_new = self._as_batch_column(log_prob_new, B)
 
-            # Q-values for new actions: reuse the same LSTM hidden states
-            # by running forward_sequence with new actions
-            # Note: we detach the critic LSTM to prevent actor gradients
-            # flowing through critic parameters
-            with torch.no_grad():
-                q1_h, _ = q1_net.forward_lstm(obs_features, vector=obs_vector)
-                q2_h, _ = q2_net.forward_lstm(obs_features, vector=obs_vector)
+            for p in list(q1_net.parameters()) + list(q2_net.parameters()):
+                p.requires_grad_(False)
 
-            q1_new = q1_net.forward_q(q1_h.detach(), new_actions)  # (B, T, 1)
-            q2_new = q2_net.forward_q(q2_h.detach(), new_actions)
+            q1_new = q1_net(
+                pixels=None,
+                action=new_actions,
+                vector=obs_vector,
+                img_features=features,
+            )
+            q2_new = q2_net(
+                pixels=None,
+                action=new_actions,
+                vector=obs_vector,
+                img_features=features,
+            )
+            q1_new = self._as_batch_column(q1_new, B)
+            q2_new = self._as_batch_column(q2_new, B)
+
+            for p in list(q1_net.parameters()) + list(q2_net.parameters()):
+                p.requires_grad_(True)
+
             min_q_new = torch.min(q1_new, q2_new)
 
-            # Masked actor loss
-            actor_loss_elementwise = alpha.detach() * log_prob_new - min_q_new  # (B, T, 1)
-            actor_loss = (actor_loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+            actor_loss_elementwise = alpha.detach() * log_prob_new - min_q_new
+            actor_loss = actor_loss_elementwise.mean()
 
             self.actor_opt.zero_grad()
             actor_loss.backward()
@@ -581,7 +642,7 @@ class LearnerWorker:
                 with torch.no_grad():
                     entropy_error = log_prob_new + self.target_entropy
                 alpha_loss_elementwise = -(self.log_alpha * entropy_error)
-                alpha_loss = (alpha_loss_elementwise * mask).sum() / mask.sum().clamp(min=1)
+                alpha_loss = alpha_loss_elementwise.mean()
 
                 self.alpha_opt.zero_grad()
                 alpha_loss.backward()
@@ -627,6 +688,10 @@ class LearnerWorker:
 
         try:
             current_entropy = -log_prob_new.mean().item() if log_prob_new is not None else 0.0
+            if new_actions is not None:
+                new_actions_log = new_actions.reshape(-1, new_actions.shape[-1])
+            else:
+                new_actions_log = None
 
             # Compute rich statistics for logging
             log_dict = {
@@ -672,22 +737,22 @@ class LearnerWorker:
                 "actor/log_alpha": self.log_alpha.item() if self.log_alpha is not None else 0.0,
                 # ── Action statistics (per action dim) ────────────────
                 "action/steer_mean": (
-                    new_actions[:, :, 0].mean().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 0].mean().item() if new_actions_log is not None else 0.0
                 ),
                 "action/steer_std": (
-                    new_actions[:, :, 0].std().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 0].std().item() if new_actions_log is not None else 0.0
                 ),
                 "action/gas_mean": (
-                    new_actions[:, :, 1].mean().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 1].mean().item() if new_actions_log is not None else 0.0
                 ),
                 "action/gas_std": (
-                    new_actions[:, :, 1].std().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 1].std().item() if new_actions_log is not None else 0.0
                 ),
                 "action/brake_mean": (
-                    new_actions[:, :, 2].mean().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 2].mean().item() if new_actions_log is not None else 0.0
                 ),
                 "action/brake_std": (
-                    new_actions[:, :, 2].std().item() if new_actions is not None else 0.0
+                    new_actions_log[:, 2].std().item() if new_actions_log is not None else 0.0
                 ),
                 # ── Policy parameters (mu, sigma) ────────────────────
                 "actor/loc_mean": (
@@ -716,8 +781,7 @@ class LearnerWorker:
                 "reward/batch_min": rewards_b.min().item(),
                 "reward/batch_max": rewards_b.max().item(),
                 # ── Sequence masking statistics ───────────────────────
-                "batch/valid_ratio": (mask.sum() / mask.numel()).item(),
-                "batch/total_steps": (mask.sum()).item(),
+                "batch/size": float(B),
                 # ── PER statistics ────────────────────────────────────
                 "per/td_error_mean": td_errors.mean().item(),
                 "per/beta": beta,
@@ -854,10 +918,9 @@ class LearnerWorker:
         avg_return = sum(last) / len(last) if last else 0.0
 
         if self.total_steps - self._last_log_steps >= self.cfg.log_interval:
-            elapsed = time.time() - self.start_time
             print(
                 f"Steps: {self.total_steps}, AvgReturn(100): {avg_return:.2f}, "
-                f"Buffer: {len(self.rb)}, Time: {elapsed:.1f}s, Eps: {epsilon:.3f}"
+                f"Buffer: {len(self.rb)}, Eps: {epsilon:.3f}"
             )
             try:
                 # Compute episode statistics
@@ -888,12 +951,19 @@ class LearnerWorker:
                     "buffer/fill_ratio": len(self.rb) / getattr(self.cfg, "replay_size", 1000000),
                     # ── Scheduling ─────────────────────────────────────
                     "exploration/epsilon": epsilon,
-                    "time/elapsed_seconds": elapsed,
-                    "time/hours": elapsed / 3600.0,
-                    "throughput/steps_per_sec": self.total_steps / elapsed if elapsed > 0 else 0.0,
-                    "throughput/steps_per_hour": (
-                        self.total_steps / (elapsed / 3600.0) if elapsed > 0 else 0.0
+                    # ── Async pacing / queue telemetry ────────────────
+                    "pacing/update_credit": float(self._update_credit_current),
+                    "pacing/drain_transitions_last_iter": float(self._last_drain_count),
+                    "pacing/train_batches_last_iter": float(self._last_train_batches),
+                    "queue/size": float(self._queue_size) if self._queue_size >= 0 else -1.0,
+                    "queue/capacity": float(self._queue_capacity),
+                    "queue/fill_ratio": (
+                        float(self._queue_size) / float(self._queue_capacity)
+                        if self._queue_size >= 0 and self._queue_capacity > 0
+                        else -1.0
                     ),
+                    "collector/enqueue_full_count": float(self._collector_enqueue_full_count),
+                    "collector/actor_infer_calls": float(self._collector_actor_infer_calls),
                     # ── Learning rate schedule (if available) ──────────
                     "schedule/actor_lr": self.actor_opt.param_groups[0].get("lr", 0.0),
                     "schedule/critic_lr": self.critic_opt.param_groups[0].get("lr", 0.0),
@@ -936,10 +1006,6 @@ class LearnerWorker:
                     "use_noisy": getattr(self.cfg, "use_noisy", False),
                     "num_cells": getattr(self.cfg, "num_cells", 256),
                     "vae_checkpoint_path": getattr(self.cfg, "vae_checkpoint_path", None),
-                    "use_lstm": getattr(self.cfg, "use_lstm", False),
-                    "lstm_hidden_size": getattr(self.cfg, "lstm_hidden_size", 256),
-                    "lstm_layers": getattr(self.cfg, "lstm_layers", 1),
-                    "stateful_inference": getattr(self.cfg, "stateful_inference", True),
                 },
             }
 

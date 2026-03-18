@@ -12,11 +12,11 @@ from .learner import LearnerWorker
 from .logging_utils import log_info, log_success, log_warning, log_error
 
 
-# ── Collation function for sequence batches ────────────────────────────────────
+# ── Collation function for transition batches ──────────────────────────────────
 
 
 def _collate_sequence_batch(batch):
-    """Collate a list of sequence TensorDicts into a single batched TensorDict.
+    """Collate a list of transition TensorDicts into a single batched TensorDict.
 
     When the replay buffer samples a batch of sequences (typically from ListStorage),
     each item is a dict/TensorDict with:
@@ -151,9 +151,8 @@ def _learner_process_fn(
         from assetto_corsa_rl.train.logging_utils import log_warning
 
         log_warning(
-            "[LEARNER] Skipping expert demonstrations: current replay buffer stores "
-            "sequence chunks (features/actions/...), while demo loader emits single-step "
-            "transitions (pixels/next_pixels)."
+            "[LEARNER] Skipping expert demonstrations: replay schema expects feature transitions, "
+            "while demo loader emits raw pixel transitions."
         )
 
     log_alpha = torch.nn.Parameter(
@@ -361,6 +360,18 @@ class Trainer:
             k: v.cpu().clone().share_memory_() for k, v in self.actor.state_dict().items()
         }
 
+        collector_device_cfg = getattr(self.cfg, "collector_device", None)
+        if collector_device_cfg is not None:
+            collector_device = torch.device(str(collector_device_cfg))
+        elif self.device.type == "cuda":
+            collector_device = torch.device("cpu")
+        else:
+            collector_device = self.device
+
+        collector_env_kwargs = dict(self.env_kwargs or {})
+        collector_env_kwargs["device"] = collector_device
+        log_info(f"Async devices: learner={self.device}, collector={collector_device}")
+
         weights_lock = mp.Lock()
         weights_version = mp.Value("i", 0)
 
@@ -387,11 +398,11 @@ class Trainer:
             target=_collector_process_fn,
             kwargs=dict(
                 cfg=self.cfg,
-                env_kwargs=self.env_kwargs,
+                env_kwargs=collector_env_kwargs,
                 actor=actor_for_collector,
                 transitions_queue=transitions_queue,
                 stop_event=stop_event,
-                device=self.device,
+                device=collector_device,
                 shared_weights=actor_state,
                 weights_lock=weights_lock,
                 weights_version=weights_version,

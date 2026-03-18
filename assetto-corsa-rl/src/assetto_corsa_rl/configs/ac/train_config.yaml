@@ -10,6 +10,7 @@ train:
 
   seed: 6741
   device: null # null = auto-select (GPU if available, else CPU) use gpu:id or cpu to force
+  collector_device: null # null = auto (cpu when learner uses cuda), or set explicit cpu/cuda:id
 
   wandb:
     enabled: true
@@ -27,3 +28,9 @@ train:
   # Number of trials this agent will run when calling `acrl ac sweep`.
   # Set WANDB_SWEEP_ID env-var to join an existing sweep instead of creating one.
   sweep_count: 20
+
+  # ── CPU inference optimization ──────────────────────────────────────────────
+  cpu_num_threads: 14 # threads for CPU inference
+  cpu_inference_backend: "eager" # compile | jit | eager (used by collector SACInferenceEngine on CPU)
+  quantize_actor: false # INT8 quantization for actor (faster but slightly less accurate)
+  quantize_cnn_only: false # Quantize only frozen CNN encoder (safe, recommended)

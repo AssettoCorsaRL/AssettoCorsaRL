@@ -2,11 +2,11 @@ model:
   num_cells: 256
   lr: 3e-4
   actor_lr: 1e-4
-  critic_lr: 3e-4
+  critic_lr: 1e-4
   max_grad_norm: 1.0
 
   # bc_pretrained_model: "D:/acrl/AssetoCorsaRL/models/sac_last.pt"
-  bc_pretrained_model: null
+  bc_pretrained_model: "D:/acrl/AssetoCorsaRL/models/sac_best.pt"
   vae_checkpoint_path: "D:/acrl/AssetoCorsaRL/models/loss=0.1050.ckpt" #* IMPORTANT: Path to pretrained encoder to load for VAE training
   # replay_buffer_path: "D:/acrl/AssetoCorsaRL/models/replay_buffer_1225061.pkl"
   replay_buffer_path: null
@@ -26,11 +26,13 @@ model:
   alpha_min: 1e-4
   alpha_max: 1.0
 
-  batch_size: 256
+  batch_size: 512
   replay_size: 1_000_000
 
-  updates_per_step: 1
+  updates_per_step: 2
   actor_update_delay: 2
+  saturate_gpu: true # consume update-credit aggressively (still bounded by collected transitions)
+  max_updates_per_tick: 512 # max gradient-update batches executed per learner loop iteration
 
   freeze_encoder_steps: 100_000_000 # "never" unfreeze it (uses less vram)
 
@@ -44,14 +46,6 @@ model:
   use_noisy: false
   noise_sigma: 0.45
 
-  #* recurrent context
-  use_lstm: false
-  lstm_hidden_size: 256
-  lstm_layers: 1
-  seq_len: 16 # training sequence length
-  burn_in: 4 # warm-up steps (no loss computed)
-  seq_overlap: 8 # overlap between consecutive chunks
-
   #* exploration - IGNORE IF use_noisy=true
   explore_start: 0
   explore_end: 0
@@ -64,12 +58,13 @@ model:
   ou_noise_scale: 0.35 # initial scale for additive noise after start_steps
   ou_noise_decay_steps: 200_000 # steps over which additive OU noise decays to zero
 
-  min_q_target: -500
-  max_q_target: 2000
+  #TODO: remove ts
+  min_q_target: -5000000 # don't clip, it doesn't do anything anyway
+  max_q_target: 200000000
 
   cumul_memories_used: 0
   cumul_memories_should_have_been_used: 0
-  max_pacing_lag_batches: 1000
+  max_pacing_lag_batches: 3000 # cap queued update credits (batches) to limit stale replay lag
 
   compile_models: false
   compile_mode: "reduce-overhead" # default | reduce-overhead | max-autotune

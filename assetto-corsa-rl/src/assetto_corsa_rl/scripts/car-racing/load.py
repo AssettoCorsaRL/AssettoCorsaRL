@@ -363,7 +363,7 @@ def play(
                         out.write(frame_bgr)
 
                 out.release()
-                print(f"✓ Saved video to: {out_path} ({len(frames)} frames)")
+                print(f"Saved video to: {out_path} ({len(frames)} frames)")
             except Exception as e:
                 print(f"Warning: failed to save video: {e}")
 

@@ -275,7 +275,7 @@ def main(
         raise RuntimeError(
             f"Unexpected batch shape {xb.shape}, expected (B, {in_channels}, 64, 64)"
         )
-    print(f"✓ Batch shape verified: {xb.shape}")
+    print(f"Batch shape verified: {xb.shape}")
 
     model = ConvVAE(
         z_dim=args.z_dim,
@@ -311,15 +311,15 @@ def main(
             if args.gpus <= 0
             else min(args.gpus, torch.cuda.device_count())
         )
-        print(f"✓ Using CUDA with {devices} device(s)")
+        print(f"Using CUDA with {devices} device(s)")
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         accelerator = "mps"
         devices = 1
-        print("✓ Using MPS")
+        print("Using MPS")
     else:
         accelerator = None
         devices = None
-        print("✓ Using CPU")
+        print("Using CPU")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,

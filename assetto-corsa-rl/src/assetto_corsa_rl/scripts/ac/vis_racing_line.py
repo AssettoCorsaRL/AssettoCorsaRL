@@ -337,7 +337,7 @@ def main(input, lap, no_animate):
     print(f"📂 Loading racing line from: {input_path}")
     racing_data = load_racing_data(str(input_path))
 
-    print(f"✓ Loaded {racing_data['num_laps']} lap(s)")
+    print(f"Loaded {racing_data['num_laps']} lap(s)")
 
     try:
         visualizer = RacingLineVisualizer(racing_data, lap_index=lap)

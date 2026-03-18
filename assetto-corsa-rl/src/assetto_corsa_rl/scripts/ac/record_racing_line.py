@@ -101,7 +101,7 @@ class RacingLineRecorder:
 
         self.completed_laps.append(lap_data)
 
-        print(f"\n✓ Lap {self.last_lap_count} saved:")
+        print(f"\nLap {self.last_lap_count} saved:")
         print(f"   Points recorded: {len(self.current_lap_positions)}")
         print(f"   Lap time: {lap_time:.2f}s")
 
@@ -143,7 +143,7 @@ class RacingLineRecorder:
 
             while True:
                 if max_laps and laps_recorded >= max_laps:
-                    print(f"\n✓ Reached max laps ({max_laps})")
+                    print(f"\nReached max laps ({max_laps})")
                     break
                 data = self.telemetry.get_latest()
 
@@ -160,7 +160,7 @@ class RacingLineRecorder:
                     self.recording = True
 
                     if max_laps and laps_recorded >= max_laps:
-                        print(f"\n✓ Completed recording {max_laps} laps")
+                        print(f"\nCompleted recording {max_laps} laps")
                         break
 
                 current_time = time.time()
@@ -191,7 +191,7 @@ class RacingLineRecorder:
                 print("\n⚠ No complete laps recorded")
 
             self.telemetry.close()
-            print("\n✓ Recorder closed")
+            print("\nRecorder closed")
 
 
 @cli_command(

@@ -152,7 +152,7 @@ def main(ckpt, env, frames, image_shape, device):
 
     vae.to(device)
     vae.eval()
-    print(f"✓ Loaded VAE from {ckpt}")
+    print(f"Loaded VAE from {ckpt}")
 
     if env == "gym":
         env = create_gym_env(height=img_h, width=img_w, device=device, num_envs=1)

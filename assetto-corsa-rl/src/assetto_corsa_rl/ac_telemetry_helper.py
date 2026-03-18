@@ -223,7 +223,7 @@ class Telemetry:
         self._image_running = True
         self._image_thread = threading.Thread(target=self._image_capture_loop, daemon=True)
         self._image_thread.start()
-        print("✓ Started image capture")
+        print("Started image capture")
 
     def stop_image_capture(self) -> None:
         """Stop image capture thread."""
@@ -252,7 +252,7 @@ class Telemetry:
             self._sct = None
         self._ac_window_handle = None
         self._sct = mss()
-        print("✓ MSS reconnected")
+        print("MSS reconnected")
 
     def get_latest_image(self) -> Optional[np.ndarray]:
         """Get latest captured image.

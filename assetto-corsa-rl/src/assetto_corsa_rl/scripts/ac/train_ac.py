@@ -113,10 +113,6 @@ def _do_train():
         use_noisy=cfg.use_noisy,
         noise_sigma=cfg.noise_sigma,
         vae_checkpoint_path=vae_path,
-        use_lstm=getattr(cfg, "use_lstm", False),
-        lstm_hidden_size=getattr(cfg, "lstm_hidden_size", 256),
-        lstm_layers=getattr(cfg, "lstm_layers", 1),
-        stateful_inference=getattr(cfg, "stateful_inference", True),
     )
     modules = agent.modules()
 
@@ -164,7 +160,6 @@ def _do_train():
         log_info(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
         checkpoint = torch.load(bc_pretrained_path, map_location=device)
 
-        # check if BC model was trained with different noisy setting
         bc_use_noisy = checkpoint.get("config", {}).get("use_noisy", False)
         current_use_noisy = cfg.use_noisy
 
@@ -182,7 +177,7 @@ def _do_train():
             try:
                 actor.load_state_dict(checkpoint["actor_state"], strict=strict)
                 print(
-                    f"✓ Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
+                    f"Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
                 )
             except Exception as e:
                 print(f"  Warning: Partial actor load: {e}")
@@ -255,7 +250,6 @@ def _do_train():
         try:
             import pickle
 
-            # Support both .pt (torch) and .pkl (pickle) formats
             if replay_buffer_path.endswith(".pt"):
                 rb_state = torch.load(replay_buffer_path, weights_only=False)
             else:
@@ -285,8 +279,6 @@ def _do_train():
     elif replay_buffer_path:
         log_warning(f"Replay buffer path specified but file not found: {replay_buffer_path}")
 
-    # ── Load expert demonstrations (if enabled) ────────────────────────
-    # In async mode, demos are loaded inside the learner subprocess only.
     use_async = bool(getattr(cfg, "use_async", False))
     if getattr(cfg, "use_expert_demonstrations", False) and not use_async:
         log_warning(
