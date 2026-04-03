@@ -2,6 +2,7 @@ import copy
 import queue
 import time
 import types
+import subprocess
 
 import torch.multiprocessing as mp
 import torch
@@ -10,6 +11,73 @@ from tensordict import TensorDict
 from .collector import CollectorWorker
 from .learner import LearnerWorker
 from .logging_utils import log_info, log_success, log_warning, log_error
+
+
+# ── Periodic AC reset utilities ────────────────────────────────────────────────
+
+
+def _is_ac_running() -> bool:
+    """Check if Assetto Corsa is currently running."""
+    try:
+        proc_list = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq acs.exe"], capture_output=True, text=True, timeout=5
+        )
+        return "acs.exe" in (proc_list.stdout or "").lower()
+    except Exception:
+        return False
+
+
+def maybe_reset_ac(
+    last_reset_step: int,
+    current_step: int,
+    reset_interval_steps: int,
+    ac_exe_path: str = r"D:\Steam\steamapps\common\assettocorsa\acs.exe",
+    startup_wait: float = 20.0,
+) -> int:
+    """Periodically kill and restart Assetto Corsa to prevent memory leaks/crashes.
+
+    Args:
+        last_reset_step: Step counter of the last reset (or 0 if never reset)
+        current_step: Current step counter
+        reset_interval_steps: Steps between resets (pass 0 to disable)
+        ac_exe_path: Path to acs.exe executable
+        startup_wait: Seconds to wait after relaunching AC
+
+    Returns:
+        Updated last_reset_step (current_step if reset occurred, otherwise last_reset_step)
+    """
+    if reset_interval_steps <= 0:
+        return last_reset_step  # Disabled
+
+    if current_step - last_reset_step < reset_interval_steps:
+        return last_reset_step  # Not time yet
+
+    log_warning(f"[AC Reset] Triggering periodic restart at step {current_step}")
+
+    try:
+        from .train_utils import kill_all_ac_instances, activate_ac_window
+    except ImportError:
+        log_warning("[AC Reset] Could not import AC control utilities")
+        return last_reset_step
+
+    # Kill all existing instances
+    log_info("[AC Reset] Killing all Assetto Corsa instances...")
+    kill_all_ac_instances(max_retries=3, retry_delay=1.0)
+
+    # Relaunch
+    log_info(f"[AC Reset] Relaunching from {ac_exe_path}")
+    try:
+        subprocess.Popen(
+            [ac_exe_path],
+            cwd=str(__import__("pathlib").Path(ac_exe_path).parent),
+        )
+        time.sleep(max(0.0, float(startup_wait)))
+        activate_ac_window()
+        log_success("[AC Reset] Assetto Corsa restarted successfully")
+    except Exception as e:
+        log_warning(f"[AC Reset] Error during restart: {e}")
+
+    return current_step
 
 
 # ── Collation function for transition batches ──────────────────────────────────
@@ -28,16 +96,18 @@ def _collate_sequence_batch(batch):
         mask: (T, 1)
         vector: (T+1, O) [optional]
 
+    Handles variable-length sequences by padding to max length.
+
     This function stacks them along batch dimension to produce:
-        features: (B, T+1, F)
-        actions: (B, T, A)
+        features: (B, T_max+1, F)
+        actions: (B, T_max, A)
         etc.
 
     Args:
         batch: Either a TensorDict (if already batched), list of TensorDicts, or list of dicts
 
     Returns:
-        TensorDict with batched tensors
+        TensorDict with batched tensors (padded if sequences had different lengths)
     """
     if isinstance(batch, TensorDict):
         # Already batched
@@ -64,11 +134,98 @@ def _collate_sequence_batch(batch):
                     "is mixed with sequence chunks (features/actions/...)."
                 )
 
+        # Check if sequences have variable lengths and determine max lengths
+        def get_seq_length(item, key):
+            """Get sequence length from first time dimension."""
+            val = item.get(key) if isinstance(item, dict) else item[key]
+            if isinstance(val, torch.Tensor) and val.ndim > 0:
+                return val.shape[0]
+            return None
+
+        # Detect features/actions keys to determine sequence structure
+        feature_keys = [
+            k
+            for k in keys
+            if k in ("features", "actions", "rewards", "dones", "terminated", "mask")
+        ]
+        vector_keys = [k for k in keys if k in ("vector",)]
+
+        # Get max sequence lengths for each key
+        max_lens = {}
+        has_variable_length = False
+        for key in feature_keys:
+            lens = [get_seq_length(b, key) for b in batch]
+            if any(l is not None for l in lens):
+                max_len = max(l for l in lens if l is not None)
+                max_lens[key] = max_len
+                if len(set(l for l in lens if l is not None)) > 1:
+                    has_variable_length = True
+
+        # Pad sequences if needed
+        if has_variable_length:
+            padded_batch = []
+            for item in batch:
+                padded_item = {}
+                for k in keys:
+                    val = item.get(k) if isinstance(item, dict) else item[k]
+                    if not isinstance(val, torch.Tensor):
+                        padded_item[k] = val
+                        continue
+
+                    # Determine if this tensor needs padding
+                    if k in max_lens:
+                        current_len = val.shape[0]
+                        target_len = max_lens[k]
+
+                        # Handle different sequence types
+                        if k == "vector":
+                            # vector is (T+1, D); pad along time dimension
+                            if current_len < target_len + 1:
+                                pad_amount = (target_len + 1) - current_len
+                                padding = (0, 0, 0, pad_amount)  # pad time dim
+                                padded_val = torch.nn.functional.pad(
+                                    val, padding, mode="constant", value=0.0
+                                )
+                                padded_item[k] = padded_val
+                            else:
+                                padded_item[k] = val
+                        elif k in ("features",):
+                            # features is (T+1, F); pad along time dimension
+                            if current_len < target_len + 1:
+                                pad_amount = (target_len + 1) - current_len
+                                padding = (0, 0, 0, pad_amount)  # pad time dim
+                                padded_val = torch.nn.functional.pad(
+                                    val, padding, mode="constant", value=0.0
+                                )
+                                padded_item[k] = padded_val
+                            else:
+                                padded_item[k] = val
+                        else:
+                            # actions, rewards, dones, terminated, mask are (T, ...)
+                            if current_len < target_len:
+                                pad_amount = target_len - current_len
+                                padding = (0, 0, 0, pad_amount)  # pad time dim
+                                padded_val = torch.nn.functional.pad(
+                                    val, padding, mode="constant", value=0.0
+                                )
+                                padded_item[k] = padded_val
+                            else:
+                                padded_item[k] = val
+                    else:
+                        padded_item[k] = val
+
+                padded_batch.append(padded_item)
+            batch = padded_batch
+
         # Stack each key
         result_dict = {}
         for k in keys:
             tensors = [b[k] for b in batch]
-            result_dict[k] = torch.stack(tensors, dim=0)
+            # Check if all tensors are torch.Tensor and have same shape
+            if all(isinstance(t, torch.Tensor) for t in tensors):
+                result_dict[k] = torch.stack(tensors, dim=0)
+            else:
+                result_dict[k] = tensors
 
         return TensorDict(result_dict, batch_size=[len(batch)])
 
@@ -252,6 +409,14 @@ class Trainer:
         self._episode_returns = []
         self._current_episode_return = torch.zeros(1, device=device)
 
+        # AC reset tracking
+        self._last_ac_reset_step = 0
+        self._ac_reset_interval_steps = int(getattr(cfg, "ac_reset_interval_steps", 0))
+        self._ac_exe_path = getattr(
+            cfg, "ac_exe_path", r"D:\Steam\steamapps\common\assettocorsa\acs.exe"
+        )
+        self._ac_startup_wait = float(getattr(cfg, "ac_startup_wait", 20.0))
+
         self._queue: queue.Queue = queue.Queue()
 
         use_async = bool(getattr(cfg, "use_async", False))
@@ -341,6 +506,16 @@ class Trainer:
                         self.learner._do_update()
 
             self.learner._maybe_log_and_save(epsilon=self.collector._exploration_epsilon())
+
+            # Periodic AC reset
+            if self._ac_reset_interval_steps > 0:
+                self._last_ac_reset_step = maybe_reset_ac(
+                    last_reset_step=self._last_ac_reset_step,
+                    current_step=self.total_steps,
+                    reset_interval_steps=self._ac_reset_interval_steps,
+                    ac_exe_path=self._ac_exe_path,
+                    startup_wait=self._ac_startup_wait,
+                )
 
         print("Training finished")
 

@@ -1,4 +1,6 @@
 import math
+import subprocess
+import time as _time
 
 import torch
 import torch.nn.functional as F
@@ -183,6 +185,54 @@ def add_transition(rb, i, pixels, next_pixels, action, reward, done, vector=None
         transition["next_vector"] = next_vector[i].to(torch.float32).cpu()
 
     rb.add(transition)
+
+
+def kill_all_ac_instances(max_retries: int = 3, retry_delay: float = 1.0) -> bool:
+    """Kill all running Assetto Corsa instances.
+
+    Uses taskkill to cleanly terminate all acs.exe processes.
+    Retries up to max_retries times with delays to ensure termination.
+
+    Args:
+        max_retries: Maximum number of kill attempts
+        retry_delay: Delay in seconds between retries
+
+    Returns:
+        True if all instances were successfully killed or none were running, False if some persisted
+    """
+    try:
+        for attempt in range(max_retries):
+            proc_list = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq acs.exe"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            if "acs.exe" not in (proc_list.stdout or "").lower():
+                if attempt > 0:
+                    print("[AC] All Assetto Corsa instances terminated successfully.")
+                return True
+
+            print(
+                f"[AC] Terminating all Assetto Corsa instances (attempt {attempt + 1}/{max_retries})..."
+            )
+            subprocess.run(["taskkill", "/IM", "acs.exe", "/F"], capture_output=True, timeout=5)
+
+            if attempt < max_retries - 1:
+                _time.sleep(retry_delay)
+
+        proc_list = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq acs.exe"], capture_output=True, text=True, timeout=5
+        )
+        if "acs.exe" in (proc_list.stdout or "").lower():
+            print("[AC] Warning: Could not fully terminate all Assetto Corsa instances.")
+            return False
+        return True
+
+    except Exception as e:
+        print(f"[AC] Error while killing AC instances: {e}")
+        return False
 
 
 def activate_ac_window(retries: int = 10, retry_delay: float = 2.0) -> bool:

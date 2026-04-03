@@ -25,7 +25,7 @@ class AssettoCorsa(gym.Env):
         host: str = "127.0.0.1",
         send_port: int = 9877,
         recv_port: int = 9876,
-        max_episode_steps: int = 1000,
+        max_episode_steps: int = 1_000,
         timeout: float = 1.0,
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,

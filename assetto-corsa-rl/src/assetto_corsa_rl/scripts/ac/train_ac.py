@@ -1,3 +1,16 @@
+import os
+import psutil
+
+p = psutil.Process(os.getpid())
+p.nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+
+try:
+    for proc in psutil.process_iter(["pid", "name"]):
+        if proc.info["name"] == "acs.exe":
+            psutil.Process(proc.info["pid"]).nice(psutil.HIGH_PRIORITY_CLASS)
+except Exception:
+    pass
+
 # NOTE: all arguments for this script are the .yamls
 
 import time
@@ -18,6 +31,7 @@ try:
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
+    from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances  # type: ignore
 except Exception:
     repo_root = Path(__file__).resolve().parents[2]
     src_path = str(repo_root / "src")
@@ -27,6 +41,7 @@ except Exception:
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
     from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
+    from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances  # type: ignore
 
 from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
 
@@ -87,14 +102,14 @@ def _do_train():
         ["tasklist", "/FI", "IMAGENAME eq acs.exe"], capture_output=True, text=True
     )
     if "acs.exe" not in _proc_list.stdout.lower():
+        log_info("Cleaning up any existing Assetto Corsa instances...")
+        kill_all_ac_instances()
         log_info("Launching Assetto Corsa...")
         subprocess.Popen(
             [r"D:\Steam\steamapps\common\assettocorsa\acs.exe"],
             cwd=r"D:\Steam\steamapps\common\assettocorsa",
         )
-        _time.sleep(10)
-        from assetto_corsa_rl.train.train_utils import activate_ac_window
-
+        _time.sleep(20)
         activate_ac_window()
         log_success("Assetto Corsa launched.")
     else:

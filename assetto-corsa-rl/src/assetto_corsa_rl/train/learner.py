@@ -3,6 +3,7 @@ import pickle
 import shutil
 import time
 from pathlib import Path
+from collections import deque
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ import wandb
 
 from .train_utils import fix_action_shape, unpack_pixels
 from .logging_utils import log_info, log_success, log_warning, log_error, log_metric
+from torchrl.modules import TanhNormal
 
 
 class LearnerWorker:
@@ -63,7 +65,7 @@ class LearnerWorker:
         self.stop_event = stop_event
 
         self.total_steps = 0
-        self.episode_returns: list[float] = []
+        self.episode_returns: deque = deque(maxlen=10_000)  # Auto-evicts old entries
         self.start_time = time.time()
 
         self._last_log_steps = 0
@@ -74,12 +76,14 @@ class LearnerWorker:
         self._updates_count = 0
         self._updates_per_step = int(getattr(cfg, "updates_per_step", 1))
         self._actor_update_delay = getattr(cfg, "actor_update_delay", 1)
-        self._saturate_gpu = bool(getattr(cfg, "saturate_gpu", True))
-        self._max_updates_per_tick = max(
-            1,
-            int(getattr(cfg, "max_updates_per_tick", self._updates_per_step * 64)),
+        _configured_max_updates = int(
+            getattr(cfg, "max_updates_per_tick", self._updates_per_step * 16)
         )
-        self._max_pacing_lag_batches = int(getattr(cfg, "max_pacing_lag_batches", 1000))
+        _responsive_cap = max(1, self._updates_per_step * 32)
+        self._max_updates_per_tick = max(1, min(_configured_max_updates, _responsive_cap))
+        self._max_update_credit = int(
+            getattr(cfg, "max_update_credit", self._max_updates_per_tick * 4)
+        )
         self._critic_updates_count = 0
         self._actor_updates_count = 0
         self._alpha_updates_count = 0
@@ -89,7 +93,6 @@ class LearnerWorker:
         self._freeze_encoder_steps = getattr(cfg, "freeze_encoder_steps", 0)
         self._encoder_frozen = False
         self._last_epsilon = 0.0  # updated from collector meta messages
-        self._update_credit_current = 0
         self._last_drain_count = 0
         self._last_train_batches = 0
         self._queue_size = -1
@@ -135,6 +138,9 @@ class LearnerWorker:
         self._last_expert_bonus = max(0.0, self._expert_priority_initial_bonus)
         self._last_expert_target_priority = 0.0
         self._last_expert_base_priority = 0.0
+        
+        # Pinned memory cache for fast CPU→GPU transfers
+        self._pinned_cache = PinnedMemoryCache()
 
     def _resolve_actor_net(self):
         """Return the underlying ActorNet exposing ``forward_features``.
@@ -200,54 +206,49 @@ class LearnerWorker:
     def run(self):
         """Run until ``stop_event`` is set (multi-process usage).
 
-        By default, run in saturate mode (``saturate_gpu=true``):
-        consume accumulated update-credit as fast as possible (up to
-        ``max_updates_per_tick`` per loop iteration).
-
-        If ``saturate_gpu=false``, pace updates to the data collection rate:
-        for every new transition, earn ``updates_per_step`` update credits and
-        only train while credit is available.
-
-        Note:
-        Even in saturate mode, updates are bounded by collected-transition
-        credit to prevent runaway learner updates that can starve queue
-        draining and backpressure the collector.
+        Simple credit-based training loop:
+        - After warmup, earn ``updates_per_step`` credits per collected transition
+        - Spend up to ``max_updates_per_tick`` credits per loop iteration
+        - Cap accumulated credit to avoid long learner stalls
         """
         _weight_push_every = max(1, self._updates_per_step)
         _update_credit = 0
-        _max_updates_per_tick = self._max_updates_per_tick
+        start_steps = int(getattr(self.cfg, "start_steps", 0))
 
         while self.stop_event is None or not self.stop_event.is_set():
-            n = self._drain_transitions()
+            # Pull newly collected transitions first.
+            n = self._drain_transitions(max_items=4096)
             self._last_drain_count = n
             self.total_steps += n
-            _update_credit += n * self._updates_per_step
-            if self._max_pacing_lag_batches > 0:
-                _update_credit = min(_update_credit, self._max_pacing_lag_batches)
-            self._update_credit_current = _update_credit if not self._saturate_gpu else 0
 
-            trained_this_iter = False
-            self._last_train_batches = 0
-            start_steps = int(getattr(self.cfg, "start_steps", 0))
+            # Do not build a huge training debt during random warmup.
+            if self.total_steps < start_steps:
+                _update_credit = 0
+
+            # Check if we have enough data and credit to train.
             has_enough_data = (
                 self.total_steps >= start_steps and len(self.rb) >= self.cfg.batch_size
             )
 
-            k = 0
-            if has_enough_data and _update_credit > 0:
-                k = min(_update_credit, _max_updates_per_tick)
+            if has_enough_data and n > 0:
+                _update_credit += n * self._updates_per_step
+                _update_credit = min(_update_credit, self._max_update_credit)
+
+            k = min(_update_credit, self._max_updates_per_tick)
+
+            if _update_credit >= self._updates_per_step:
+                k = self._updates_per_step  # steady 1 update per collected transition
+                _update_credit -= k
 
             if k > 0:
                 for _ in range(k):
                     self._do_update()
+
                 _update_credit -= k
-                self._update_credit_current = _update_credit
                 self._last_train_batches = k
                 if self._updates_count % _weight_push_every == 0:
                     self._push_weights()
-                trained_this_iter = True
-
-            if not trained_this_iter:
+            else:
                 time.sleep(0.001)
 
             self._maybe_log_and_save(epsilon=self._last_epsilon)
@@ -266,11 +267,13 @@ class LearnerWorker:
     def _drain_transitions(self, max_items: int = 8192) -> int:
         """Pull single-step transitions from the queue into the replay buffer.
 
+        Batches transitions before adding to avoid O(log n) sum-tree updates per item.
+
         Each item is either:
         - A dict with "_meta" key (episode return, epsilon updates)
         - A single-step transition dict with keys:
-            features: (F)
-            next_features: (F)
+            pixels: (C, H, W)
+            next_pixels: (C, H, W)
             action: (A)
             reward: (1)
             done: (1)
@@ -278,6 +281,8 @@ class LearnerWorker:
             vector/next_vector: (O) [optional]
         """
         count = 0
+        batch_transitions = []
+
         for _ in range(max_items):
             try:
                 item = self.transitions_queue.get_nowait()
@@ -286,10 +291,14 @@ class LearnerWorker:
 
             # Meta messages (episode returns, epsilon, etc.)
             if isinstance(item, dict) and item.get("_meta"):
+                # Flush accumulated batch before processing meta
+                if batch_transitions:
+                    self._add_transitions_batch(batch_transitions)
+                    count += len(batch_transitions)
+                    batch_transitions = []
+
                 if "episode_return" in item:
-                    self.episode_returns.append(float(item["episode_return"]))
-                    if len(self.episode_returns) > 10_000:
-                        del self.episode_returns[:1_000]
+                    self.episode_returns.append(float(item["episode_return"]))  # deque auto-evicts
                 if "epsilon" in item:
                     self._last_epsilon = float(item["epsilon"])
                 if "queue_size" in item and item["queue_size"] is not None:
@@ -302,17 +311,49 @@ class LearnerWorker:
                     self._collector_actor_infer_calls = int(item["collector/actor_infer_calls"])
                 continue
 
-            # Convert transition dict to TensorDict for replay buffer
-            td_data = {}
-            for k, v in item.items():
-                if isinstance(v, torch.Tensor):
-                    td_data[k] = v.cpu()
+            # Accumulate transition for batch add
+            batch_transitions.append(item)
 
-            td = TensorDict(td_data, batch_size=[])
-            self.rb.add(td)
-            count += 1
+        # Flush remaining batch
+        if batch_transitions:
+            self._add_transitions_batch(batch_transitions)
+            count += len(batch_transitions)
 
         return count
+
+    def _add_transitions_batch(self, transitions_list: list) -> None:
+        """Add a batch of transitions efficiently by stacking before inserting.
+
+        Reduces sum-tree update overhead by batching additions.
+        """
+        if not transitions_list:
+            return
+
+        # Stack all tensors from the batch
+        stacked_data = {}
+        for key in transitions_list[0].keys():
+            values = [t[key] for t in transitions_list if key in t]
+            if not values:
+                continue
+
+            # Stack the tensors
+            if isinstance(values[0], torch.Tensor):
+                stacked_data[key] = torch.stack(values, dim=0)
+            else:
+                # For non-tensors, convert to tensor first
+                stacked_data[key] = torch.tensor(
+                    [v if isinstance(v, (int, float, bool)) else v.item() for v in values]
+                )
+
+        # Create batched TensorDict and insert all rows as individual replay entries.
+        # Using ``add`` with a batched TensorDict can store each batch as one item in
+        # ListStorage, leading to variable leading dimensions at sample-time.
+        td = TensorDict(stacked_data, batch_size=[len(transitions_list)])
+        if hasattr(self.rb, "extend"):
+            self.rb.extend(td)
+        else:
+            for i in range(len(transitions_list)):
+                self.rb.add(td[i])
 
     # === weight broadcast (multi-process) ===================================================
 
@@ -379,18 +420,46 @@ class LearnerWorker:
         self._last_expert_target_priority = target_priority
 
     def _to_device_fast(self, x: torch.Tensor, dtype=None) -> torch.Tensor:
-        """Move tensor to learner device, using pinned-memory async copies when possible."""
+        """Move tensor to learner device, using pinned-memory cache for async copies."""
         if not isinstance(x, torch.Tensor):
             return x
         if dtype is not None:
             x = x.to(dtype=dtype)
         if x.device.type == "cpu":
             try:
-                x = x.pin_memory()
+                x = self._pinned_cache.get_pinned(x)
             except Exception:
                 pass
             return x.to(self.device, non_blocking=True)
         return x.to(self.device)
+
+    def _extract_cnn_and_compute_features(
+        self, pixels: torch.Tensor, actor_net=None
+    ) -> torch.Tensor:
+        """Extract CNN from actor and compute features from pixels.
+
+        Args:
+            pixels: Tensor of shape [B, C, H, W]
+            actor_net: Pre-resolved actor network (optional, for caching)
+
+        Returns:
+            Features tensor of shape [B, F]
+        """
+        if actor_net is None:
+            actor_net = self._resolve_actor_net()
+
+        cnn = None
+        for m in actor_net.modules():
+            if hasattr(m, "cnn"):
+                cnn = m.cnn
+                break
+
+        if cnn is None:
+            raise RuntimeError("Could not find CNN in actor network")
+
+        with torch.no_grad():
+            features = cnn(pixels)
+        return features
 
     def _unpack_batch(self, batch):
         """Convert sampled batch to a properly batched dict of tensors.
@@ -432,6 +501,29 @@ class LearnerWorker:
             return x.view(batch_size, 1)
         return x.reshape(batch_size, -1).mean(dim=1, keepdim=True)
 
+    def _sample_squashed(self, loc, scale):
+        """Numerically stable squashed-Gaussian sample + log_prob.
+
+        Avoids atanh entirely by keeping the pre-tanh sample z.
+        """
+        low = torch.tensor([-1.0, 0.0, 0.0], device=self.device)
+        high = torch.tensor([1.0, 1.0, 1.0], device=self.device)
+
+        normal = torch.distributions.Normal(loc, scale)
+        z = normal.rsample()  # pre-tanh
+        tanh_z = torch.tanh(z)  # in [-1, 1]
+
+        # map [-1,1] → [low, high]
+        actions = low + (tanh_z + 1.0) * 0.5 * (high - low)
+
+        log_prob = normal.log_prob(z)
+        log_prob -= torch.log(1.0 - tanh_z.pow(2) + 1e-6)  # tanh correction
+        log_prob -= torch.log((high - low) * 0.5 + 1e-8)  # affine scaling
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        log_prob = torch.clamp(log_prob, min=-100.0, max=10.0)  # safety clamp
+
+        return actions, log_prob
+
     # === gradient update ===========================================================================
 
     def _do_update(self):
@@ -444,11 +536,18 @@ class LearnerWorker:
                 self._set_encoder_requires_grad(True)
                 self._encoder_frozen = False
 
+        # Cache actor net resolution to avoid repeated traversals
+        actor_net = self._resolve_actor_net()
+
         batch, info = self.rb.sample(self.cfg.batch_size, return_info=True)
         batch_indices = info.get("index", None)
 
-        features = self._to_device_fast(batch["features"], dtype=torch.float32)
-        next_features = self._to_device_fast(batch["next_features"], dtype=torch.float32)
+        # Load raw pixels and compute features using CNN
+        pixels = self._to_device_fast(batch["pixels"], dtype=torch.float32)
+        next_pixels = self._to_device_fast(batch["next_pixels"], dtype=torch.float32)
+        features = self._extract_cnn_and_compute_features(pixels, actor_net)
+        next_features = self._extract_cnn_and_compute_features(next_pixels, actor_net)
+
         actions_b = self._to_device_fast(batch["action"], dtype=torch.float32)
         rewards_b = self._to_device_fast(batch["reward"], dtype=torch.float32)
 
@@ -480,20 +579,26 @@ class LearnerWorker:
         # ══════════════════════════════════════════════════════════════════
 
         with torch.no_grad():
-            actor_net = self._resolve_actor_net()
             actor_params = actor_net.forward_features(next_features, vector=next_obs_vector)
-            from torchrl.modules import TanhNormal
 
-            next_dist = TanhNormal(
-                loc=actor_params["loc"],
-                scale=actor_params["scale"],
-                low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
-                high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
+            # TODO: add back tanhnormal if doesn't wokr
+            # next_dist = TanhNormal(
+            #     loc=actor_params["loc"],
+            #     scale=actor_params["scale"],
+            #     low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
+            #     high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
+            # )
+            # next_actions = next_dist.rsample()
+            # next_log_prob = next_dist.log_prob(next_actions)
+
+            next_actions, next_log_prob = self._sample_squashed(
+                actor_params["loc"], actor_params["scale"]
             )
-            next_actions = next_dist.rsample()
-            next_log_prob = next_dist.log_prob(next_actions)
+            next_log_prob = self._as_batch_column(next_log_prob, B)
+
             if next_log_prob.dim() >= 2:
                 next_log_prob = next_log_prob.sum(dim=-1, keepdim=True)
+            next_log_prob = torch.clamp(next_log_prob, min=-100.0, max=10.0)  # ← ADD
             next_log_prob = self._as_batch_column(next_log_prob, B)
 
             next_q1 = self.q1_target.module(
@@ -545,16 +650,17 @@ class LearnerWorker:
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
             td_errors = torch.max(td_error_1, td_error_2).reshape(B, -1)
-            td_errors_for_per = td_errors.max(dim=1).values
+            td_errors_for_per = td_errors.max(dim=1).values.cpu()
 
             if batch_indices is not None:
                 _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
-                new_priorities = (
-                    torch.clamp(td_errors_for_per, min=1e-6, max=_max_priority)
-                    .to(torch.float32)
-                    .cpu()
-                    .numpy()
-                )
+                new_priorities = np.clip(
+                    td_errors_for_per.numpy(), 
+                    1e-6, 
+                    _max_priority
+                ).astype(np.float32)
+                del td_errors_for_per  # Explicit cleanup
+                del td_errors  # Also free parent tensor
                 self.rb.update_priority(batch_indices, new_priorities)
 
         # ── Explained variance ─────────────────────────────────────────
@@ -587,21 +693,25 @@ class LearnerWorker:
         self._maybe_refresh_expert_priorities()
 
         if self._updates_count % self._actor_update_delay == 0:
-            actor_net = self._resolve_actor_net()
             actor_params = actor_net.forward_features(features, vector=obs_vector)
 
-            from torchrl.modules import TanhNormal
+            # dist = TanhNormal(
+            #     loc=actor_params["loc"],
+            #     scale=actor_params["scale"],
+            #     low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
+            #     high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
+            # )
+            # new_actions = dist.rsample()
+            # log_prob_new = dist.log_prob(new_actions)
 
-            dist = TanhNormal(
-                loc=actor_params["loc"],
-                scale=actor_params["scale"],
-                low=torch.tensor([-1.0, 0.0, 0.0], device=self.device),
-                high=torch.tensor([1.0, 1.0, 1.0], device=self.device),
+            new_actions, log_prob_new = self._sample_squashed(
+                actor_params["loc"], actor_params["scale"]
             )
-            new_actions = dist.rsample()
-            log_prob_new = dist.log_prob(new_actions)
+            log_prob_new = self._as_batch_column(log_prob_new, B)
+
             if log_prob_new.dim() >= 2:
                 log_prob_new = log_prob_new.sum(dim=-1, keepdim=True)
+            log_prob_new = torch.clamp(log_prob_new, min=-100.0, max=10.0)  # ← ADD
             log_prob_new = self._as_batch_column(log_prob_new, B)
 
             for p in list(q1_net.parameters()) + list(q2_net.parameters()):
@@ -914,7 +1024,7 @@ class LearnerWorker:
     # === periodic logging & checkpointing ================================================â”€
 
     def _maybe_log_and_save(self, epsilon: float = 0.0):
-        last = self.episode_returns[-100:]
+        last = list(self.episode_returns)[-100:]  # deque slicing requires conversion
         avg_return = sum(last) / len(last) if last else 0.0
 
         if self.total_steps - self._last_log_steps >= self.cfg.log_interval:
@@ -952,7 +1062,6 @@ class LearnerWorker:
                     # ── Scheduling ─────────────────────────────────────
                     "exploration/epsilon": epsilon,
                     # ── Async pacing / queue telemetry ────────────────
-                    "pacing/update_credit": float(self._update_credit_current),
                     "pacing/drain_transitions_last_iter": float(self._last_drain_count),
                     "pacing/train_batches_last_iter": float(self._last_train_batches),
                     "queue/size": float(self._queue_size) if self._queue_size >= 0 else -1.0,

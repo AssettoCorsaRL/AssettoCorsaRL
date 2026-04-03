@@ -24,18 +24,20 @@ def _init_orthogonal(module, gain=1.0):
 
 
 class BoundedNormalParams(nn.Module):
-    def __init__(self, min_scale, max_scale):
+    def __init__(self, min_scale, max_scale, loc_bound=5.0):
         super().__init__()
         self.register_buffer("min_scale", min_scale)
         self.register_buffer("max_scale", max_scale)
-        self.register_buffer("scale_range", max_scale - min_scale)
-
         self.register_buffer("log_scale_min", torch.log(min_scale))
         self.register_buffer("log_scale_max", torch.log(max_scale))
+        self.loc_bound = loc_bound
 
     def forward(self, x):
         loc, log_scale = x.chunk(2, dim=-1)
-        # soft clamp - gradients flow everywhere
+
+        # smooth, differentiable, keeps gradients flowing
+        loc = self.loc_bound * torch.tanh(loc / self.loc_bound)
+
         log_scale = self.log_scale_max - F.softplus(self.log_scale_max - log_scale)
         log_scale = self.log_scale_min + F.softplus(log_scale - self.log_scale_min)
         scale = torch.exp(log_scale)

@@ -30,7 +30,10 @@ train:
   sweep_count: 20
 
   # ── CPU inference optimization ──────────────────────────────────────────────
-  cpu_num_threads: 14 # threads for CPU inference
+  cpu_num_threads: 4 # threads for CPU inference
   cpu_inference_backend: "eager" # compile | jit | eager (used by collector SACInferenceEngine on CPU)
   quantize_actor: false # INT8 quantization for actor (faster but slightly less accurate)
   quantize_cnn_only: false # Quantize only frozen CNN encoder (safe, recommended)
+
+  ac_reset_interval_steps: 50000
+  ac_startup_wait: 20.0

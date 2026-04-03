@@ -1,6 +1,8 @@
 import torch
 import queue
 import types
+import threading
+import time
 from tensordict import TensorDict
 
 from .train_utils import (
@@ -12,7 +14,7 @@ from .train_utils import (
     sample_random_action,
 )
 from .logging_utils import log_info
-from .cpu_inference_utils import quantize_cnn_only, enable_cpu_optimizations
+from .cpu_inference_utils import enable_cpu_optimizations
 from ..model.sac_inference import SACInferenceEngine
 
 
@@ -48,6 +50,13 @@ class CollectorWorker:
         self._enqueue_full_count = 0
         self._actor_infer_calls = 0
 
+        self._weight_sync_thread = None
+        self._stop_weight_sync = threading.Event()
+
+        if self.weights_version is not None:
+            self._weight_sync_thread = threading.Thread(target=self._weight_sync_loop, daemon=True)
+            self._weight_sync_thread.start()
+
         self._start_steps_logged = False
         self._end_start_steps_logged = False
         start_steps = int(getattr(self.cfg, "start_steps", 0))
@@ -78,25 +87,12 @@ class CollectorWorker:
 
         self._cpu_inference_engine = None
 
-        # grab the frozen CNN from the actor for feature pre-computation
-        self.shared_cnn = None
-        for m in self.actor.modules():
-            if hasattr(m, "cnn"):
-                self.shared_cnn = m.cnn
-                break
-        assert self.shared_cnn is not None, "Could not find CNN in actor"
-
         self.actor.eval()
 
         if str(self.device) == "cpu":
             cpu_threads = int(getattr(cfg, "cpu_num_threads", 4))
-            quantize_cnn = bool(getattr(cfg, "quantize_cnn_only", True))
 
             enable_cpu_optimizations(num_threads=cpu_threads)
-
-            if quantize_cnn:
-                quantize_cnn_only(self.actor, device=self.device, num_threads=cpu_threads)
-                log_info(f"[COLLECTOR] Applied INT8 quantization to CNN encoder (CPU inference)")
 
             log_info(f"[COLLECTOR] CPU inference optimized: {cpu_threads} threads")
 
@@ -128,6 +124,8 @@ class CollectorWorker:
                 log_info("[COLLECTOR] SACInferenceEngine disabled when use_noisy=true")
             else:
                 log_info("[COLLECTOR] SACInferenceEngine disabled when num_envs>1")
+        else:
+            self._cpu_inference_engine = None
 
         self._reset_actor_context()
 
@@ -135,6 +133,20 @@ class CollectorWorker:
         for m in self.actor.modules():
             if hasattr(m, "reset_context"):
                 m.reset_context()
+
+    def _weight_sync_loop(self):
+        while not self._stop_weight_sync.is_set():
+            if self.weights_version is not None:
+                current_version = self.weights_version.value
+                if current_version != self._local_version:
+                    self.actor.load_state_dict(self.shared_weights, strict=False)
+            time.sleep(0.001)  # 1000 Hz polling
+
+    def stop(self):
+        """Stop the weight synchronization thread."""
+        self._stop_weight_sync.set()
+        if self._weight_sync_thread is not None:
+            self._weight_sync_thread.join()
 
     #! Async entry point
 
@@ -144,9 +156,6 @@ class CollectorWorker:
 
         while self.stop_event is None or not self.stop_event.is_set():
             self._step_and_store()
-
-            if self.weights_version is not None and self.total_steps % sync_every == 0:
-                self._sync_weights()
             # broadcast epsilon so the learner can log it.
             if self.total_steps % sync_every == 0:
                 eps = self._exploration_epsilon()
@@ -317,17 +326,16 @@ class CollectorWorker:
         if next_pixels.ndim == 3:
             next_pixels = next_pixels.unsqueeze(0)
 
+        pixels = pixels.cpu().byte()  # float32 -> uint8
+        next_pixels = next_pixels.cpu().byte()
+
         cur_vector = inner_obs.get("vector", None)
         next_vector = td_next.get("vector", None)
 
-        with torch.no_grad():
-            feat = self.shared_cnn(pixels.to(self.device))
-            next_feat = self.shared_cnn(next_pixels.to(self.device))
-
         for i in range(self.cfg.num_envs):
             transition = {
-                "features": feat[i].cpu(),
-                "next_features": next_feat[i].cpu(),
+                "pixels": pixels[i].float(),
+                "next_pixels": next_pixels[i].float(),
                 "action": actions[i].cpu().float(),
                 "reward": rewards[i].unsqueeze(0).cpu(),
                 "done": dones[i].unsqueeze(0).cpu(),
@@ -388,14 +396,15 @@ class CollectorWorker:
                 self.current_episode_return = torch.zeros_like(self.current_episode_return)
 
     def _enqueue(self, item):
-        while True:
+        try:
+            self.transitions_queue.put_nowait(item)
+        except queue.Full:
+            self._enqueue_full_count += 1
             try:
-                self.transitions_queue.put(item, timeout=0.05)
-                break
-            except queue.Full:
-                self._enqueue_full_count += 1
-                if self.stop_event is not None and self.stop_event.is_set():
-                    break
+                self.transitions_queue.get_nowait()
+                self.transitions_queue.put_nowait(item)
+            except queue.Empty:
+                pass
 
     def _sync_weights(self):
         if self.weights_version is None or self.weights_version.value == self._local_version:

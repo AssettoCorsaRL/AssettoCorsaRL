@@ -25,7 +25,7 @@ if src_path not in sys.path:
 
 from assetto_corsa_rl.ac_env import create_transformed_env
 from assetto_corsa_rl.model.sac import SACPolicy
-from assetto_corsa_rl.train.train_utils import activate_ac_window
+from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances
 
 from assetto_corsa_rl.cli_registry import cli_command, cli_option, load_cfg_from_yaml
 
@@ -68,6 +68,10 @@ def _ensure_ac_running(auto_launch: bool, ac_exe_path: str | None, startup_wait:
         )
         return
 
+    # Kill any existing AC instances before launching
+    print("[AC] Cleaning up any existing Assetto Corsa instances...")
+    kill_all_ac_instances()
+
     print(f"Launching Assetto Corsa from: {exe_path}")
     subprocess.Popen([str(exe_path)], cwd=str(exe_path.parent))
     time.sleep(max(0.0, float(startup_wait)))
@@ -106,7 +110,7 @@ def _ensure_ac_running(auto_launch: bool, ac_exe_path: str | None, startup_wait:
 )
 @cli_option(
     "--startup-wait",
-    default=10.0,
+    default=20.0,
     type=float,
     help="Seconds to wait after launching Assetto Corsa",
 )
