@@ -13,8 +13,8 @@ try:
     from .ac_send_actions import XboxController
     from .ac_telemetry_helper import Telemetry
 except:
-    from ac_send_actions import XboxController
-    from ac_telemetry_helper import Telemetry
+    from ac_send_actions import XboxController #type:ignore
+    from ac_telemetry_helper import Telemetry # type:ignore
 
 
 class AssettoCorsa(gym.Env):

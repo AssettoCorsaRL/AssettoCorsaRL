@@ -31,7 +31,7 @@ from collections import deque
 try:
     from assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 except Exception:
-    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option
+    from ...src.assetto_corsa_rl.cli_registry import cli_command, cli_option  # type: ignore
 
 
 try:

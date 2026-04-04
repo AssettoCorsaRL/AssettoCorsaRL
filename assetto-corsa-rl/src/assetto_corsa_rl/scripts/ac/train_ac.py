@@ -43,7 +43,7 @@ except Exception:
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
     from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances  # type: ignore
 
-from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
+from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ReplayBuffer, LazyTensorStorage
 
 try:
     from assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml
@@ -229,8 +229,10 @@ def _do_train():
     actor_lr = getattr(cfg, "actor_lr", cfg.lr)
     critic_lr = getattr(cfg, "critic_lr", cfg.lr)
 
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=actor_lr)
-    critic_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=critic_lr)
+    actor_opt = torch.optim.Adam(actor.parameters(), lr=actor_lr, weight_decay=1e-5)
+    critic_opt = torch.optim.Adam(
+        list(q1.parameters()) + list(q2.parameters()), lr=critic_lr, weight_decay=1e-5
+    )
 
     log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
     alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
@@ -249,15 +251,27 @@ def _do_train():
             return TensorDict(result, batch_size=[len(batch)])
         return batch
 
-    log_info("Using PrioritizedReplayBuffer with ListStorage")
-    storage = ListStorage(max_size=cfg.replay_size)
-    rb = PrioritizedReplayBuffer(
-        alpha=cfg.per_alpha,
-        beta=cfg.per_beta,
-        storage=storage,
-        batch_size=cfg.batch_size,
-        collate_fn=_collate_sequence_batch,
-    )
+    log_info("Creating replay buffer...")
+    storage = LazyTensorStorage(max_size=cfg.replay_size)
+
+    use_per = bool(getattr(cfg, "use_per", True))
+
+    if use_per:
+        log_info("Using PrioritizedReplayBuffer with LazyTensorStorage")
+        rb = PrioritizedReplayBuffer(
+            alpha=cfg.per_alpha,
+            beta=cfg.per_beta,
+            storage=storage,
+            batch_size=cfg.batch_size,
+            collate_fn=_collate_sequence_batch,
+        )
+    else:
+        log_info("Using plain UniformReplayBuffer with LazyTensorStorage")
+        rb = ReplayBuffer(
+            storage=storage,
+            batch_size=cfg.batch_size,
+            collate_fn=_collate_sequence_batch,
+        )
 
     replay_buffer_path = getattr(cfg, "replay_buffer_path", None)
     if replay_buffer_path and Path(replay_buffer_path).exists():

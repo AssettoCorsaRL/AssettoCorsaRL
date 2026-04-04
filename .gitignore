@@ -33,3 +33,5 @@
 /assetto-corsa-rl/wandb
 /sac_best.pt
 /sac_best copy.pt
+/training_history.txt
+/test_infer.py

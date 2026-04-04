@@ -4,7 +4,7 @@ train:
   log_interval: 1000 # how often (in steps) to print/log training stats
   log_update_every: 400 # how often (in gradient updates) to log loss metrics (reduced from 2000 for frequent visibility)
   save_interval: 50_000 # how often (in steps) to save model checkpoints
-  save_interval_replaybuffer: 500_000 # how often (in steps) to save the replay buffer
+  save_interval_replaybuffer: null # how often (in steps) to save the replay buffer (null = disabled)
 
   min_free_space_gb: 30 # minimum free disk space to maintain (in GB)
 

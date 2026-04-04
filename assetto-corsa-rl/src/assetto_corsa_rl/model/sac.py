@@ -90,11 +90,22 @@ class ActorNet(nn.Module):
         _init_orthogonal(self.mlp[0], gain=lrelu_gain)
         _init_orthogonal(self.mlp[3], gain=lrelu_gain)
         _init_orthogonal(self.mlp[6], gain=0.01)
+
         action_dim = self.mlp[6].out_features // 2
-        with torch.no_grad():
-            log_min = self.mlp[7].log_scale_min
-            log_max = self.mlp[7].log_scale_max
-            self.mlp[6].bias[action_dim:] = (log_min + log_max) / 2
+        # with torch.no_grad():
+        #     # loc biases for [steer, gas, brake]
+        #     self.mlp[6].bias[:action_dim] = torch.tensor(
+        #         [0.0, 1.1, -0.85],
+        #         device=self.mlp[6].bias.device,
+        #         dtype=self.mlp[6].bias.dtype,
+        #     )
+
+        #     # smaller initial std so policy actually starts near those values
+        #     self.mlp[6].bias[action_dim:] = torch.tensor(
+        #         [-2.5, -2.5, -2.5],
+        #         device=self.mlp[6].bias.device,
+        #         dtype=self.mlp[6].bias.dtype,
+        #     )
 
     def reset_context(self):
         self._context_state = None

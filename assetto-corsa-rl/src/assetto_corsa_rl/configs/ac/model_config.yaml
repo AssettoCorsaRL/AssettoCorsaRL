@@ -20,7 +20,7 @@ model:
   expert_priority_refresh_updates: 1000 # refresh expert PER priority every N gradient updates (annealed to 0 bonus over training)
 
   gamma: 0.99
-  tau: 0.01
+  tau: 0.005
 
   alpha: 0.2
   alpha_lr: 3e-4
@@ -28,7 +28,7 @@ model:
   alpha_max: 1.0
 
   batch_size: 256
-  replay_size: 300_000
+  replay_size: 750_000
 
   updates_per_step: 1
   actor_update_delay: 2
@@ -38,6 +38,8 @@ model:
   freeze_encoder_steps: 100_000_000 # "never" unfreeze it (uses less vram)
 
   load_initial: true
+
+  use_per: false # use Priority Experience Replay (true) or uniform replay (false)
 
   per_alpha: 0.4 # less aggressive prioritization for stability
   per_beta: 0.4
@@ -53,11 +55,11 @@ model:
   explore_steps: 1
 
   #* Ornstein-Uhlenbeck exploration noise (temporally correlated)
-  ou_theta: 0.5 # mean-reversion speed (higher = less autocorrelation, faster reversion to mean)
+  ou_theta: 0.0 # mean-reversion speed (higher = less autocorrelation, faster reversion to mean)
   ou_sigma: [0.3, 0.3, 0.1]
-  ou_mu: [0, 0.15, 0] # drift towards throttle (steer centered at 0)
+  ou_mu: [0, 0.7, 0] # drift towards throttle (steer centered at 0)
   ou_noise_scale: 0.35 # initial scale for additive noise after start_steps
-  ou_noise_decay_steps: 0 # steps over which additive OU noise decays to zero
+  ou_noise_decay_steps: 250000 # steps over which additive OU noise decays to zero
 
   #TODO: remove ts
   min_q_target: -5000000 # don't clip, it doesn't do anything anyway

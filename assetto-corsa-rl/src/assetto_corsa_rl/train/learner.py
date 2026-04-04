@@ -16,6 +16,37 @@ from .logging_utils import log_info, log_success, log_warning, log_error, log_me
 from torchrl.modules import TanhNormal
 
 
+class PinnedMemoryCache:
+    """Reuse pinned memory buffers to avoid unbounded allocation.
+
+    PyTorch's tensor.pin_memory() allocates a new buffer each call.
+    This cache pools buffers by shape/dtype to prevent memory leaks.
+    """
+
+    def __init__(self, max_buffers=32):
+        self.cache = {}
+        self.max_buffers = max_buffers
+        self._access_order = []  # Track insertion order for FIFO eviction
+
+    def get_pinned(self, tensor):
+        """Get or create a pinned buffer matching tensor shape/dtype."""
+        key = (tuple(tensor.shape), tensor.dtype)
+
+        if key not in self.cache:
+            # Evict oldest if cache is full
+            if len(self.cache) >= self.max_buffers:
+                oldest_key = self._access_order.pop(0)
+                self.cache.pop(oldest_key, None)
+
+            # Create new pinned buffer
+            self.cache[key] = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+            self._access_order.append(key)
+
+        # Copy data into pinned buffer
+        self.cache[key].copy_(tensor)
+        return self.cache[key]
+
+
 class LearnerWorker:
     def __init__(
         self,
@@ -138,7 +169,7 @@ class LearnerWorker:
         self._last_expert_bonus = max(0.0, self._expert_priority_initial_bonus)
         self._last_expert_target_priority = 0.0
         self._last_expert_base_priority = 0.0
-        
+
         # Pinned memory cache for fast CPU→GPU transfers
         self._pinned_cache = PinnedMemoryCache()
 
@@ -391,6 +422,8 @@ class LearnerWorker:
     def _maybe_refresh_expert_priorities(self):
         if not bool(getattr(self.cfg, "use_expert_demonstrations", False)):
             return
+        if not bool(getattr(self.cfg, "use_per", True)):
+            return  # Skip if not using PER
         if self._expert_priority_refresh_updates <= 0:
             return
         if self._updates_count <= 0:
@@ -420,18 +453,11 @@ class LearnerWorker:
         self._last_expert_target_priority = target_priority
 
     def _to_device_fast(self, x: torch.Tensor, dtype=None) -> torch.Tensor:
-        """Move tensor to learner device, using pinned-memory cache for async copies."""
         if not isinstance(x, torch.Tensor):
             return x
         if dtype is not None:
             x = x.to(dtype=dtype)
-        if x.device.type == "cpu":
-            try:
-                x = self._pinned_cache.get_pinned(x)
-            except Exception:
-                pass
-            return x.to(self.device, non_blocking=True)
-        return x.to(self.device)
+        return x.to(self.device, non_blocking=True)
 
     def _extract_cnn_and_compute_features(
         self, pixels: torch.Tensor, actor_net=None
@@ -543,8 +569,8 @@ class LearnerWorker:
         batch_indices = info.get("index", None)
 
         # Load raw pixels and compute features using CNN
-        pixels = self._to_device_fast(batch["pixels"], dtype=torch.float32)
-        next_pixels = self._to_device_fast(batch["next_pixels"], dtype=torch.float32)
+        pixels = unpack_pixels(self._to_device_fast(batch["pixels"]))
+        next_pixels = unpack_pixels(self._to_device_fast(batch["next_pixels"]))
         features = self._extract_cnn_and_compute_features(pixels, actor_net)
         next_features = self._extract_cnn_and_compute_features(next_pixels, actor_net)
 
@@ -646,22 +672,22 @@ class LearnerWorker:
         critic_loss = q1_masked + q2_masked
 
         # ── TD error for PER priorities ────────────────────────────────
+        use_per = bool(getattr(self.cfg, "use_per", True))
+
         with torch.no_grad():
             td_error_1 = torch.abs(q1_pred - q_target)
             td_error_2 = torch.abs(q2_pred - q_target)
             td_errors = torch.max(td_error_1, td_error_2).reshape(B, -1)
-            td_errors_for_per = td_errors.max(dim=1).values.cpu()
 
-            if batch_indices is not None:
-                _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
-                new_priorities = np.clip(
-                    td_errors_for_per.numpy(), 
-                    1e-6, 
-                    _max_priority
-                ).astype(np.float32)
-                del td_errors_for_per  # Explicit cleanup
-                del td_errors  # Also free parent tensor
-                self.rb.update_priority(batch_indices, new_priorities)
+            if use_per:
+                td_errors_for_per = td_errors.max(dim=1).values.cpu()
+                if batch_indices is not None:
+                    _max_priority = float(getattr(self.cfg, "per_max_priority", 100.0))
+                    new_priorities = np.clip(td_errors_for_per.numpy(), 1e-6, _max_priority).astype(
+                        np.float32
+                    )
+                    del td_errors_for_per  # Explicit cleanup
+                    self.rb.update_priority(batch_indices, new_priorities)
 
         # ── Explained variance ─────────────────────────────────────────
         with torch.no_grad():
@@ -678,13 +704,14 @@ class LearnerWorker:
         self.critic_opt.step()
         self._critic_updates_count += 1
 
-        # Update PER beta
-        beta = min(
-            1.0,
-            self.cfg.per_beta
-            + (1.0 - self.cfg.per_beta) * (self.total_steps / self.cfg.total_steps),
-        )
-        self.rb.beta = beta
+        # Update PER beta (only if using PER)
+        if use_per:
+            beta = min(
+                1.0,
+                self.cfg.per_beta
+                + (1.0 - self.cfg.per_beta) * (self.total_steps / self.cfg.total_steps),
+            )
+            self.rb.beta = beta
 
         # ══════════════════════════════════════════════════════════════════
         # ACTOR UPDATE (delayed)
@@ -1034,8 +1061,9 @@ class LearnerWorker:
             )
             try:
                 # Compute episode statistics
-                last_1 = self.episode_returns[-1:] if self.episode_returns else [0.0]
-                last_10 = self.episode_returns[-10:]
+                returns_list = list(self.episode_returns)  # Convert deque to list for slicing
+                last_1 = returns_list[-1:] if returns_list else [0.0]
+                last_10 = returns_list[-10:]
                 last_100 = last
 
                 def safe_std(vals):
@@ -1080,6 +1108,14 @@ class LearnerWorker:
                         self.alpha_opt.param_groups[0].get("lr", 0.0) if self.alpha_opt else 0.0
                     ),
                 }
+
+                # ── Monitor queue health ──────────────────────────────────
+                if self._queue_size >= 0 and self._queue_capacity > 0:
+                    queue_usage = float(self._queue_size) / float(self._queue_capacity)
+                    if queue_usage > 0.9:
+                        log_warning(
+                            f"Queue near full: {queue_usage:.1%} - learner may be bottlenecked"
+                        )
 
                 if self.log_queue is not None:
                     try:
@@ -1133,7 +1169,10 @@ class LearnerWorker:
         rb_save_interval = getattr(
             self.cfg, "save_interval_replaybuffer", self.cfg.save_interval * 2
         )
-        if self.total_steps - self._last_save_rb_steps >= rb_save_interval:
+        if (
+            rb_save_interval is not None
+            and self.total_steps - self._last_save_rb_steps >= rb_save_interval
+        ):
             rb_dir = Path("./models")
             rb_dir.mkdir(parents=True, exist_ok=True)
             rb_path = rb_dir / f"replay_buffer_{self.total_steps}.pt"
@@ -1159,11 +1198,19 @@ class LearnerWorker:
                         "Skipping replay buffer save."
                     )
                 else:
-                    # Try torch.save first (better for torch tensors and LazyTensorStorage)
-                    # Fallback to pickle if torch.save fails
                     try:
+                        if hasattr(self.rb._storage, "_storage") and isinstance(
+                            self.rb._storage._storage, (list, tuple)
+                        ):
+                            buffer_clones = [
+                                t.clone() if isinstance(t, torch.Tensor) else t
+                                for t in self.rb._storage._storage
+                            ]
+                        else:
+                            buffer_clones = self.rb._storage._storage
+
                         rb_state = {
-                            "buffer": self.rb._storage._storage,
+                            "buffer": buffer_clones,
                             "sampler_state": {
                                 "alpha": getattr(self.rb._sampler, "_alpha", None),
                                 "beta": getattr(self.rb._sampler, "_beta", None),
@@ -1173,12 +1220,19 @@ class LearnerWorker:
                         }
                         torch.save(rb_state, rb_path)
                     except (RuntimeError, ValueError, TypeError) as e:
-                        # LazyTensorStorage may have closed file handles - try pickle
+                        # If save fails due to closed files, log warning but continue training
                         if "closed file" in str(e).lower():
-                            # Silently skip if storage is in invalid state
-                            return
-                        with open(rb_path, "wb") as f:
-                            pickle.dump(rb_state, f)
+                            log_warning(f"Cannot save replay buffer (storage file closed): {e}")
+                        else:
+                            # Try pickle as fallback
+                            try:
+                                with open(rb_path, "wb") as f:
+                                    pickle.dump(rb_state, f)
+                            except Exception as pickle_err:
+                                log_warning(
+                                    f"Both torch.save and pickle failed for replay buffer: {pickle_err}"
+                                )
+                        return
 
                     saved_size = rb_path.stat().st_size
                     remaining_space = shutil.disk_usage(rb_dir).free

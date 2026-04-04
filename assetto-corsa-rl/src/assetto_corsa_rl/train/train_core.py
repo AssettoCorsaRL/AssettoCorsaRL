@@ -293,16 +293,25 @@ def _learner_process_fn(
     start_time,
 ):
     """Entry-point for the learner subprocess."""
-    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ListStorage
+    from torchrl.data.replay_buffers import PrioritizedReplayBuffer, ReplayBuffer, LazyTensorStorage
 
-    storage = ListStorage(max_size=rb_kwargs["max_size"])
-    rb = PrioritizedReplayBuffer(
-        alpha=rb_kwargs["alpha"],
-        beta=rb_kwargs["beta"],
-        storage=storage,
-        batch_size=rb_kwargs["batch_size"],
-        collate_fn=_collate_sequence_batch,  # Custom collation for sequence batches
-    )
+    storage = LazyTensorStorage(max_size=rb_kwargs["max_size"])
+    use_per = rb_kwargs.get("use_per", True)
+
+    if use_per:
+        rb = PrioritizedReplayBuffer(
+            alpha=rb_kwargs["alpha"],
+            beta=rb_kwargs["beta"],
+            storage=storage,
+            batch_size=rb_kwargs["batch_size"],
+            collate_fn=_collate_sequence_batch,  # Custom collation for sequence batches
+        )
+    else:
+        rb = ReplayBuffer(
+            storage=storage,
+            batch_size=rb_kwargs["batch_size"],
+            collate_fn=_collate_sequence_batch,  # Custom collation for sequence batches
+        )
 
     if getattr(cfg, "use_expert_demonstrations", False):
         from assetto_corsa_rl.train.logging_utils import log_warning
@@ -592,6 +601,7 @@ class Trainer:
             alpha=float(self.cfg.per_alpha),
             beta=float(self.cfg.per_beta),
             batch_size=int(self.cfg.batch_size),
+            use_per=bool(getattr(self.cfg, "use_per", True)),
         )
 
         learner_proc = mp.Process(

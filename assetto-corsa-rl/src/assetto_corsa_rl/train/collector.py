@@ -50,12 +50,12 @@ class CollectorWorker:
         self._enqueue_full_count = 0
         self._actor_infer_calls = 0
 
-        self._weight_sync_thread = None
-        self._stop_weight_sync = threading.Event()
+        # self._weight_sync_thread = None
+        # self._stop_weight_sync = threading.Event()
 
-        if self.weights_version is not None:
-            self._weight_sync_thread = threading.Thread(target=self._weight_sync_loop, daemon=True)
-            self._weight_sync_thread.start()
+        # if self.weights_version is not None:
+        #     self._weight_sync_thread = threading.Thread(target=self._weight_sync_loop, daemon=True)
+        #     self._weight_sync_thread.start()
 
         self._start_steps_logged = False
         self._end_start_steps_logged = False
@@ -134,19 +134,13 @@ class CollectorWorker:
             if hasattr(m, "reset_context"):
                 m.reset_context()
 
-    def _weight_sync_loop(self):
-        while not self._stop_weight_sync.is_set():
-            if self.weights_version is not None:
-                current_version = self.weights_version.value
-                if current_version != self._local_version:
-                    self.actor.load_state_dict(self.shared_weights, strict=False)
-            time.sleep(0.001)  # 1000 Hz polling
-
     def stop(self):
         """Stop the weight synchronization thread."""
-        self._stop_weight_sync.set()
-        if self._weight_sync_thread is not None:
-            self._weight_sync_thread.join()
+        # self._stop_weight_sync.set()
+        # if self._weight_sync_thread is not None:
+        #     self._weight_sync_thread.join()
+
+        pass
 
     #! Async entry point
 
@@ -155,6 +149,10 @@ class CollectorWorker:
         sync_every = int(getattr(self.cfg, "sync_every", 100))
 
         while self.stop_event is None or not self.stop_event.is_set():
+
+            if self.total_steps % sync_every == 0:
+                self._sync_weights()
+
             self._step_and_store()
             # broadcast epsilon so the learner can log it.
             if self.total_steps % sync_every == 0:
@@ -334,11 +332,11 @@ class CollectorWorker:
 
         for i in range(self.cfg.num_envs):
             transition = {
-                "pixels": pixels[i].float(),
-                "next_pixels": next_pixels[i].float(),
-                "action": actions[i].cpu().float(),
-                "reward": rewards[i].unsqueeze(0).cpu(),
-                "done": dones[i].unsqueeze(0).cpu(),
+                "pixels": pack_pixels(pixels[i]),  # uint8
+                "next_pixels": pack_pixels(next_pixels[i]),  # uint8
+                "action": actions[i].cpu().to(torch.float16),
+                "reward": rewards[i].unsqueeze(0).cpu().to(torch.float16),
+                "done": dones[i].unsqueeze(0).cpu(),  # bool is fine
                 "terminated": terminated[i].unsqueeze(0).cpu(),
             }
             if cur_vector is not None:
@@ -397,9 +395,11 @@ class CollectorWorker:
 
     def _enqueue(self, item):
         try:
-            self.transitions_queue.put_nowait(item)
+            # Non-blocking put with immediate fallback for queue backpressure
+            self.transitions_queue.put(item, timeout=0.001)
         except queue.Full:
             self._enqueue_full_count += 1
+            # Drop oldest item to make room (backpressure handling)
             try:
                 self.transitions_queue.get_nowait()
                 self.transitions_queue.put_nowait(item)
