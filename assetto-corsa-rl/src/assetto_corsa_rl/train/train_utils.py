@@ -43,6 +43,13 @@ class OrnsteinUhlenbeckNoise:
                 t = x.to(self.device).float()
             else:
                 t = torch.tensor([x], dtype=torch.float32, device=self.device)
+
+            if t.numel() > action_dim:
+                t = t.flatten()[:action_dim]
+            elif t.numel() < action_dim and t.numel() > 1:
+                pad = torch.zeros(action_dim - t.numel(), device=self.device)
+                t = torch.cat([t.flatten(), pad])
+
             # expand to (num_envs, action_dim) if needed
             if t.numel() == 1:
                 t = t.expand(num_envs, action_dim)
@@ -104,10 +111,7 @@ def unpack_pixels(x):
 
 def sample_random_actions(num_envs, device=None):
     device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    steer = torch.empty(num_envs, 1, device=device).uniform_(-1, 1)
-    gas = torch.empty(num_envs, 1, device=device).uniform_(0, 1)
-    brake = torch.empty(num_envs, 1, device=device).uniform_(0, 1)
-    return torch.cat([steer, gas, brake], dim=-1)
+    return torch.empty(num_envs, 2, device=device).uniform_(-1.0, 1.0)
 
 
 def sample_random_action(n=1, dev=None):

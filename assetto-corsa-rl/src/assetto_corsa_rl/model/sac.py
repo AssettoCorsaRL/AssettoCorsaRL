@@ -91,21 +91,30 @@ class ActorNet(nn.Module):
         _init_orthogonal(self.mlp[3], gain=lrelu_gain)
         _init_orthogonal(self.mlp[6], gain=0.01)
 
-        action_dim = self.mlp[6].out_features // 2
-        # with torch.no_grad():
-        #     # loc biases for [steer, gas, brake]
-        #     self.mlp[6].bias[:action_dim] = torch.tensor(
-        #         [0.0, 1.1, -0.85],
-        #         device=self.mlp[6].bias.device,
-        #         dtype=self.mlp[6].bias.dtype,
-        #     )
+        action_dim = self.mlp[6].out_features // 2  # = 2
 
-        #     # smaller initial std so policy actually starts near those values
-        #     self.mlp[6].bias[action_dim:] = torch.tensor(
-        #         [-2.5, -2.5, -2.5],
-        #         device=self.mlp[6].bias.device,
-        #         dtype=self.mlp[6].bias.dtype,
-        #     )
+        with torch.no_grad():
+            # loc biases: keep steer centered; bias accel/throttle action positive.
+            loc_bias = torch.zeros(
+                action_dim, device=self.mlp[6].bias.device, dtype=self.mlp[6].bias.dtype
+            )
+            if action_dim >= 2:
+                # pre-tanh mean; tanh(1.0) ~= 0.76 so sampled accel starts clearly > 0.
+                loc_bias[1] = 1.0
+            elif action_dim == 1:
+                loc_bias[0] = 1.0
+            self.mlp[6].bias[:action_dim] = loc_bias
+
+            # log_scale biases: allow wider steer exploration, keep accel tighter.
+            log_scale_bias = torch.zeros(
+                action_dim, device=self.mlp[6].bias.device, dtype=self.mlp[6].bias.dtype
+            )
+            if action_dim >= 1:
+                log_scale_bias[0] = 0.8
+            if action_dim >= 2:
+                # Smaller accel std so sampled throttle reflects loc bias at init.
+                log_scale_bias[1] = -1.5
+            self.mlp[6].bias[action_dim:] = log_scale_bias
 
     def reset_context(self):
         self._context_state = None
@@ -283,8 +292,8 @@ class SACPolicy:
         self.shared_cnn = shared_cnn
         self.target_cnn = target_cnn
 
-        min_scale = torch.tensor([0.01, 0.01, 0.01], device=device)
-        max_scale = torch.tensor([0.5, 0.5, 0.5], device=device)
+        min_scale = torch.full((action_dim,), 0.01, device=device)
+        max_scale = torch.full((action_dim,), 2.0, device=device)
 
         fusion_input_size = cnn_output_size + obs_dim
 
@@ -304,34 +313,16 @@ class SACPolicy:
 
         if obs_dim > 0:
             policy_module = TensorDictModule(
-                actor_net,
-                in_keys=["pixels", "vector"],
-                out_keys=["loc", "scale"],
+                actor_net, in_keys=["pixels", "vector"], out_keys=["loc", "scale"]
             )
         else:
             policy_module = TensorDictModule(
-                actor_net,
-                in_keys=["pixels"],
-                out_keys=["loc", "scale"],
+                actor_net, in_keys=["pixels"], out_keys=["loc", "scale"]
             )
 
-        low = [-1.0, 0.0, 0.0]
-        high = [1.0, 1.0, 1.0]
-
-        try:
-            low_t = torch.as_tensor(low, dtype=torch.float32)
-            high_t = torch.as_tensor(high, dtype=torch.float32)
-            if not torch.all(high_t > low_t):
-                print(
-                    f"Warning: invalid action bounds detected (low={low_t}, high={high_t}). "
-                    "Defaulting to [-1, 1]."
-                )
-                low_t = -torch.ones_like(low_t)
-                high_t = torch.ones_like(high_t)
-            dist_kwargs = {"low": low_t, "high": high_t}
-        except Exception as e:
-            print(f"Warning: could not validate action bounds ({e}); using raw spec values.")
-            dist_kwargs = {"low": low, "high": high}
+        low_t = torch.full((action_dim,), -1.0, dtype=torch.float32, device=device)
+        high_t = torch.full((action_dim,), 1.0, dtype=torch.float32, device=device)
+        dist_kwargs = {"low": low_t, "high": high_t}
 
         self.actor = ProbabilisticActor(
             module=policy_module,

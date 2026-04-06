@@ -1,20 +1,15 @@
 ﻿import wandb
-import json
 import sys
 import statistics
 from collections import defaultdict
 
 
 def fetch_run_history(run_path: str, num_snapshots: int = 50) -> str:
-    """
-    Takes a wandb run path (entity/project/run_id OR entity/project for latest run)
-    and returns a comprehensive, LLM-optimized history with evenly spaced snapshots.
-    """
     api = wandb.Api()
 
     parts = run_path.strip().split("/")
     if len(parts) == 2:
-        runs = api.runs(run_path, per_page=1)
+        runs = api.runs(run_path, per_page=1, order="-created_at")
         run = next(iter(runs))
     elif len(parts) == 3:
         run = api.run(run_path)
@@ -53,36 +48,48 @@ def fetch_run_history(run_path: str, num_snapshots: int = 50) -> str:
         output.append("  (none logged)")
     output.append("")
 
-    # ── Collect all rows ───────────────────────────────────────────────────────
-    print("Fetching full history (this may take a moment)...", file=sys.stderr)
-    all_rows = list(run.scan_history())
-    total_steps = len(all_rows)
+    print("Scanning history (single pass)...", file=sys.stderr)
 
-    output.append(f"Available metric keys: {run.history_keys}")
-    output.append(f"Total logged steps: {total_steps}")
-    output.append("")
-
-    if total_steps == 0:
-        output.append("No history found.")
-        return "\n".join(output)
-
-    # ── Per-key statistics (over ALL rows) ────────────────────────────────────
     key_data = defaultdict(list)
-    for row in all_rows:
+    all_rows_raw = []  # (step, row) for every row — we subsample after
+
+    for row in run.scan_history(page_size=10_000):
+        step = row.get("_step", 0)
+        all_rows_raw.append((step, row))
         for k, v in row.items():
             if k.startswith("_"):
                 continue
             if isinstance(v, (int, float)) and v == v:  # skip NaN
-                key_data[k].append((row.get("_step", 0), v))
+                key_data[k].append((step, v))
 
+    if not all_rows_raw:
+        output.append("No history found.")
+        return "\n".join(output)
+
+    all_rows_raw.sort(key=lambda x: x[0])
+    total_steps = all_rows_raw[-1][0] + 1
+
+    seen_keys = sorted(key_data.keys())
+    output.append(f"Available metric keys: {seen_keys}")
+    output.append(f"Total logged steps: {total_steps}")
+    output.append("")
+
+    n = len(all_rows_raw)
+    if n <= num_snapshots:
+        snapshot_rows = all_rows_raw
+    else:
+        step_size = (n - 1) / (num_snapshots - 1)
+        indices = set(round(i * step_size) for i in range(num_snapshots))
+        snapshot_rows = [all_rows_raw[i] for i in sorted(indices)]
+
+    # ── Per-metric statistics ─────────────────────────────────────────────────
     output.append("── PER-METRIC STATISTICS (all steps) ──")
-    for key in sorted(key_data.keys()):
+    for key in seen_keys:
         values = [v for _, v in key_data[key]]
         steps = [s for s, _ in key_data[key]]
         mn, mx = min(values), max(values)
         mean = statistics.mean(values)
-        first_step, first_val = steps[0], values[0]
-        last_step, last_val = steps[-1], values[-1]
+        first_val, last_val = values[0], values[-1]
         trend = (
             "improving"
             if last_val > first_val
@@ -91,31 +98,20 @@ def fetch_run_history(run_path: str, num_snapshots: int = 50) -> str:
         output.append(
             f"  {key}:"
             f" min={mn:.4g}, max={mx:.4g}, mean={mean:.4g},"
-            f" first={first_val:.4g} (step {first_step}),"
-            f" last={last_val:.4g} (step {last_step}),"
+            f" first={first_val:.4g} (step {steps[0]}),"
+            f" last={last_val:.4g} (step {steps[-1]}),"
             f" trend={trend},"
             f" n_logged={len(values)}"
         )
     output.append("")
 
-    # ── Evenly spaced snapshots ───────────────────────────────────────────────
-    if total_steps <= num_snapshots:
-        snapshot_indices = list(range(total_steps))
-    else:
-        step_size = (total_steps - 1) / (num_snapshots - 1)
-        snapshot_indices = sorted(
-            set(round(i * step_size) for i in range(num_snapshots))
-        )
-
     output.append(
-        f"── SNAPSHOTS ({num_snapshots} evenly spaced across {total_steps} total steps) ──"
+        f"── SNAPSHOTS ({len(snapshot_rows)} snapshots across {total_steps} total steps) ──"
     )
-    output.append(f"  Format: [snap XX/{num_snapshots} | row Y] step=N  key=value ...")
+    output.append(f"  Format: [snap XX/{len(snapshot_rows)} | step=N] key=value ...")
     output.append("")
 
-    for snap_num, idx in enumerate(snapshot_indices, 1):
-        row = all_rows[idx]
-        step = row.get("_step", idx)
+    for snap_num, (step, row) in enumerate(snapshot_rows, 1):
         metrics = {
             k: (round(v, 5) if isinstance(v, float) else v)
             for k, v in sorted(row.items())
@@ -123,7 +119,7 @@ def fetch_run_history(run_path: str, num_snapshots: int = 50) -> str:
         }
         metrics_str = "  ".join(f"{k}={v}" for k, v in metrics.items())
         output.append(
-            f"  [snap {snap_num:02d}/{num_snapshots} | row {idx+1}]  step={step}  {metrics_str}"
+            f"  [snap {snap_num:02d}/{len(snapshot_rows)} | step={step}]  {metrics_str}"
         )
 
     output.append("")

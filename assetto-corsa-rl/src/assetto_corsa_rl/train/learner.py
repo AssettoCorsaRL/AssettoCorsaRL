@@ -84,7 +84,7 @@ class LearnerWorker:
         self.critic_opt = critic_opt
         self.log_alpha = log_alpha
         self.alpha_opt = alpha_opt
-        self.target_entropy = target_entropy if target_entropy is not None else -3.0
+        self.target_entropy = target_entropy if target_entropy is not None else -2.0
         self.transitions_queue = transitions_queue
         self.env = env
         self.device = device
@@ -265,11 +265,9 @@ class LearnerWorker:
                 _update_credit += n * self._updates_per_step
                 _update_credit = min(_update_credit, self._max_update_credit)
 
-            k = min(_update_credit, self._max_updates_per_tick)
-
-            if _update_credit >= self._updates_per_step:
-                k = self._updates_per_step  # steady 1 update per collected transition
-                _update_credit -= k
+            k = 0
+            if has_enough_data and _update_credit > 0:
+                k = int(min(_update_credit, self._max_updates_per_tick))
 
             if k > 0:
                 for _ in range(k):
@@ -280,6 +278,7 @@ class LearnerWorker:
                 if self._updates_count % _weight_push_every == 0:
                     self._push_weights()
             else:
+                self._last_train_batches = 0
                 time.sleep(0.001)
 
             self._maybe_log_and_save(epsilon=self._last_epsilon)
@@ -532,11 +531,12 @@ class LearnerWorker:
 
         Avoids atanh entirely by keeping the pre-tanh sample z.
         """
-        low = torch.tensor([-1.0, 0.0, 0.0], device=self.device)
-        high = torch.tensor([1.0, 1.0, 1.0], device=self.device)
+        low = torch.full_like(loc, -1.0)
+        high = torch.full_like(loc, 1.0)
 
         normal = torch.distributions.Normal(loc, scale)
         z = normal.rsample()  # pre-tanh
+
         tanh_z = torch.tanh(z)  # in [-1, 1]
 
         # map [-1,1] → [low, high]
@@ -577,10 +577,10 @@ class LearnerWorker:
         actions_b = self._to_device_fast(batch["action"], dtype=torch.float32)
         rewards_b = self._to_device_fast(batch["reward"], dtype=torch.float32)
 
-        if "terminated" in batch.keys():
-            done_mask = self._to_device_fast(batch["terminated"], dtype=torch.float32)
-        elif "done" in batch.keys():
+        if "done" in batch.keys():
             done_mask = self._to_device_fast(batch["done"], dtype=torch.float32)
+        elif "terminated" in batch.keys():
+            done_mask = self._to_device_fast(batch["terminated"], dtype=torch.float32)
         else:
             done_mask = torch.zeros_like(rewards_b)
 
@@ -704,7 +704,7 @@ class LearnerWorker:
         self.critic_opt.step()
         self._critic_updates_count += 1
 
-        # Update PER beta (only if using PER)
+        beta = 0.0  # Default value when PER is disabled
         if use_per:
             beta = min(
                 1.0,
@@ -879,17 +879,11 @@ class LearnerWorker:
                 "action/steer_std": (
                     new_actions_log[:, 0].std().item() if new_actions_log is not None else 0.0
                 ),
-                "action/gas_mean": (
+                "action/accel_mean": (
                     new_actions_log[:, 1].mean().item() if new_actions_log is not None else 0.0
                 ),
-                "action/gas_std": (
+                "action/accel_std": (
                     new_actions_log[:, 1].std().item() if new_actions_log is not None else 0.0
-                ),
-                "action/brake_mean": (
-                    new_actions_log[:, 2].mean().item() if new_actions_log is not None else 0.0
-                ),
-                "action/brake_std": (
-                    new_actions_log[:, 2].std().item() if new_actions_log is not None else 0.0
                 ),
                 # ── Policy parameters (mu, sigma) ────────────────────
                 "actor/loc_mean": (

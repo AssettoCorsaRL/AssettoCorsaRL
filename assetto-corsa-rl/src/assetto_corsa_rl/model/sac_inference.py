@@ -151,30 +151,7 @@ class SACInferenceEngine:
         deterministic: bool = False,
         copy: bool = True,
     ):
-        """
-        Parameters
-        ----------
-        policy : SACPolicy
-            Trained policy whose actor will be optimised.
-        input_hw : tuple
-            (H, W) of observation images.
-        backend : str
-            "compile"  → torch.compile + Inductor (best overall)
-            "jit"      → TorchScript trace + freeze + optimize_for_inference
-            "eager"    → optimised eager (quantise + channels_last only)
-        quantize : bool
-            Dynamic INT8 quantisation of Linear layers.
-        channels_last : bool
-            NHWC memory format for the CNN  (big win on MKL-DNN).
-        num_threads : int
-            Intra-op thread count.  8 = P-core count on i7-14700F.
-        warmup : int
-            JIT / compile warm-up iterations.
-        deterministic : bool
-            If True, return tanh(mean) instead of sampling.
-        copy : bool
-            deepcopy the actor so the original policy stays intact.
-        """
+
         self.deterministic = deterministic
         self._channels_last = channels_last
         self._backend = backend
@@ -203,8 +180,9 @@ class SACInferenceEngine:
                 else torch.tensor(dk["high"], dtype=torch.float32)
             )
         except Exception:
-            self._lo = torch.tensor([-1.0, 0.0, 0.0])
-            self._hi = torch.tensor([1.0, 1.0, 1.0])
+            action_dim = actor_net.mlp[-2].out_features // 2  # derive from model
+            self._lo = torch.full((action_dim,), -1.0)
+            self._hi = torch.full((action_dim,), 1.0)
         self._range = self._hi - self._lo
 
         in_c = 3

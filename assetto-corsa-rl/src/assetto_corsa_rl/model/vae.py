@@ -487,36 +487,20 @@ def load_vae_encoder(
         Tuple of (encoder_module, output_size) where encoder_module handles
         channel adaptation if needed and output_size is the flattened feature size
     """
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-    except FileNotFoundError:
-        print(f"VAE checkpoint file not found: '{checkpoint_path}'", RuntimeWarning)
-        raise
-    except Exception as e:
-        print(f"Failed to load VAE checkpoint from '{checkpoint_path}': {e}", RuntimeWarning)
-        raise
+    checkpoint = torch.load(checkpoint_path, map_location=device)
 
     if isinstance(checkpoint, dict):
         hparams = checkpoint.get("hyper_parameters", {})
         state_dict = checkpoint.get("state_dict", checkpoint)
 
         if not hparams:
-            if "to_latent.weight" in state_dict:
-                z_dim = state_dict["to_latent.weight"].shape[0]
-            else:
-                z_dim = 1024
-
-            if "encoder_in.weight" in state_dict:
-                vae_in_channels = state_dict["encoder_in.weight"].shape[1]
-            else:
-                vae_in_channels = 3
+            z_dim = state_dict["to_latent.weight"].shape[0]
+            vae_in_channels = state_dict["encoder_in.weight"].shape[1]
         else:
-            z_dim = hparams.get("z_dim", 1024)
-            vae_in_channels = hparams.get("in_channels", 3)
+            z_dim = hparams["z_dim"]
+            vae_in_channels = hparams["in_channels"]
     else:
-        z_dim = 1024
-        vae_in_channels = 3
-        state_dict = checkpoint
+        raise ValueError("Checkpoint must be a dictionary with 'hyper_parameters' and 'state_dict'")
 
     old_stdout = sys.stdout
     if not verbose:
@@ -529,24 +513,7 @@ def load_vae_encoder(
             sys.stdout.close()
             sys.stdout = old_stdout
 
-    try:
-        if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-            vae.load_state_dict(checkpoint["state_dict"])
-        else:
-            vae.load_state_dict(checkpoint)
-    except RuntimeError as e:
-        print(
-            f"Failed to load VAE model parameters from '{checkpoint_path}' — "
-            f"architecture mismatch or corrupted weights: {e}",
-            RuntimeWarning,
-        )
-        raise
-    except Exception as e:
-        print(
-            f"Unexpected error loading VAE state dict from '{checkpoint_path}': {e}", RuntimeWarning
-        )
-        raise
-
+    vae.load_state_dict(checkpoint["state_dict"], strict=True)
     vae = vae.to(device)
 
     vae_encoder = VAEEncoder(vae)

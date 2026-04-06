@@ -175,22 +175,9 @@ def _do_train():
         log_info(f"Loading BC-SAC pretrained model from {bc_pretrained_path}...")
         checkpoint = torch.load(bc_pretrained_path, map_location=device)
 
-        bc_use_noisy = checkpoint.get("config", {}).get("use_noisy", False)
-        current_use_noisy = cfg.use_noisy
-
-        if bc_use_noisy != current_use_noisy:
-            log_warning(
-                f"BC model was trained with use_noisy={bc_use_noisy}, "
-                f"current model has use_noisy={current_use_noisy}"
-            )
-            log_info("Loading with strict=False to handle architecture mismatch...")
-            strict = False
-        else:
-            strict = True
-
         if "actor_state" in checkpoint:
             try:
-                actor.load_state_dict(checkpoint["actor_state"], strict=strict)
+                actor.load_state_dict(checkpoint["actor_state"], strict=True)
                 print(
                     f"Loaded BC-SAC pretrained actor (val_mse: {checkpoint.get('val_mse', 'N/A')})"
                 )
@@ -201,25 +188,25 @@ def _do_train():
 
         if "q1_state" in checkpoint:
             try:
-                q1.load_state_dict(checkpoint["q1_state"], strict=strict)
+                q1.load_state_dict(checkpoint["q1_state"], strict=True)
                 log_success("Loaded BC-SAC pretrained Q1")
             except Exception as e:
                 log_warning(f"Partial Q1 load: {e}")
         if "q2_state" in checkpoint:
             try:
-                q2.load_state_dict(checkpoint["q2_state"], strict=strict)
+                q2.load_state_dict(checkpoint["q2_state"], strict=True)
                 log_success("Loaded BC-SAC pretrained Q2")
             except Exception as e:
                 log_warning(f"Partial Q2 load: {e}")
         if "q1_target_state" in checkpoint:
             try:
-                q1_target.load_state_dict(checkpoint["q1_target_state"], strict=strict)
+                q1_target.load_state_dict(checkpoint["q1_target_state"], strict=True)
                 log_success("Loaded BC-SAC pretrained Q1 target")
             except Exception as e:
                 log_warning(f"Partial Q1 target load: {e}")
         if "q2_target_state" in checkpoint:
             try:
-                q2_target.load_state_dict(checkpoint["q2_target_state"], strict=strict)
+                q2_target.load_state_dict(checkpoint["q2_target_state"], strict=True)
                 log_success("Loaded BC-SAC pretrained Q2 target")
             except Exception as e:
                 log_warning(f"Partial Q2 target load: {e}")

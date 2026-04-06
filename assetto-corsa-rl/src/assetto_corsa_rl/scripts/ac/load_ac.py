@@ -1,6 +1,6 @@
 """
 Usage:
-    acrl ac test --checkpoint models\sac_best.pt --vae-checkpoint loss=0.1050.ckpt
+    acrl ac test --checkpoint D:/acrl/AssetoCorsaRL/models/sac_best.pt --vae-checkpoint loss=0.1050.ckpt
 """
 
 import warnings
@@ -204,13 +204,18 @@ def test(
 
         while not done and steps < max_steps:
             with torch.no_grad():
-                if td.batch_size == torch.Size([]):
+                was_unbatched = td.batch_size == torch.Size([])
+                if was_unbatched:
                     curr_td = td.unsqueeze(0)
                 else:
                     curr_td = td
 
                 actor_out = actor(curr_td)
-                action = actor_out["loc"]
+                action = actor_out["action"]
+
+                # Squeeze back to unbatched form if needed
+                if was_unbatched:
+                    action = action.squeeze(0)
 
             td.set("action", action)
             td = env.step(td)

@@ -47,8 +47,12 @@ class CollectorWorker:
         self.current_td = self.env.reset()
         self.current_episode_return = torch.zeros(cfg.num_envs, device=self.device)
         self._queue_capacity = int(getattr(cfg, "queue_size", 0))
+        self._queue_target_size = int(getattr(cfg, "queue_target_size", 1000))
+        self._queue_target_hysteresis = int(getattr(cfg, "queue_target_hysteresis", 200))
+        self._queue_backpressure_sleep_ms = float(getattr(cfg, "queue_backpressure_sleep_ms", 2.0))
         self._enqueue_full_count = 0
         self._actor_infer_calls = 0
+        self._queue_backpressure_active = False
 
         # self._weight_sync_thread = None
         # self._stop_weight_sync = threading.Event()
@@ -63,7 +67,6 @@ class CollectorWorker:
         if start_steps > 0:
             log_info(f"[COLLECTOR] Beginning random exploration phase: {start_steps:,} steps")
 
-        # ou noise (not just random jitter. waywaywayway better)
         action_dim = int(env.action_spec.shape[-1])
         ou_theta = getattr(cfg, "ou_theta", 0.15)
         ou_sigma = getattr(cfg, "ou_sigma", 0.3)
@@ -74,6 +77,9 @@ class CollectorWorker:
                 ou_mu_default[1] = 0.4
         else:
             ou_mu_default = torch.tensor(ou_mu_cfg, dtype=torch.float32, device=self.device)
+            if ou_mu_default.shape[0] > action_dim:
+                ou_mu_default = ou_mu_default[:action_dim]
+
         self.ou_noise = OrnsteinUhlenbeckNoise(
             action_dim=action_dim,
             num_envs=cfg.num_envs,
@@ -149,6 +155,7 @@ class CollectorWorker:
         sync_every = int(getattr(self.cfg, "sync_every", 100))
 
         while self.stop_event is None or not self.stop_event.is_set():
+            self._maybe_apply_queue_backpressure()
 
             if self.total_steps % sync_every == 0:
                 self._sync_weights()
@@ -179,6 +186,43 @@ class CollectorWorker:
 
                 self._enqueue_full_count = 0
                 self._actor_infer_calls = 0
+
+    def _safe_qsize(self):
+        try:
+            return int(self.transitions_queue.qsize())
+        except Exception:
+            return None
+
+    def _maybe_apply_queue_backpressure(self):
+        """Throttle collection to keep queue around a target size.
+
+        Uses hysteresis to avoid toggling every iteration.
+        """
+        target = self._queue_target_size
+        if target <= 0:
+            return
+
+        qsize = self._safe_qsize()
+        if qsize is None:
+            return
+
+        margin = max(1, self._queue_target_hysteresis)
+        upper = target + margin
+        lower = max(0, target - margin)
+
+        if not self._queue_backpressure_active and qsize >= upper:
+            self._queue_backpressure_active = True
+
+        if self._queue_backpressure_active:
+            sleep_s = max(0.0005, self._queue_backpressure_sleep_ms / 1000.0)
+            while self._queue_backpressure_active:
+                if self.stop_event is not None and self.stop_event.is_set():
+                    break
+                qnow = self._safe_qsize()
+                if qnow is None or qnow <= lower:
+                    self._queue_backpressure_active = False
+                    break
+                time.sleep(sleep_s)
 
     def _exploration_epsilon(self):
         """Linearly anneal epsilon from explore_start → explore_end over explore_steps.
@@ -270,13 +314,9 @@ class CollectorWorker:
                 eps = self._exploration_epsilon()
 
             if in_random_phase:
-                # OU noise for coherent random exploration (car actually drives)
                 ou_sample = self.ou_noise.sample()
-                # steer [-1,1], gas [0,1], brake [0,1]
                 actions = ou_sample.clone()
-                actions[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
-                if actions.shape[-1] >= 2:
-                    actions[:, 1:] = actions[:, 1:].clamp(0.0, 1.0)
+                actions = actions.clamp(-1.0, 1.0)
             elif eps > 0.0:
                 mask = torch.rand(self.cfg.num_envs, device=self.device) < eps
                 rand_actions = sample_random_action(self.cfg.num_envs, dev=self.device)
@@ -293,17 +333,15 @@ class CollectorWorker:
                     else sample_random_action(self.cfg.num_envs, dev=self.device)
                 )
 
-            if not in_random_phase and actor_action is not None:
-                decay_frac = min(
-                    1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
-                )
-                noise_scale = self._ou_noise_scale * (1.0 - decay_frac)
-                if noise_scale > 1e-6:
-                    ou_delta = self.ou_noise.sample() - self.ou_noise.mu[0]
-                    actions = actions + noise_scale * ou_delta
-                    actions[:, 0] = actions[:, 0].clamp(-1.0, 1.0)
-                    if actions.shape[-1] >= 2:
-                        actions[:, 1:] = actions[:, 1:].clamp(0.0, 1.0)
+            # if not in_random_phase and actor_action is not None:
+            #     decay_frac = min(
+            #         1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
+            #     )
+            #     noise_scale = self._ou_noise_scale * (1.0 - decay_frac)
+            #     if noise_scale > 1e-6:
+            #         ou_delta = self.ou_noise.sample() - self.ou_noise.mu[0]
+            #         actions = actions + noise_scale * ou_delta
+            #         actions = actions.clamp(-1.0, 1.0)
 
         actions_step = expand_actions_for_envs(actions, target_batch)
         action_td = TensorDict({"action": actions_step}, batch_size=target_batch)
@@ -324,8 +362,8 @@ class CollectorWorker:
         if next_pixels.ndim == 3:
             next_pixels = next_pixels.unsqueeze(0)
 
-        pixels = pixels.cpu().byte()  # float32 -> uint8
-        next_pixels = next_pixels.cpu().byte()
+        pixels = pixels.cpu()
+        next_pixels = next_pixels.cpu()
 
         cur_vector = inner_obs.get("vector", None)
         next_vector = td_next.get("vector", None)

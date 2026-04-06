@@ -8,13 +8,14 @@ import json
 from pathlib import Path
 import cv2
 import torch
+import threading
 
 try:
     from .ac_send_actions import XboxController
     from .ac_telemetry_helper import Telemetry
 except:
-    from ac_send_actions import XboxController #type:ignore
-    from ac_telemetry_helper import Telemetry # type:ignore
+    from ac_send_actions import XboxController  # type:ignore
+    from ac_telemetry_helper import Telemetry  # type:ignore
 
 
 class AssettoCorsa(gym.Env):
@@ -67,9 +68,9 @@ class AssettoCorsa(gym.Env):
         self._load_racing_line(racing_line_path)
 
         self.action_space = spaces.Box(
-            low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
-            shape=(3,),
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            shape=(2,),
             dtype=np.float32,
         )
 
@@ -124,6 +125,7 @@ class AssettoCorsa(gym.Env):
         self._low_speed_duration_s = 0.0
         self._last_done_check_time = time.monotonic()
         self._telemetry_missing_start_time = None
+        self._last_telemetry_frame_time = 0.0
 
     def _compute_racing_line_context(self, data: Dict[str, Any]) -> Dict[str, float]:
         defaults = {
@@ -160,7 +162,6 @@ class AssettoCorsa(gym.Env):
             seg_xy = seg[:2]
             seg_norm = float(np.linalg.norm(seg_xy))
 
-            #  lateral offset to centerline (left/right of tangent) in meters.
             if seg_norm > 1e-6:
                 rel_xy = position[:2] - p0[:2]
                 cross_z = seg_xy[0] * rel_xy[1] - seg_xy[1] * rel_xy[0]
@@ -458,6 +459,29 @@ class AssettoCorsa(gym.Env):
 
         return normalized
 
+    def _wait_for_telemetry(self, timeout: float = 1.0) -> bool:
+        """Wait for new telemetry data from queue with timeout.
+
+        Uses queue-based polling instead of sleep, which is non-blocking
+        and only waits if data is actually unavailable.
+
+        Args:
+            timeout: Maximum seconds to wait for telemetry data
+
+        Returns:
+            True if new (different) data received and stored, False if timeout or duplicate
+        """
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < timeout:
+            data = self.telemetry.get_from_queue(block=False)
+            if data is not None:
+                if self._last_obs is None or data != self._last_obs:
+                    with self.telemetry._lock:
+                        self._last_obs = data
+                    return True
+            time.sleep(0.001)  # Small sleep to avoid busy-waiting
+        return False
+
     def _load_racing_line(self, filepath: str) -> None:
         """Load racing line from JSON file or URL.
 
@@ -573,23 +597,16 @@ class AssettoCorsa(gym.Env):
             self._current_racing_line_index = 0
             self._meters_advanced = 0.0
 
-        velocity = data.get("car", {}).get("velocity", [0, 0, 0])
-        speed = np.linalg.norm(velocity)  # m/s
+        velocity = np.array(data.get("car", {}).get("velocity", [0, 0, 0]), dtype=np.float32)
+        speed = float(np.linalg.norm(velocity))
 
-        off_track = float(data.get("car", {}).get("tyres_off_track", 0))
-        damage = sum(data["car"].get("damage", [0]))
+        # off_track = float(data.get("car", {}).get("tyres_off_track", 0))
+        # damage = float(sum(data["car"].get("damage", [0])))
 
         reward = (
-            self.constant_reward_per_ms
-            * 0.02  # constant reward proportional to timestep (0.02s per step)
-            + meters_progress
-            * self.reward_per_m_advanced_along_centerline  # progress along racing line
-            - off_track * 0.5  # penalty for being off track
-            - (damage / 135)
+            self.constant_reward_per_ms * 0.002  # Reduced from 0.02 (10x smaller penalty)
+            + meters_progress * self.reward_per_m_advanced_along_centerline
         )
-
-        # if speed < 10.0:
-        #     reward -= 0.1 * (1.0 - speed / 10.0)
 
         self._last_speed = speed
         return reward
@@ -597,27 +614,14 @@ class AssettoCorsa(gym.Env):
     def _check_done(self, obs, data):
         terminated = False
         truncated = False
+        reason = None
 
         now = time.monotonic()
         dt = max(0.0, now - self._last_done_check_time)
         self._last_done_check_time = now
 
-        self._telemetry_missing_start_time = None
-
         car = data.get("car", {})
-        try:
-            speed_mph = float(car.get("speed_mph", 0.0))
-        except Exception:
-            speed_mph = 0.0
-
-        if not math.isfinite(speed_mph) or speed_mph < 0.0:
-            velocity = car.get("velocity", [0.0, 0.0, 0.0])
-            try:
-                speed_mph = float(
-                    np.linalg.norm(velocity) * 2.2369362920544
-                )  # meters/h^2 -> miles/h^2
-            except Exception:
-                speed_mph = 0.0
+        speed_mph = float(car.get("speed_mph", 0.0))
 
         if speed_mph < self.low_speed_threshold_mph:
             self._low_speed_duration_s += dt
@@ -626,19 +630,20 @@ class AssettoCorsa(gym.Env):
 
         if self._low_speed_duration_s >= self.low_speed_truncate_seconds:
             truncated = True
+            reason = "low_speed"
+
+        if data["lap"]["get_lap_count"] == 2:
+            truncated = True
+            reason = "lap_complete"
+
+        if self._episode_step >= self.max_episode_steps:
+            truncated = True
+            reason = "time_limit"
 
         if truncated:
             self._low_speed_duration_s = 0.0
 
-        if data["lap"]["get_lap_count"] == 2:
-            truncated = True
-        # if sum(data["car"]["damage"]) > 150:
-        #     terminated = True
-
-        if self._episode_step >= self.max_episode_steps:
-            truncated = True
-
-        return terminated, truncated
+        return terminated, truncated, reason
 
     def reset(
         self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None
@@ -662,7 +667,7 @@ class AssettoCorsa(gym.Env):
         self.telemetry.send_reset()
         self.telemetry.clear_queue()
 
-        time.sleep(0.1)
+        self._wait_for_telemetry(timeout=1.0)
 
         self._episode_step = 0
         obs = self._get_observation()
@@ -687,16 +692,16 @@ class AssettoCorsa(gym.Env):
 
         info = {"episode_step": self._episode_step}
 
-        time.sleep(1.5)
+        for _ in range(15):
+            if self._wait_for_telemetry(timeout=0.1):
+                break
 
         obs = self._get_observation()
 
         if self.racing_line_positions is not None and self._last_obs:
             position = np.array(self._last_obs.get("car", {}).get("world_location", [0, 0, 0]))
-            # full search to find true spawn index
             closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=-1)
             self._current_racing_line_index = closest_idx
-            # compute arc to spawn so first step reward starts from 0 delta
             segments = (
                 self.racing_line_positions[1 : closest_idx + 1]
                 - self.racing_line_positions[0:closest_idx]
@@ -710,31 +715,34 @@ class AssettoCorsa(gym.Env):
         return obs, info
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Execute one step in the environment.
-
-        Args:
-            action: [steering, throttle, brake] in normalized ranges
-
-        Returns:
-            observation, reward, terminated, truncated, info
-        """
         action = np.asarray(action).flatten()
 
         steering = float(np.clip(action[0], -1.0, 1.0))
-        throttle = float(np.clip(action[1], 0.0, 1.0))
-        brake = float(np.clip(action[2], 0.0, 1.0))
+        accel = float(np.clip(action[1], -1.0, 1.0))
+
+        if accel >= 0.0:
+            throttle = accel
+            brake = 0.0
+        else:
+            throttle = 0.0
+            brake = abs(accel)
 
         self.controller.left_joystick_float(x_value_float=steering, y_value_float=0.0)
         self.controller.right_trigger_float(value_float=throttle)
         self.controller.left_trigger_float(value_float=brake)
         self.controller.update()
 
+        self._wait_for_telemetry(timeout=self.timeout)
         obs = self._get_observation()
         data = self._last_obs
 
         reward = self._calculate_reward(obs, data)
+        terminated, truncated, reason = self._check_done(obs, data)
 
-        terminated, truncated = self._check_done(obs, data)
+        if reason == "low_speed":
+            reward -= 50.0
+        elif reason == "lap_complete":
+            reward += 100.0
 
         self._episode_step += 1
 
@@ -743,6 +751,7 @@ class AssettoCorsa(gym.Env):
             "steering": steering,
             "throttle": throttle,
             "brake": brake,
+            "termination_reason": reason,
         }
 
         return obs, reward, terminated, truncated, info
@@ -913,7 +922,7 @@ def create_mock_env(device: Optional[torch.device] = None):
         def __init__(self, device):
             self.device = device
             self.action_spec = Bounded(
-                low=-1.0, high=1.0, shape=(3,), dtype=torch.float32, device=device
+                low=-1.0, high=1.0, shape=(2,), dtype=torch.float32, device=device
             )
             self.observation_spec = Composite(
                 pixels=UnboundedContinuous(shape=(4, 84, 84), dtype=torch.float32, device=device)
@@ -1086,7 +1095,7 @@ def main() -> None:
 
         while True:
             if env._last_obs is None:
-                time.sleep(0.05)
+                env._wait_for_telemetry(timeout=0.05)
                 obs = env._get_observation()
                 continue
 
@@ -1152,7 +1161,6 @@ def main() -> None:
                 print("\nEpisode done, resetting...")
                 obs, info = env.reset()
 
-            time.sleep(0.05)
             print()
 
     except KeyboardInterrupt:

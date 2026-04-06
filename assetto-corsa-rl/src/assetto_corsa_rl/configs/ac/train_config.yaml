@@ -22,6 +22,9 @@ train:
 
   use_async: true # set to true to run collector + learner as separate processes (torch.multiprocessing)
   queue_size: 65536 # max transitions in the inter-process queue before back-pressure kicks in
+  queue_target_size: 0 # desired steady-state async queue size (set <=0 to disable target backpressure)
+  queue_target_hysteresis: 1000000000000 # tolerance band around queue_target_size to prevent oscillation
+  queue_backpressure_sleep_ms: 2.0 # collector sleep interval while queue is above target band
   sync_every: 200 # collector syncs actor weights from shared memory every N steps
 
   # ── wandb sweep ────────────────────────────────────────────────────────────
