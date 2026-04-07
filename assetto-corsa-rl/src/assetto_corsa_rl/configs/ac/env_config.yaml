@@ -78,11 +78,11 @@ environment:
     tyre_3_temp_o: true
 
     # Racing-line localization / upcoming turn shape
-    rl_distance_to_centerline: false
-    rl_heading_error_rad: false
-    rl_curve_lookahead_short: false
-    rl_curve_lookahead_mid: false
-    rl_curve_lookahead_far: false
+    rl_distance_to_centerline: true
+    rl_heading_error_rad: true
+    rl_curve_lookahead_short: true
+    rl_curve_lookahead_mid: true
+    rl_curve_lookahead_far: true
 
   # Normalization bounds for observations (min, max) - scales to [-1, 1]
   # Only used if normalize_observations=true

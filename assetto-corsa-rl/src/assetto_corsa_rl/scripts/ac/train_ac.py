@@ -65,19 +65,36 @@ def _do_train():
         log_success("Observation normalization enabled", bold=True)
 
     try:
+
+        def _to_jsonable(value):
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, (list, tuple)):
+                return [_to_jsonable(v) for v in value]
+            if isinstance(value, dict):
+                return {str(k): _to_jsonable(v) for k, v in value.items()}
+            return str(value)
+
+        wandb_cfg = {k: _to_jsonable(v) for k, v in vars(cfg).items() if not k.startswith("_")}
+
         wandb_kwargs = {
             "project": cfg.wandb_project,
-            "config": {"seed": cfg.seed, "total_steps": cfg.total_steps},
+            "config": wandb_cfg,
         }
         if getattr(cfg, "wandb_entity", None):
             wandb_kwargs["entity"] = cfg.wandb_entity
         if getattr(cfg, "wandb_name", None):
             wandb_kwargs["name"] = cfg.wandb_name
         wandb.init(**wandb_kwargs)
-        is_sweep_run = bool(
-            (wandb.run is not None and getattr(wandb.run, "sweep_id", None))
-            or os.getenv("WANDB_SWEEP_ID")
-        )
+        run_sweep_id = getattr(wandb.run, "sweep_id", None) if wandb.run is not None else None
+        env_sweep_id = os.getenv("WANDB_SWEEP_ID")
+        is_sweep_run = bool(run_sweep_id)
+        if env_sweep_id and not is_sweep_run:
+            log_warning(
+                "WANDB_SWEEP_ID is set but this run has no sweep_id; skipping sweep overrides."
+            )
         if wandb.run is not None and is_sweep_run:
             for k, v in dict(wandb.config).items():
                 if hasattr(cfg, k) and not k.startswith("_"):

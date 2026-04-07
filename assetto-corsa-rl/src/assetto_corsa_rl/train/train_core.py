@@ -150,10 +150,11 @@ def _collate_sequence_batch(batch):
         ]
         vector_keys = [k for k in keys if k in ("vector",)]
 
-        # Get max sequence lengths for each key
+        # Get max sequence lengths for each key that may vary over time.
+        # This includes feature-like tensors and optional telemetry vector sequences.
         max_lens = {}
         has_variable_length = False
-        for key in feature_keys:
+        for key in set(feature_keys + vector_keys):
             lens = [get_seq_length(b, key) for b in batch]
             if any(l is not None for l in lens):
                 max_len = max(l for l in lens if l is not None)

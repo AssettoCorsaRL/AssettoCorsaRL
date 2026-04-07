@@ -5,7 +5,6 @@ from torch import nn
 import torch.nn.functional as F
 import lightning as pl
 from typing import Tuple, Optional
-import lpips
 import sys
 import os
 
@@ -227,6 +226,7 @@ class ConvVAE(pl.LightningModule):
         attention_resolutions: Tuple[int, ...] = (10,),
         dropout: float = 0.1,
         mse_weight: float = 0.0,
+        use_lpips: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -238,11 +238,17 @@ class ConvVAE(pl.LightningModule):
         self.im_shape = im_shape  # (H, W)
         self.base_channels = base_channels
         self.mse_weight = mse_weight
+        self.use_lpips = bool(use_lpips)
 
-        self.lpips = lpips.LPIPS(net="vgg")
-        # freeze LPIPS network
-        for param in self.lpips.parameters():
-            param.requires_grad = False
+        if self.use_lpips:
+            import lpips
+
+            self.lpips = lpips.LPIPS(net="vgg")
+            # freeze LPIPS network
+            for param in self.lpips.parameters():
+                param.requires_grad = False
+        else:
+            self.lpips = None
 
         channels = [base_channels * m for m in channel_multipliers]
 
@@ -349,13 +355,19 @@ class ConvVAE(pl.LightningModule):
         # scale from [0, 1] to [-1, 1]
         recon_scaled = recon * 2.0 - 1.0
         target_scaled = target * 2.0 - 1.0
-        lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
+        lpips_loss = None
+        if self.lpips is not None:
+            lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
 
         if self.mse_weight > 0:
             mse_loss = F.mse_loss(recon, target, reduction="mean")
-            loss = lpips_loss + self.mse_weight * mse_loss
-        else:
+            loss = self.mse_weight * mse_loss
+            if lpips_loss is not None:
+                loss = loss + lpips_loss
+        elif lpips_loss is not None:
             loss = lpips_loss
+        else:
+            loss = F.mse_loss(recon, target, reduction="mean")
 
         return loss
 
@@ -384,10 +396,11 @@ class ConvVAE(pl.LightningModule):
         if self.mse_weight > 0:
             recon_scaled = recon * 2.0 - 1.0
             target_scaled = target * 2.0 - 1.0
-            lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
             mse_loss = F.mse_loss(recon, target, reduction="mean")
-            self.log("train/lpips", lpips_loss, on_step=True, on_epoch=True, sync_dist=True)
             self.log("train/mse", mse_loss, on_step=True, on_epoch=True, sync_dist=True)
+            if self.lpips is not None:
+                lpips_loss = self.lpips(recon_scaled, target_scaled).mean()
+                self.log("train/lpips", lpips_loss, on_step=True, on_epoch=True, sync_dist=True)
 
         # log images every 500 steps
         if self.global_step > 0 and self.global_step % 500 == 0:
@@ -507,13 +520,22 @@ def load_vae_encoder(
         sys.stdout = open(os.devnull, "w")
 
     try:
-        vae = ConvVAE(z_dim=z_dim, in_channels=vae_in_channels)
+        vae = ConvVAE(z_dim=z_dim, in_channels=vae_in_channels, use_lpips=False)
     finally:
         if not verbose:
             sys.stdout.close()
             sys.stdout = old_stdout
 
-    vae.load_state_dict(checkpoint["state_dict"], strict=True)
+    # Encoder-only use does not build the LPIPS module, so drop those weights
+    # before strict loading to keep checkpoint validation for core VAE params.
+    lpips_prefix = "lpips."
+    lpips_keys = [k for k in state_dict.keys() if k.startswith(lpips_prefix)]
+    if lpips_keys:
+        state_dict = {k: v for k, v in state_dict.items() if not k.startswith(lpips_prefix)}
+        if verbose:
+            print(f"Skipping {len(lpips_keys)} LPIPS parameter(s) while loading encoder checkpoint")
+
+    vae.load_state_dict(state_dict, strict=True)
     vae = vae.to(device)
 
     vae_encoder = VAEEncoder(vae)

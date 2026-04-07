@@ -25,18 +25,26 @@ model:
 
   alpha: 0.2
   alpha_lr: 3e-4
-  alpha_min: 1e-2
+  alpha_min: 1e-4
   alpha_max: 1.0
 
-  batch_size: 256
+  batch_size: 128
   replay_size: 750_000
 
   updates_per_step: 1
   actor_update_delay: 2
-  max_updates_per_tick: 6 # reduce to limit queue growth, increase if gpu utalization hella low
+  max_updates_per_tick: 8 # baseline learner headroom; adaptive logic scales this by queue pressure
+  max_update_credit: 256 # max queued learner updates to absorb temporary collector spikes
+  drain_max_items: 16384 # max queue items drained per learner loop iteration
+  adaptive_updates: true # scale learner update cap from queue fill ratio
+  adaptive_queue_low: 0.35 # below this ratio, learner relaxes update cap
+  adaptive_queue_high: 0.75 # above this ratio, learner boosts update cap
+  adaptive_scale_up: 2.0 # multiplier when queue is high
+  adaptive_scale_down: 0.5 # multiplier when queue is low
+  adaptive_max_updates_per_tick: 32 # hard cap for adaptive boosts
   max_items: 32768
 
-  freeze_encoder_steps: 100_000_000 # "never" unfreeze it (uses less vram)
+  freeze_encoder_steps: 10
 
   load_initial: true
 
@@ -51,16 +59,16 @@ model:
   noise_sigma: 0.45
 
   #* exploration - IGNORE IF use_noisy=true
-  explore_start: 0
-  explore_end: 0
-  explore_steps: 1
+  explore_start: 0.20
+  explore_end: 0.05
+  explore_steps: 400_000
 
   #* Ornstein-Uhlenbeck exploration noise (temporally correlated)
   ou_theta: 0.2 # mean-reversion speed (higher = less autocorrelation, faster reversion to mean)
   ou_sigma: [0.3, 0.3, 0.1]
   ou_mu: [0, 0.7, 0] # drift towards throttle (steer centered at 0)
   ou_noise_scale: 0.35 # initial scale for additive noise after start_steps
-  ou_noise_decay_steps: 1 # steps over which additive OU noise decays to zero
+  ou_noise_decay_steps: 250000 # steps over which additive OU noise decays to zero
 
   #TODO: remove ts
   min_q_target: -5000000 # don't clip, it doesn't do anything anyway
@@ -72,6 +80,6 @@ model:
   compile_models: false
   compile_mode: "reduce-overhead" # default | reduce-overhead | max-autotune
 
-  lr_scheduler: "linear" # cosine | linear | none
+  lr_scheduler: "none" # cosine | linear | none
   lr_warmup_steps: 0 # gradient-update steps of linear warmup (0 to disable)
   lr_min_factor: 0.05 # minimum LR = initial_lr * lr_min_factor

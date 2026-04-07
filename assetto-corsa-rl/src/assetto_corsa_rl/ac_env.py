@@ -31,7 +31,7 @@ class AssettoCorsa(gym.Env):
         observation_keys: Optional[list] = None,
         input_config: Optional[Dict[str, bool]] = None,
         racing_line_path: str = "racing_lines.json",
-        constant_reward_per_ms: float = -0.5,
+        constant_reward_per_ms: float = 0.0,
         reward_per_m_advanced_along_centerline: float = 1.0,
         final_speed_reward_per_m_per_s: float = 0.05,
         low_speed_threshold_mph: float = 2.5,
@@ -42,6 +42,9 @@ class AssettoCorsa(gym.Env):
         observation_image_shape: Tuple[int, int] = (84, 84),
         normalize_observations: bool = True,
         normalization_bounds: Optional[Dict[str, list]] = None,
+        max_progress_per_step_m: float = 12.0,
+        max_progress_speed_margin_m: float = 3.0,
+        max_reward_dt_s: float = 0.1,
     ):
         super().__init__()
 
@@ -61,6 +64,9 @@ class AssettoCorsa(gym.Env):
 
         self.normalize_observations = normalize_observations
         self.normalization_bounds = normalization_bounds or {}
+        self.max_progress_per_step_m = float(max_progress_per_step_m)
+        self.max_progress_speed_margin_m = float(max_progress_speed_margin_m)
+        self.max_reward_dt_s = float(max_reward_dt_s)
 
         self.racing_line = None
         self.racing_line_positions = None
@@ -125,7 +131,17 @@ class AssettoCorsa(gym.Env):
         self._low_speed_duration_s = 0.0
         self._last_done_check_time = time.monotonic()
         self._telemetry_missing_start_time = None
-        self._last_telemetry_frame_time = 0.0
+        self._last_telemetry_frame_id = -1
+        self._last_reward_time = time.monotonic()
+        self._last_reward_debug = {
+            "raw_meters_progress": 0.0,
+            "clipped_meters_progress": 0.0,
+            "max_progress": 0.0,
+            "progress_was_clipped": False,
+            "raw_dt_s": 0.0,
+            "used_dt_s": 0.0,
+            "dt_was_clipped": False,
+        }
 
     def _compute_racing_line_context(self, data: Dict[str, Any]) -> Dict[str, float]:
         defaults = {
@@ -162,6 +178,7 @@ class AssettoCorsa(gym.Env):
             seg_xy = seg[:2]
             seg_norm = float(np.linalg.norm(seg_xy))
 
+            #  lateral offset to centerline (left/right of tangent) in meters.
             if seg_norm > 1e-6:
                 rel_xy = position[:2] - p0[:2]
                 cross_z = seg_xy[0] * rel_xy[1] - seg_xy[1] * rel_xy[0]
@@ -460,27 +477,34 @@ class AssettoCorsa(gym.Env):
         return normalized
 
     def _wait_for_telemetry(self, timeout: float = 1.0) -> bool:
-        """Wait for new telemetry data from queue with timeout.
-
-        Uses queue-based polling instead of sleep, which is non-blocking
-        and only waits if data is actually unavailable.
+        """Wait for new telemetry data with timeout.
 
         Args:
             timeout: Maximum seconds to wait for telemetry data
 
         Returns:
-            True if new (different) data received and stored, False if timeout or duplicate
+            True if data received, False if timeout
         """
-        start_time = time.monotonic()
-        while time.monotonic() - start_time < timeout:
-            data = self.telemetry.get_from_queue(block=False)
-            if data is not None:
-                if self._last_obs is None or data != self._last_obs:
-                    with self.telemetry._lock:
-                        self._last_obs = data
-                    return True
-            time.sleep(0.001)  # Small sleep to avoid busy-waiting
-        return False
+        data = self.telemetry.get_from_queue(block=True, timeout=timeout)
+        if data is None:
+            return False
+
+        # If telemetry includes frame_id, require monotonic progress so stale repeats
+        # do not advance the env step/reward.
+        frame_id = data.get("frame_id") if isinstance(data, dict) else None
+        if frame_id is None:
+            return True
+
+        try:
+            frame_id = int(frame_id)
+        except (TypeError, ValueError):
+            return True
+
+        if frame_id <= self._last_telemetry_frame_id:
+            return False
+
+        self._last_telemetry_frame_id = frame_id
+        return True
 
     def _load_racing_line(self, filepath: str) -> None:
         """Load racing line from JSON file or URL.
@@ -552,7 +576,7 @@ class AssettoCorsa(gym.Env):
         if self.racing_line_positions is None or self.racing_line_segment_lengths is None:
             return 0.0
 
-        closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=100)
+        closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=30)
         n = len(self.racing_line_positions)
 
         idx_diff = closest_idx - self._current_racing_line_index
@@ -587,9 +611,27 @@ class AssettoCorsa(gym.Env):
 
     # inspired by linesight-rl: https://github.com/Linesight-RL/linesight/tree/main
     def _calculate_reward(self, obs, data):
+        if data is None:
+            self._last_reward_debug = {
+                "raw_meters_progress": 0.0,
+                "clipped_meters_progress": 0.0,
+                "max_progress": 0.0,
+                "progress_was_clipped": False,
+                "raw_dt_s": 0.0,
+                "used_dt_s": 0.0,
+                "dt_was_clipped": False,
+            }
+            return 0.0
+
+        now = time.monotonic()
+        raw_dt = max(1e-3, now - self._last_reward_time)
+        self._last_reward_time = now
+        dt = min(raw_dt, self.max_reward_dt_s)
+        dt_was_clipped = bool(dt < raw_dt)
+
         position = np.array(data["car"]["world_location"][:3])
         current_meters = self._calculate_meters_advanced(position)
-        meters_progress = current_meters - self._meters_advanced
+        raw_meters_progress = current_meters - self._meters_advanced
         self._meters_advanced = current_meters
 
         n = len(self.racing_line_positions)
@@ -600,15 +642,29 @@ class AssettoCorsa(gym.Env):
         velocity = np.array(data.get("car", {}).get("velocity", [0, 0, 0]), dtype=np.float32)
         speed = float(np.linalg.norm(velocity))
 
-        # off_track = float(data.get("car", {}).get("tyres_off_track", 0))
-        # damage = float(sum(data["car"].get("damage", [0])))
+        max_progress = max(
+            self.max_progress_per_step_m,
+            speed * dt + self.max_progress_speed_margin_m,
+        )
+        meters_progress = float(np.clip(raw_meters_progress, 0.0, max_progress))
+        progress_was_clipped = bool(meters_progress < raw_meters_progress)
 
         reward = (
-            self.constant_reward_per_ms * 0.002  # Reduced from 0.02 (10x smaller penalty)
-            + meters_progress * self.reward_per_m_advanced_along_centerline
+            # self.constant_reward_per_ms * 0.02 +
+            meters_progress
+            * self.reward_per_m_advanced_along_centerline
         )
 
         self._last_speed = speed
+        self._last_reward_debug = {
+            "raw_meters_progress": float(raw_meters_progress),
+            "clipped_meters_progress": float(meters_progress),
+            "max_progress": float(max_progress),
+            "progress_was_clipped": progress_was_clipped,
+            "raw_dt_s": float(raw_dt),
+            "used_dt_s": float(dt),
+            "dt_was_clipped": dt_was_clipped,
+        }
         return reward
 
     def _check_done(self, obs, data):
@@ -660,6 +716,8 @@ class AssettoCorsa(gym.Env):
         self._low_speed_duration_s = 0.0
         self._last_done_check_time = time.monotonic()
         self._telemetry_missing_start_time = None
+        self._last_telemetry_frame_id = -1
+        self._last_reward_time = time.monotonic()
 
         self.controller.reset()
         self.controller.update()
@@ -667,6 +725,7 @@ class AssettoCorsa(gym.Env):
         self.telemetry.send_reset()
         self.telemetry.clear_queue()
 
+        # Wait for telemetry to respond to reset (up to 1 second)
         self._wait_for_telemetry(timeout=1.0)
 
         self._episode_step = 0
@@ -700,8 +759,10 @@ class AssettoCorsa(gym.Env):
 
         if self.racing_line_positions is not None and self._last_obs:
             position = np.array(self._last_obs.get("car", {}).get("world_location", [0, 0, 0]))
+            # full search to find true spawn index
             closest_idx, _ = self._find_closest_point_on_racing_line(position, search_window=-1)
             self._current_racing_line_index = closest_idx
+            # compute arc to spawn so first step reward starts from 0 delta
             segments = (
                 self.racing_line_positions[1 : closest_idx + 1]
                 - self.racing_line_positions[0:closest_idx]
@@ -732,17 +793,45 @@ class AssettoCorsa(gym.Env):
         self.controller.left_trigger_float(value_float=brake)
         self.controller.update()
 
-        self._wait_for_telemetry(timeout=self.timeout)
+        frame_time = 1.0 / 50.0  # 50 Hz frame rate (20ms per frame)
+
+        got_fresh_telemetry = self._wait_for_telemetry(timeout=frame_time)
         obs = self._get_observation()
         data = self._last_obs
+
+        if not got_fresh_telemetry or data is None:
+            now = time.monotonic()
+            if self._telemetry_missing_start_time is None:
+                self._telemetry_missing_start_time = now
+
+            # Prevent long telemetry gaps from inflating dt on the next reward step.
+            self._last_reward_time = now
+
+            telemetry_missing_for = now - self._telemetry_missing_start_time
+            terminated = False
+            truncated = telemetry_missing_for >= self.timeout
+            reason = "telemetry_timeout" if truncated else None
+
+            self._episode_step += 1
+            info = {
+                "episode_step": self._episode_step,
+                "steering": steering,
+                "throttle": throttle,
+                "brake": brake,
+                "termination_reason": reason,
+                "telemetry_missing_for_s": float(telemetry_missing_for),
+            }
+            return obs, 0.0, terminated, truncated, info
+
+        self._telemetry_missing_start_time = None
 
         reward = self._calculate_reward(obs, data)
         terminated, truncated, reason = self._check_done(obs, data)
 
         if reason == "low_speed":
-            reward -= 50.0
+            reward -= 5.0
         elif reason == "lap_complete":
-            reward += 100.0
+            reward += 20.0
 
         self._episode_step += 1
 
@@ -752,6 +841,13 @@ class AssettoCorsa(gym.Env):
             "throttle": throttle,
             "brake": brake,
             "termination_reason": reason,
+            "raw_meters_progress": self._last_reward_debug["raw_meters_progress"],
+            "clipped_meters_progress": self._last_reward_debug["clipped_meters_progress"],
+            "progress_clip_limit_m": self._last_reward_debug["max_progress"],
+            "progress_was_clipped": self._last_reward_debug["progress_was_clipped"],
+            "reward_raw_dt_s": self._last_reward_debug["raw_dt_s"],
+            "reward_used_dt_s": self._last_reward_debug["used_dt_s"],
+            "reward_dt_was_clipped": self._last_reward_debug["dt_was_clipped"],
         }
 
         return obs, reward, terminated, truncated, info
@@ -1095,7 +1191,7 @@ def main() -> None:
 
         while True:
             if env._last_obs is None:
-                env._wait_for_telemetry(timeout=0.05)
+                time.sleep(0.05)
                 obs = env._get_observation()
                 continue
 
@@ -1125,7 +1221,7 @@ def main() -> None:
             # obs, reward, terminated, truncated, info = env.step(action)
 
             reward = env._calculate_reward(obs, env._last_obs)
-            terminated, truncated = env._check_done(obs, env._last_obs)
+            terminated, truncated, reason = env._check_done(obs, env._last_obs)
 
             key_to_idx = {k: i for i, k in enumerate(env.observation_keys)}
 

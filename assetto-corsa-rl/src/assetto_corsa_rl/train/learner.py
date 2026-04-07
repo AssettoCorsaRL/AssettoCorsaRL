@@ -115,6 +115,16 @@ class LearnerWorker:
         self._max_update_credit = int(
             getattr(cfg, "max_update_credit", self._max_updates_per_tick * 4)
         )
+        self._drain_max_items = max(1, int(getattr(cfg, "drain_max_items", 16384)))
+        self._adaptive_updates = bool(getattr(cfg, "adaptive_updates", True))
+        self._adaptive_queue_low = float(getattr(cfg, "adaptive_queue_low", 0.35))
+        self._adaptive_queue_high = float(getattr(cfg, "adaptive_queue_high", 0.75))
+        self._adaptive_scale_up = float(getattr(cfg, "adaptive_scale_up", 2.0))
+        self._adaptive_scale_down = float(getattr(cfg, "adaptive_scale_down", 0.5))
+        self._adaptive_max_updates_per_tick = max(
+            self._max_updates_per_tick,
+            int(getattr(cfg, "adaptive_max_updates_per_tick", self._max_updates_per_tick * 4)),
+        )
         self._critic_updates_count = 0
         self._actor_updates_count = 0
         self._alpha_updates_count = 0
@@ -130,11 +140,18 @@ class LearnerWorker:
         self._queue_capacity = int(getattr(cfg, "queue_size", 0))
         self._collector_enqueue_full_count = 0
         self._collector_actor_infer_calls = 0
+        self._last_effective_max_updates = float(self._max_updates_per_tick)
+        self._last_update_credit = 0.0
+        self._last_queue_fill_ratio = -1.0
 
         _default_log_updates = int(getattr(cfg, "updates_per_step", 1)) * int(
             getattr(cfg, "log_interval", 1000)
         )
         self._log_update_every: int = int(getattr(cfg, "log_update_every", _default_log_updates))
+        log_info(
+            "Learner schedule: updates_per_step=%s actor_update_delay=%s log_update_every=%s"
+            % (self._updates_per_step, self._actor_update_delay, self._log_update_every)
+        )
 
         if getattr(cfg, "compile_models", False):
             log_info("Applying torch.compile to actor / critic networks...")
@@ -248,26 +265,40 @@ class LearnerWorker:
 
         while self.stop_event is None or not self.stop_event.is_set():
             # Pull newly collected transitions first.
-            n = self._drain_transitions(max_items=4096)
+            n = self._drain_transitions(max_items=self._drain_max_items)
             self._last_drain_count = n
             self.total_steps += n
 
-            # Do not build a huge training debt during random warmup.
             if self.total_steps < start_steps:
                 _update_credit = 0
 
-            # Check if we have enough data and credit to train.
+            queue_fill_ratio = -1.0
+            if self._queue_size >= 0 and self._queue_capacity > 0:
+                queue_fill_ratio = float(self._queue_size) / float(self._queue_capacity)
+            self._last_queue_fill_ratio = queue_fill_ratio
+
+            effective_max_updates = self._max_updates_per_tick
+            if self._adaptive_updates and queue_fill_ratio >= 0.0:
+                if queue_fill_ratio >= self._adaptive_queue_high:
+                    boosted = int(max(1.0, effective_max_updates * self._adaptive_scale_up))
+                    effective_max_updates = min(self._adaptive_max_updates_per_tick, boosted)
+                elif queue_fill_ratio <= self._adaptive_queue_low:
+                    reduced = int(max(1.0, effective_max_updates * self._adaptive_scale_down))
+                    effective_max_updates = max(1, reduced)
+
+            effective_credit_cap = max(self._max_update_credit, effective_max_updates * 4)
+
             has_enough_data = (
                 self.total_steps >= start_steps and len(self.rb) >= self.cfg.batch_size
             )
 
             if has_enough_data and n > 0:
                 _update_credit += n * self._updates_per_step
-                _update_credit = min(_update_credit, self._max_update_credit)
+                _update_credit = min(_update_credit, effective_credit_cap)
 
             k = 0
             if has_enough_data and _update_credit > 0:
-                k = int(min(_update_credit, self._max_updates_per_tick))
+                k = int(min(_update_credit, effective_max_updates))
 
             if k > 0:
                 for _ in range(k):
@@ -280,6 +311,9 @@ class LearnerWorker:
             else:
                 self._last_train_batches = 0
                 time.sleep(0.001)
+
+            self._last_effective_max_updates = float(effective_max_updates)
+            self._last_update_credit = float(_update_credit)
 
             self._maybe_log_and_save(epsilon=self._last_epsilon)
 
@@ -339,6 +373,18 @@ class LearnerWorker:
                     self._collector_enqueue_full_count = int(item["collector/enqueue_full_count"])
                 if "collector/actor_infer_calls" in item:
                     self._collector_actor_infer_calls = int(item["collector/actor_infer_calls"])
+                continue
+
+            if isinstance(item, dict) and item.get("_batch"):
+                transitions = item.get("transitions", [])
+                if transitions:
+                    self._add_transitions_batch(transitions)
+                    count += len(transitions)
+                continue
+
+            if isinstance(item, (list, tuple)) and item and isinstance(item[0], dict):
+                self._add_transitions_batch(list(item))
+                count += len(item)
                 continue
 
             # Accumulate transition for batch add
@@ -577,10 +623,22 @@ class LearnerWorker:
         actions_b = self._to_device_fast(batch["action"], dtype=torch.float32)
         rewards_b = self._to_device_fast(batch["reward"], dtype=torch.float32)
 
-        if "done" in batch.keys():
+        terminated_mask = None
+        truncated_mask = None
+        if "terminated" in batch.keys():
+            terminated_mask = self._to_device_fast(batch["terminated"], dtype=torch.float32)
+        if "truncated" in batch.keys():
+            truncated_mask = self._to_device_fast(batch["truncated"], dtype=torch.float32)
+
+        if terminated_mask is not None:
+            done_mask = terminated_mask
+            if (
+                bool(getattr(self.cfg, "treat_truncated_as_done", False))
+                and truncated_mask is not None
+            ):
+                done_mask = torch.maximum(done_mask, truncated_mask)
+        elif "done" in batch.keys():
             done_mask = self._to_device_fast(batch["done"], dtype=torch.float32)
-        elif "terminated" in batch.keys():
-            done_mask = self._to_device_fast(batch["terminated"], dtype=torch.float32)
         else:
             done_mask = torch.zeros_like(rewards_b)
 
@@ -628,16 +686,14 @@ class LearnerWorker:
             next_log_prob = self._as_batch_column(next_log_prob, B)
 
             next_q1 = self.q1_target.module(
-                pixels=None,
+                pixels=next_pixels,
                 action=next_actions,
                 vector=next_obs_vector,
-                img_features=next_features,
             )
             next_q2 = self.q2_target.module(
-                pixels=None,
+                pixels=next_pixels,
                 action=next_actions,
                 vector=next_obs_vector,
-                img_features=next_features,
             )
             next_min_q = torch.min(next_q1, next_q2)
             next_min_q = self._as_batch_column(next_min_q, B)
@@ -718,6 +774,8 @@ class LearnerWorker:
         # ══════════════════════════════════════════════════════════════════
         self._updates_count += 1
         self._maybe_refresh_expert_priorities()
+        actor_updated_this_step = False
+        alpha_updated_this_step = False
 
         if self._updates_count % self._actor_update_delay == 0:
             actor_params = actor_net.forward_features(features, vector=obs_vector)
@@ -772,6 +830,7 @@ class LearnerWorker:
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.max_grad_norm)
             self.actor_opt.step()
             self._actor_updates_count += 1
+            actor_updated_this_step = True
 
             # ── Alpha update ───────────────────────────────────────────
             alpha_loss = None
@@ -786,6 +845,7 @@ class LearnerWorker:
                 torch.nn.utils.clip_grad_norm_([self.log_alpha], max_norm=1.0)
                 self.alpha_opt.step()
                 self._alpha_updates_count += 1
+                alpha_updated_this_step = True
 
                 alpha_min = float(getattr(self.cfg, "alpha_min", 0.01))
                 alpha_max = float(getattr(self.cfg, "alpha_max", 1.0))
@@ -824,7 +884,9 @@ class LearnerWorker:
             return
 
         try:
-            current_entropy = -log_prob_new.mean().item() if log_prob_new is not None else 0.0
+            current_entropy = (
+                -log_prob_new.mean().item() if log_prob_new is not None else float("nan")
+            )
             if new_actions is not None:
                 new_actions_log = new_actions.reshape(-1, new_actions.shape[-1])
             else:
@@ -836,8 +898,9 @@ class LearnerWorker:
                 "loss/critic_loss": critic_loss.item(),
                 "loss/q1_loss": q1_masked.item(),
                 "loss/q2_loss": q2_masked.item(),
-                "loss/actor_loss": actor_loss.item() if actor_loss is not None else 0.0,
-                "loss/alpha_loss": alpha_loss.item() if alpha_loss is not None else 0.0,
+                # Keep gaps when delayed actor/alpha updates are skipped, instead of fake zeros.
+                "loss/actor_loss": (actor_loss.item() if actor_loss is not None else float("nan")),
+                "loss/alpha_loss": (alpha_loss.item() if alpha_loss is not None else float("nan")),
                 # ── Critic Q-value statistics ─────────────────────────
                 "critic/q_target_mean": q_target.mean().item(),
                 "critic/q_target_std": q_target.std().item(),
@@ -868,22 +931,30 @@ class LearnerWorker:
                 # ── Actor policy statistics ───────────────────────────
                 "actor/entropy": current_entropy,
                 "actor/entropy_loss_scalar": (
-                    (alpha.detach() * current_entropy) if log_prob_new is not None else 0.0
+                    (alpha.detach() * current_entropy) if log_prob_new is not None else float("nan")
                 ),
                 "actor/alpha": alpha.item(),
                 "actor/log_alpha": self.log_alpha.item() if self.log_alpha is not None else 0.0,
                 # ── Action statistics (per action dim) ────────────────
                 "action/steer_mean": (
-                    new_actions_log[:, 0].mean().item() if new_actions_log is not None else 0.0
+                    new_actions_log[:, 0].mean().item()
+                    if new_actions_log is not None
+                    else float("nan")
                 ),
                 "action/steer_std": (
-                    new_actions_log[:, 0].std().item() if new_actions_log is not None else 0.0
+                    new_actions_log[:, 0].std().item()
+                    if new_actions_log is not None
+                    else float("nan")
                 ),
                 "action/accel_mean": (
-                    new_actions_log[:, 1].mean().item() if new_actions_log is not None else 0.0
+                    new_actions_log[:, 1].mean().item()
+                    if new_actions_log is not None
+                    else float("nan")
                 ),
                 "action/accel_std": (
-                    new_actions_log[:, 1].std().item() if new_actions_log is not None else 0.0
+                    new_actions_log[:, 1].std().item()
+                    if new_actions_log is not None
+                    else float("nan")
                 ),
                 # ── Policy parameters (mu, sigma) ────────────────────
                 "actor/loc_mean": (
@@ -898,13 +969,13 @@ class LearnerWorker:
                 ),
                 # ── Log probability (entropy from policy output) ───────
                 "actor/log_prob_mean": (
-                    log_prob_new.mean().item() if log_prob_new is not None else 0.0
+                    log_prob_new.mean().item() if log_prob_new is not None else float("nan")
                 ),
                 "actor/log_prob_std": (
-                    log_prob_new.std().item() if log_prob_new is not None else 0.0
+                    log_prob_new.std().item() if log_prob_new is not None else float("nan")
                 ),
                 "actor/log_prob_min": (
-                    log_prob_new.min().item() if log_prob_new is not None else 0.0
+                    log_prob_new.min().item() if log_prob_new is not None else float("nan")
                 ),
                 # ── Reward statistics ─────────────────────────────────
                 "reward/batch_mean": rewards_b.mean().item(),
@@ -920,6 +991,8 @@ class LearnerWorker:
                 "updates/critic_updates_count": self._critic_updates_count,
                 "updates/actor_updates_count": self._actor_updates_count,
                 "updates/alpha_updates_count": self._alpha_updates_count,
+                "updates/actor_updated_this_log": float(actor_updated_this_step),
+                "updates/alpha_updated_this_log": float(alpha_updated_this_step),
                 "updates/total_env_steps": self.total_steps,
             }
             self._log(log_dict)
@@ -1086,6 +1159,11 @@ class LearnerWorker:
                     # ── Async pacing / queue telemetry ────────────────
                     "pacing/drain_transitions_last_iter": float(self._last_drain_count),
                     "pacing/train_batches_last_iter": float(self._last_train_batches),
+                    "pacing/effective_max_updates_per_tick": float(
+                        self._last_effective_max_updates
+                    ),
+                    "pacing/update_credit": float(self._last_update_credit),
+                    "pacing/drain_max_items": float(self._drain_max_items),
                     "queue/size": float(self._queue_size) if self._queue_size >= 0 else -1.0,
                     "queue/capacity": float(self._queue_capacity),
                     "queue/fill_ratio": (
@@ -1093,6 +1171,7 @@ class LearnerWorker:
                         if self._queue_size >= 0 and self._queue_capacity > 0
                         else -1.0
                     ),
+                    "queue/fill_ratio_observed": float(self._last_queue_fill_ratio),
                     "collector/enqueue_full_count": float(self._collector_enqueue_full_count),
                     "collector/actor_infer_calls": float(self._collector_actor_infer_calls),
                     # ── Learning rate schedule (if available) ──────────

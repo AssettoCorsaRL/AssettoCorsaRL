@@ -6,7 +6,7 @@ from copy import deepcopy
 
 import torch
 from torch import nn, multiprocessing
-from tensordict.nn import TensorDictModule
+from tensordict.nn import InteractionType, TensorDictModule
 from tensordict import TensorDict
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
@@ -330,6 +330,7 @@ class SACPolicy:
             in_keys=["loc", "scale"],
             distribution_class=TanhNormal,
             distribution_kwargs=dist_kwargs,
+            default_interaction_type=InteractionType.RANDOM,
             return_log_prob=True,
         )
 

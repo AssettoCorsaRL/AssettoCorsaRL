@@ -1,14 +1,13 @@
 import torch
 import queue
 import types
-import threading
-import time
 from tensordict import TensorDict
 
 from .train_utils import (
     OrnsteinUhlenbeckNoise,
     expand_actions_for_envs,
     extract_reward_and_done,
+    fix_action_shape,
     get_inner,
     pack_pixels,
     sample_random_action,
@@ -47,12 +46,15 @@ class CollectorWorker:
         self.current_td = self.env.reset()
         self.current_episode_return = torch.zeros(cfg.num_envs, device=self.device)
         self._queue_capacity = int(getattr(cfg, "queue_size", 0))
-        self._queue_target_size = int(getattr(cfg, "queue_target_size", 1000))
-        self._queue_target_hysteresis = int(getattr(cfg, "queue_target_hysteresis", 200))
-        self._queue_backpressure_sleep_ms = float(getattr(cfg, "queue_backpressure_sleep_ms", 2.0))
+        self._queue_batch_size = max(1, int(getattr(cfg, "queue_batch_size", 64)))
+        self._queue_batch_max_delay_steps = max(
+            1, int(getattr(cfg, "queue_batch_max_delay_steps", 4))
+        )
+        self._pending_transitions = []
+        self._steps_since_batch_flush = 0
         self._enqueue_full_count = 0
         self._actor_infer_calls = 0
-        self._queue_backpressure_active = False
+        self._warned_action_shape_mismatch = False
 
         # self._weight_sync_thread = None
         # self._stop_weight_sync = threading.Event()
@@ -155,14 +157,13 @@ class CollectorWorker:
         sync_every = int(getattr(self.cfg, "sync_every", 100))
 
         while self.stop_event is None or not self.stop_event.is_set():
-            self._maybe_apply_queue_backpressure()
-
             if self.total_steps % sync_every == 0:
                 self._sync_weights()
 
             self._step_and_store()
             # broadcast epsilon so the learner can log it.
             if self.total_steps % sync_every == 0:
+                self._flush_pending_transitions(force=True)
                 eps = self._exploration_epsilon()
                 queue_size = None
                 try:
@@ -170,59 +171,21 @@ class CollectorWorker:
                 except Exception:
                     queue_size = None
 
-                try:
-                    self.transitions_queue.put_nowait(
-                        {
-                            "_meta": True,
-                            "epsilon": eps,
-                            "queue_size": queue_size,
-                            "queue_capacity": self._queue_capacity,
-                            "collector/enqueue_full_count": self._enqueue_full_count,
-                            "collector/actor_infer_calls": self._actor_infer_calls,
-                        }
-                    )
-                except Exception:
-                    pass
+                self._enqueue(
+                    {
+                        "_meta": True,
+                        "epsilon": eps,
+                        "queue_size": queue_size,
+                        "queue_capacity": self._queue_capacity,
+                        "collector/enqueue_full_count": self._enqueue_full_count,
+                        "collector/actor_infer_calls": self._actor_infer_calls,
+                    }
+                )
 
                 self._enqueue_full_count = 0
                 self._actor_infer_calls = 0
 
-    def _safe_qsize(self):
-        try:
-            return int(self.transitions_queue.qsize())
-        except Exception:
-            return None
-
-    def _maybe_apply_queue_backpressure(self):
-        """Throttle collection to keep queue around a target size.
-
-        Uses hysteresis to avoid toggling every iteration.
-        """
-        target = self._queue_target_size
-        if target <= 0:
-            return
-
-        qsize = self._safe_qsize()
-        if qsize is None:
-            return
-
-        margin = max(1, self._queue_target_hysteresis)
-        upper = target + margin
-        lower = max(0, target - margin)
-
-        if not self._queue_backpressure_active and qsize >= upper:
-            self._queue_backpressure_active = True
-
-        if self._queue_backpressure_active:
-            sleep_s = max(0.0005, self._queue_backpressure_sleep_ms / 1000.0)
-            while self._queue_backpressure_active:
-                if self.stop_event is not None and self.stop_event.is_set():
-                    break
-                qnow = self._safe_qsize()
-                if qnow is None or qnow <= lower:
-                    self._queue_backpressure_active = False
-                    break
-                time.sleep(sleep_s)
+        self._flush_pending_transitions(force=True)
 
     def _exploration_epsilon(self):
         """Linearly anneal epsilon from explore_start → explore_end over explore_steps.
@@ -240,12 +203,14 @@ class CollectorWorker:
         steps = int(getattr(self.cfg, "explore_steps", 100_000))
         if steps <= 0:
             return float(end)
-        frac = min(1.0, float(self.total_steps) / float(steps))
+        post_warmup_steps = max(0, self.total_steps - start_steps)
+        frac = min(1.0, float(post_warmup_steps) / float(steps))
         return float(start + (end - start) * frac)
 
     def _step_and_store(self):
         """Take one step per env, accumulate into sequences, push complete sequences."""
         target_batch = self.current_td.batch_size
+        action_dim = int(self.env.action_spec.shape[-1])
         start_steps = int(getattr(self.cfg, "start_steps", 0))
         in_random_phase = self.total_steps < start_steps
 
@@ -283,18 +248,33 @@ class CollectorWorker:
                             vector=vector_for_engine,
                         )
                         self._actor_infer_calls += 1
-                        actor_action = action_1.unsqueeze(0)
+                        actor_action = fix_action_shape(
+                            action_1.unsqueeze(0), batch_size=1, action_dim=action_dim
+                        )
                     except Exception:
                         actor_action = None
 
                 if actor_action is None:
                     actor_output = self.actor(actor_input)
                     self._actor_infer_calls += 1
-                    has_action = (
-                        "action" in actor_output.keys()
-                        and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
-                    )
-                    actor_action = actor_output["action"] if has_action else None
+                    if "action" in actor_output.keys():
+                        raw_action = actor_output["action"]
+                        if raw_action.ndim == 1:
+                            raw_action = raw_action.unsqueeze(0)
+                        if (
+                            raw_action.shape[-1] != action_dim
+                            and not self._warned_action_shape_mismatch
+                        ):
+                            log_info(
+                                "[COLLECTOR] Actor action dim mismatch: got %s expected %s; applying fix_action_shape"
+                                % (raw_action.shape[-1], action_dim)
+                            )
+                            self._warned_action_shape_mismatch = True
+                        actor_action = fix_action_shape(
+                            raw_action, batch_size=raw_action.shape[0], action_dim=action_dim
+                        )
+                    else:
+                        actor_action = None
 
                 if use_noisy and actor_action is None:
                     for m in self.actor.modules():
@@ -302,11 +282,15 @@ class CollectorWorker:
                             m.sample_noise()
                     actor_output = self.actor(actor_input)
                     self._actor_infer_calls += 1
-                    has_action = (
-                        "action" in actor_output.keys()
-                        and actor_output["action"].shape[-1] == self.env.action_spec.shape[-1]
-                    )
-                    actor_action = actor_output["action"] if has_action else None
+                    if "action" in actor_output.keys():
+                        raw_action = actor_output["action"]
+                        if raw_action.ndim == 1:
+                            raw_action = raw_action.unsqueeze(0)
+                        actor_action = fix_action_shape(
+                            raw_action, batch_size=raw_action.shape[0], action_dim=action_dim
+                        )
+                    else:
+                        actor_action = None
 
             if use_noisy:
                 eps = 0.0
@@ -333,15 +317,19 @@ class CollectorWorker:
                     else sample_random_action(self.cfg.num_envs, dev=self.device)
                 )
 
-            # if not in_random_phase and actor_action is not None:
-            #     decay_frac = min(
-            #         1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
-            #     )
-            #     noise_scale = self._ou_noise_scale * (1.0 - decay_frac)
-            #     if noise_scale > 1e-6:
-            #         ou_delta = self.ou_noise.sample() - self.ou_noise.mu[0]
-            #         actions = actions + noise_scale * ou_delta
-            #         actions = actions.clamp(-1.0, 1.0)
+            if not in_random_phase:
+                decay_frac = min(
+                    1.0, float(self.total_steps - start_steps) / max(1, self._ou_noise_decay_steps)
+                )
+                noise_scale = self._ou_noise_scale * (1.0 - decay_frac)
+                if noise_scale > 1e-6:
+                    # Smoothly interpolate from OU-driven exploration to policy-driven control.
+                    # At noise_scale=1.0 this matches pure OU (same behavior as start_steps phase).
+                    ou_sample = self.ou_noise.sample()
+                    actions = (1.0 - noise_scale) * actions.to(
+                        ou_sample.device
+                    ) + noise_scale * ou_sample
+                    actions = actions.clamp(-1.0, 1.0)
 
         actions_step = expand_actions_for_envs(actions, target_batch)
         action_td = TensorDict({"action": actions_step}, batch_size=target_batch)
@@ -352,6 +340,11 @@ class CollectorWorker:
         terminated = (
             td_next["terminated"].view(self.cfg.num_envs).to(self.device).to(torch.bool)
             if "terminated" in td_next.keys()
+            else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
+        )
+        truncated = (
+            td_next["truncated"].view(self.cfg.num_envs).to(self.device).to(torch.bool)
+            if "truncated" in td_next.keys()
             else torch.zeros(self.cfg.num_envs, dtype=torch.bool, device=self.device)
         )
 
@@ -367,6 +360,7 @@ class CollectorWorker:
 
         cur_vector = inner_obs.get("vector", None)
         next_vector = td_next.get("vector", None)
+        transitions = []
 
         for i in range(self.cfg.num_envs):
             transition = {
@@ -376,6 +370,7 @@ class CollectorWorker:
                 "reward": rewards[i].unsqueeze(0).cpu().to(torch.float16),
                 "done": dones[i].unsqueeze(0).cpu(),  # bool is fine
                 "terminated": terminated[i].unsqueeze(0).cpu(),
+                "truncated": truncated[i].unsqueeze(0).cpu(),
             }
             if cur_vector is not None:
                 v = cur_vector[i] if cur_vector.dim() > 1 else cur_vector
@@ -384,7 +379,9 @@ class CollectorWorker:
                 nv = next_vector[i] if next_vector.dim() > 1 else next_vector
                 transition["next_vector"] = nv.cpu().float()
 
-            self._enqueue(transition)
+            transitions.append(transition)
+
+        self._enqueue_transitions(transitions)
 
         self._handle_episode_end(rewards, dones)
         self._maybe_reset(td_next, dones)
@@ -403,10 +400,7 @@ class CollectorWorker:
             if d.item():
                 ep_ret = float(self.current_episode_return[i].item())
                 self.current_episode_return[i] = 0.0
-                try:
-                    self.transitions_queue.put_nowait({"_meta": True, "episode_return": ep_ret})
-                except Exception:
-                    pass
+                self._enqueue({"_meta": True, "episode_return": ep_ret})
 
     def _maybe_reset(self, td_next, dones):
         self.current_td = td_next
@@ -443,6 +437,37 @@ class CollectorWorker:
                 self.transitions_queue.put_nowait(item)
             except queue.Empty:
                 pass
+
+    def _enqueue_transitions(self, transitions):
+        if not transitions:
+            return
+
+        self._pending_transitions.extend(transitions)
+        self._steps_since_batch_flush += 1
+
+        should_flush = (
+            len(self._pending_transitions) >= self._queue_batch_size
+            or self._steps_since_batch_flush >= self._queue_batch_max_delay_steps
+        )
+        if should_flush:
+            self._flush_pending_transitions(force=False)
+
+    def _flush_pending_transitions(self, force: bool = False):
+        if not self._pending_transitions:
+            return
+
+        if not force and len(self._pending_transitions) < self._queue_batch_size:
+            return
+
+        while self._pending_transitions:
+            chunk = self._pending_transitions[: self._queue_batch_size]
+            del self._pending_transitions[: self._queue_batch_size]
+            self._enqueue({"_batch": True, "transitions": chunk})
+            if not force:
+                break
+
+        if not self._pending_transitions:
+            self._steps_since_batch_flush = 0
 
     def _sync_weights(self):
         if self.weights_version is None or self.weights_version.value == self._local_version:

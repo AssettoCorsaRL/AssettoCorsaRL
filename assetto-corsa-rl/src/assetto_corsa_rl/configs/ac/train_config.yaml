@@ -2,7 +2,7 @@ train:
   start_steps: 10_000 # number of random action steps to collect before training begins
   total_steps: 2_000_000
   log_interval: 1000 # how often (in steps) to print/log training stats
-  log_update_every: 400 # how often (in gradient updates) to log loss metrics (reduced from 2000 for frequent visibility)
+  log_update_every: 500 # how often (in gradient updates) to log loss metrics (higher = less logging overhead)
   save_interval: 50_000 # how often (in steps) to save model checkpoints
   save_interval_replaybuffer: null # how often (in steps) to save the replay buffer (null = disabled)
 
@@ -22,9 +22,8 @@ train:
 
   use_async: true # set to true to run collector + learner as separate processes (torch.multiprocessing)
   queue_size: 65536 # max transitions in the inter-process queue before back-pressure kicks in
-  queue_target_size: 0 # desired steady-state async queue size (set <=0 to disable target backpressure)
-  queue_target_hysteresis: 1000000000000 # tolerance band around queue_target_size to prevent oscillation
-  queue_backpressure_sleep_ms: 2.0 # collector sleep interval while queue is above target band
+  queue_batch_size: 64 # transitions per queue payload from collector to learner
+  queue_batch_max_delay_steps: 4 # flush batch even if small after N collector steps
   sync_every: 200 # collector syncs actor weights from shared memory every N steps
 
   # ── wandb sweep ────────────────────────────────────────────────────────────
@@ -33,7 +32,7 @@ train:
   sweep_count: 20
 
   # ── CPU inference optimization ──────────────────────────────────────────────
-  cpu_num_threads: 4 # threads for CPU inference
+  cpu_num_threads: 3 # threads for CPU inference (lower = cheaper collector CPU cost)
   cpu_inference_backend: "eager" # compile | jit | eager (used by collector SACInferenceEngine on CPU)
   quantize_actor: false # INT8 quantization for actor (faster but slightly less accurate)
   quantize_cnn_only: false # Quantize only frozen CNN encoder (safe, recommended)
