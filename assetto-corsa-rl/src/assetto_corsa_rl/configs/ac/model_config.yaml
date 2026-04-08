@@ -59,16 +59,16 @@ model:
   noise_sigma: 0.45
 
   #* exploration - IGNORE IF use_noisy=true
-  explore_start: 0.20
-  explore_end: 0.05
-  explore_steps: 400_000
+  explore_start: 0
+  explore_end: 0
+  explore_steps: 1
 
   #* Ornstein-Uhlenbeck exploration noise (temporally correlated)
   ou_theta: 0.2 # mean-reversion speed (higher = less autocorrelation, faster reversion to mean)
   ou_sigma: [0.3, 0.3, 0.1]
   ou_mu: [0, 0.7, 0] # drift towards throttle (steer centered at 0)
-  ou_noise_scale: 0.35 # initial scale for additive noise after start_steps
-  ou_noise_decay_steps: 250000 # steps over which additive OU noise decays to zero
+  ou_noise_scale: 0 # initial scale for additive noise after start_steps
+  ou_noise_decay_steps: 10 # steps over which additive OU noise decays to zero
 
   #TODO: remove ts
   min_q_target: -5000000 # don't clip, it doesn't do anything anyway

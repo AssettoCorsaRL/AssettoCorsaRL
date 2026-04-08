@@ -652,22 +652,59 @@ class Trainer:
             _flush_log_queue(log_queue)
         except KeyboardInterrupt:
             log_warning("KeyboardInterrupt — stopping workers...")
+        except Exception as e:
+            log_warning(f"Async log-forward loop failed (continuing shutdown): {e}")
         finally:
             stop_event.set()
             collector_proc.join(timeout=10)
             learner_proc.join(timeout=30)
+
+            if collector_proc.exitcode not in (None, 0):
+                log_warning(f"collector exited with code {collector_proc.exitcode}")
+            if learner_proc.exitcode not in (None, 0):
+                log_warning(f"learner exited with code {learner_proc.exitcode}")
+
             if collector_proc.is_alive():
                 log_warning("collector did not exit cleanly, terminating.")
                 collector_proc.terminate()
+                collector_proc.join(timeout=5)
             if learner_proc.is_alive():
                 log_warning("learner did not exit cleanly, terminating.")
                 learner_proc.terminate()
+                learner_proc.join(timeout=5)
+
+            for q in (log_queue, transitions_queue):
+                try:
+                    q.close()
+                except Exception:
+                    pass
+                try:
+                    q.join_thread()
+                except Exception:
+                    pass
+
+            for proc in (collector_proc, learner_proc):
+                try:
+                    proc.close()
+                except Exception:
+                    pass
+
             log_success("All worker processes stopped.")
 
 
 def _flush_log_queue(log_queue: mp.Queue) -> None:
     """Drain all pending log items from *log_queue* and forward to wandb."""
     import wandb
+
+    if getattr(_flush_log_queue, "_wandb_broken", False):
+        while True:
+            try:
+                log_queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        return
 
     while True:
         try:
@@ -686,6 +723,9 @@ def _flush_log_queue(log_queue: mp.Queue) -> None:
             wandb.log(data, step=step)
         except Exception as e:
             print(f"[ERROR] wandb.log failed: {type(e).__name__}: {e}")
+            setattr(_flush_log_queue, "_wandb_broken", True)
+            print("[WARNING] Disabling further W&B log forwarding for this run.")
+            break
 
 
 def collect_initial_data(env, rb, cfg, current_td, device):

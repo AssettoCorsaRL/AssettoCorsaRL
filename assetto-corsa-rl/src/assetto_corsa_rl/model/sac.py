@@ -7,10 +7,10 @@ from copy import deepcopy
 import torch
 from torch import nn, multiprocessing
 from tensordict.nn import InteractionType, TensorDictModule
+from tensordict.nn.distributions import NormalParamExtractor
 from tensordict import TensorDict
 from torchrl.envs.libs.gym import GymEnv
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
-import torch.nn.functional as F
 
 from .noisy import NoisyLazyLinear
 
@@ -21,27 +21,6 @@ def _init_orthogonal(module, gain=1.0):
         nn.init.orthogonal_(module.weight, gain=gain)
         if module.bias is not None:
             nn.init.zeros_(module.bias)
-
-
-class BoundedNormalParams(nn.Module):
-    def __init__(self, min_scale, max_scale, loc_bound=5.0):
-        super().__init__()
-        self.register_buffer("min_scale", min_scale)
-        self.register_buffer("max_scale", max_scale)
-        self.register_buffer("log_scale_min", torch.log(min_scale))
-        self.register_buffer("log_scale_max", torch.log(max_scale))
-        self.loc_bound = loc_bound
-
-    def forward(self, x):
-        loc, log_scale = x.chunk(2, dim=-1)
-
-        # smooth, differentiable, keeps gradients flowing
-        loc = self.loc_bound * torch.tanh(loc / self.loc_bound)
-
-        log_scale = self.log_scale_max - F.softplus(self.log_scale_max - log_scale)
-        log_scale = self.log_scale_min + F.softplus(log_scale - self.log_scale_min)
-        scale = torch.exp(log_scale)
-        return {"loc": loc, "scale": scale}
 
 
 class ActorNet(nn.Module):
@@ -66,6 +45,8 @@ class ActorNet(nn.Module):
         self.stateful_inference = False
         self._context_state = None
         self.context_lstm = None
+        self.register_buffer("_min_scale", min_scale)
+        self.register_buffer("_max_scale", max_scale)
         mlp_input_size = fusion_size
 
         def make_lin(i, o):
@@ -81,7 +62,10 @@ class ActorNet(nn.Module):
             nn.LeakyReLU(),
             nn.Dropout(p=dropout),
             make_lin(num_cells, 2 * action_dim),
-            BoundedNormalParams(min_scale=min_scale, max_scale=max_scale),
+        )
+        self.param_extractor = NormalParamExtractor(
+            scale_mapping="biased_softplus_1.0",
+            scale_lb=float(min_scale.min().item()),
         )
         self._init_weights()
 
@@ -130,7 +114,9 @@ class ActorNet(nn.Module):
         if x.ndim == 3:
             x = x[:, -1, :]
 
-        return self.mlp(x)
+        loc, scale = self.param_extractor(self.mlp(x))
+        scale = torch.clamp(scale, min=self._min_scale, max=self._max_scale)
+        return {"loc": loc, "scale": scale}
 
     def forward(self, pixels, vector=None):
         if pixels.ndim == 5:
@@ -373,12 +359,16 @@ class SACPolicy:
             obs_dim,
         )
 
+        q_in_keys = ["pixels", "action"]
+        if obs_dim > 0:
+            q_in_keys.append("vector")
+
         # wrap in ValueOperator for state dict / parameter access,
         # but call via .module() directly in trainer to pass raw tensors
-        self.q1 = ValueOperator(module=q1_net, in_keys=["pixels", "action"])
-        self.q2 = ValueOperator(module=q2_net, in_keys=["pixels", "action"])
-        self.q1_target = ValueOperator(module=q1_net_target, in_keys=["pixels", "action"])
-        self.q2_target = ValueOperator(module=q2_net_target, in_keys=["pixels", "action"])
+        self.q1 = ValueOperator(module=q1_net, in_keys=q_in_keys)
+        self.q2 = ValueOperator(module=q2_net, in_keys=q_in_keys)
+        self.q1_target = ValueOperator(module=q1_net_target, in_keys=q_in_keys)
+        self.q2_target = ValueOperator(module=q2_net_target, in_keys=q_in_keys)
 
         self.q1_target.load_state_dict(self.q1.state_dict())
         self.q2_target.load_state_dict(self.q2.state_dict())

@@ -14,22 +14,22 @@ except Exception:
 # NOTE: all arguments for this script are the .yamls
 
 import time
-import math
 import sys
 import os
-import yaml
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import wandb
 from tensordict import TensorDict
 import subprocess, time as _time  # noqa: E401
+from torchrl.collectors import SyncDataCollector
+from torchrl.objectives import SoftUpdate
+from torchrl.objectives.sac import SACLoss
+from torchrl.trainers.algorithms import SACTrainer
 
 try:
     from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
-    from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
     from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances  # type: ignore
 except Exception:
@@ -39,7 +39,6 @@ except Exception:
         sys.path.insert(0, src_path)
     from assetto_corsa_rl.ac_env import create_transformed_env, get_device  # type: ignore
     from assetto_corsa_rl.model.sac import SACPolicy  # type: ignore
-    from assetto_corsa_rl.train.train_core import run_training_loop  # type: ignore
     from assetto_corsa_rl.train.logging_utils import print_banner, print_section_header, log_info, log_success, log_warning, log_error  # type: ignore
     from assetto_corsa_rl.train.train_utils import activate_ac_window, kill_all_ac_instances  # type: ignore
 
@@ -49,6 +48,83 @@ try:
     from assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml
 except Exception:
     from ...src.assetto_corsa_rl.cli_registry import cli_command, load_cfg_from_yaml  # type: ignore
+
+
+def _build_sac_trainer(cfg, env, actor, q1, replay_buffer, device):
+    total_frames = int(getattr(cfg, "total_steps", 1_000_000))
+    frames_per_batch = max(1, int(getattr(cfg, "frames_per_batch", 1024)))
+    updates_per_step = max(1, int(getattr(cfg, "updates_per_step", 1)))
+    optim_steps_per_batch = max(
+        1,
+        int(getattr(cfg, "optim_steps_per_batch", frames_per_batch * updates_per_step)),
+    )
+
+    collector_device_cfg = getattr(cfg, "collector_device", None)
+    collector_device = device if collector_device_cfg is None else torch.device(collector_device_cfg)
+
+    collector = SyncDataCollector(
+        create_env_fn=env,
+        policy=actor,
+        frames_per_batch=frames_per_batch,
+        total_frames=total_frames,
+        device=collector_device,
+        policy_device=device,
+        storing_device=torch.device("cpu"),
+        init_random_frames=max(0, int(getattr(cfg, "start_steps", 0))),
+    )
+
+    target_entropy = -float(env.action_spec.shape[-1])
+    loss_module = SACLoss(
+        actor_network=actor,
+        qvalue_network=q1,
+        num_qvalue_nets=2,
+        loss_function="smooth_l1",
+        delay_actor=False,
+        delay_qvalue=True,
+        alpha_init=float(getattr(cfg, "alpha", 0.2)),
+        target_entropy=target_entropy,
+        fixed_alpha=False,
+    ).to(device)
+    loss_module.make_value_estimator(gamma=float(getattr(cfg, "gamma", 0.99)))
+
+    optimizer = torch.optim.Adam(
+        loss_module.parameters(),
+        lr=float(getattr(cfg, "lr", 3e-4)),
+        eps=1e-8,
+    )
+
+    tau = float(getattr(cfg, "tau", 0.01))
+    soft_update_eps = float(max(0.0, min(1.0, 1.0 - tau)))
+    target_net_updater = SoftUpdate(loss_module, eps=soft_update_eps)
+
+    checkpoint_dir = Path(getattr(cfg, "checkpoint_dir", "models"))
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    trainer_state_path = checkpoint_dir / "sac_trainer_state.pt"
+
+    trainer = SACTrainer(
+        collector=collector,
+        total_frames=total_frames,
+        frame_skip=1,
+        optim_steps_per_batch=optim_steps_per_batch,
+        loss_module=loss_module,
+        optimizer=optimizer,
+        replay_buffer=replay_buffer,
+        batch_size=int(getattr(cfg, "batch_size", 128)),
+        clip_grad_norm=True,
+        clip_norm=float(getattr(cfg, "max_grad_norm", 1.0)),
+        progress_bar=True,
+        seed=int(getattr(cfg, "seed", 0)),
+        save_trainer_interval=max(1, int(getattr(cfg, "save_interval", 10_000))),
+        log_interval=max(1, int(getattr(cfg, "log_interval", 10_000))),
+        save_trainer_file=str(trainer_state_path),
+        enable_logging=True,
+        log_rewards=True,
+        log_actions=True,
+        log_observations=False,
+        target_net_updater=target_net_updater,
+    )
+
+    return trainer, loss_module
 
 
 def _do_train():
@@ -230,19 +306,6 @@ def _do_train():
 
     log_success("Target network initialized")
 
-    actor_lr = getattr(cfg, "actor_lr", cfg.lr)
-    critic_lr = getattr(cfg, "critic_lr", cfg.lr)
-
-    actor_opt = torch.optim.Adam(actor.parameters(), lr=actor_lr, weight_decay=1e-5)
-    critic_opt = torch.optim.Adam(
-        list(q1.parameters()) + list(q2.parameters()), lr=critic_lr, weight_decay=1e-5
-    )
-
-    log_alpha = nn.Parameter(torch.tensor(math.log(cfg.alpha), device=device))
-    alpha_opt = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
-    target_entropy = -float(env.action_spec.shape[-1])
-    log_info(f"Target entropy: {target_entropy}")
-
     def _collate_sequence_batch(batch):
         """Collate a list of sequence TensorDicts into a single batched TensorDict."""
         if isinstance(batch, TensorDict):
@@ -313,50 +376,50 @@ def _do_train():
         log_warning(f"Replay buffer path specified but file not found: {replay_buffer_path}")
 
     use_async = bool(getattr(cfg, "use_async", False))
-    if getattr(cfg, "use_expert_demonstrations", False) and not use_async:
+    if use_async:
+        log_warning("cfg.use_async=true is ignored when using TorchRL SACTrainer (sync collector path)")
+
+    if getattr(cfg, "use_expert_demonstrations", False):
         log_warning(
-            "Skipping expert demonstrations: current replay buffer stores sequence chunks "
-            "(features/actions/...), while demo loader emits single-step transitions "
-            "(pixels/next_pixels)."
+            "Skipping expert demonstrations in SACTrainer path: current demo loader is wired "
+            "for the legacy custom learner/replay schema."
         )
-    elif getattr(cfg, "use_expert_demonstrations", False) and use_async:
-        log_info("Expert demonstrations will be loaded by LearnerWorker (async mode)")
 
-    total_steps = 0
-    episode_returns = []
-    current_episode_return = torch.zeros(1, device=device)
+    if getattr(cfg, "save_interval_replaybuffer", None) is not None:
+        log_warning("save_interval_replaybuffer is ignored in SACTrainer path")
 
-    start_time = time.time()
+    if bool(getattr(cfg, "ac_reset_interval_steps", 0)):
+        log_warning("Periodic AC process restarts are not integrated in SACTrainer path")
 
     print_banner("Training Started")
-    print_section_header("SAC Training Loop")
+    print_section_header("TorchRL SACTrainer Loop")
 
-    run_training_loop(
-        env,
-        rb,
-        cfg,
-        current_td,
-        actor,
-        q1,
-        q2,
-        q1_target,
-        q2_target,
-        actor_opt,
-        critic_opt,
-        log_alpha,
-        alpha_opt,
-        target_entropy,
-        device,
-        storage=storage,
-        start_time=start_time,
-        total_steps=total_steps,
-        episode_returns=episode_returns,
-        current_episode_return=current_episode_return,
-        env_kwargs=env_kwargs,
-    )
+    trainer, loss_module = _build_sac_trainer(cfg, env, actor, q1, rb, device)
+    trainer.train()
 
-    wandb.finish()
-    log_success("WandB finished. Training complete!")
+    save_dir = Path(getattr(cfg, "checkpoint_dir", "models"))
+    save_dir.mkdir(parents=True, exist_ok=True)
+    final_ckpt = {
+        "actor_state": actor.state_dict(),
+        "q1_state": q1.state_dict(),
+        "q2_state": q2.state_dict(),
+        "q1_target_state": q1_target.state_dict(),
+        "q2_target_state": q2_target.state_dict(),
+        "loss_module_state": loss_module.state_dict(),
+        "steps": int(getattr(cfg, "total_steps", 0)),
+    }
+    torch.save(final_ckpt, save_dir / "sac_last.pt")
+    log_success(f"Saved final checkpoint: {save_dir / 'sac_last.pt'}")
+
+    try:
+        if wandb.run is not None:
+            wandb.finish()
+            log_success("WandB finished. Training complete!")
+        else:
+            log_success("Training complete!")
+    except Exception as e:
+        log_warning(f"WandB finish failed (non-fatal): {e}")
+        log_success("Training complete (W&B connection was already closed).")
 
 
 @cli_command(group="ac", name="train", help="Train SAC agent in Assetto Corsa")

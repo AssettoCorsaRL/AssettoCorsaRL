@@ -95,9 +95,10 @@ def configure_cpu(
 class _ForwardCore(nn.Module):
     """
     Flat, JIT-trace-friendly forward:
-        (pixels, vector) → (loc, scale)
+        (pixels, vector) -> (loc, scale)
 
-    No Python dicts cross the module boundary; everything is tensors.
+    Supports either Tensor outputs passed through a NormalParamExtractor,
+    or legacy dict/tuple loc-scale outputs.
     """
 
     def __init__(
@@ -105,13 +106,13 @@ class _ForwardCore(nn.Module):
         cnn: nn.Module,
         mlp: nn.Module,
         obs_dim: int,
+        param_extractor: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.cnn = cnn
+        self.mlp = mlp
         self.obs_dim = obs_dim
-        # pull the final BoundedNormalParams out so we can return a tuple
-        self.mlp_body = mlp[:-1]  # everything except last module
-        self.param_head = mlp[-1]  # BoundedNormalParams
+        self.param_extractor = param_extractor
 
     def forward(
         self,
@@ -125,17 +126,21 @@ class _ForwardCore(nn.Module):
         else:
             x = feat
 
-        x = self.mlp_body(x)
-        params = self.param_head(x)
-        return params["loc"], params["scale"]
+        params = self.mlp(x)
+        if self.param_extractor is not None:
+            loc, scale = self.param_extractor(params)
+            return loc, scale
+
+        if isinstance(params, dict):
+            return params["loc"], params["scale"]
+
+        if isinstance(params, (tuple, list)) and len(params) >= 2:
+            return params[0], params[1]
+
+        raise RuntimeError("Actor parameter head must return loc/scale outputs")
 
 
 class SACInferenceEngine:
-    """
-    Zero-overhead inference wrapper.  Accepts raw tensors, returns raw
-    tensors.  No TensorDict, no ProbabilisticActor, no distribution
-    object creation — just math.
-    """
 
     def __init__(
         self,
@@ -166,6 +171,7 @@ class SACInferenceEngine:
 
         cnn = actor_net.cnn
         mlp = actor_net.mlp
+        param_extractor = getattr(actor_net, "param_extractor", None)
 
         try:
             dk = policy.actor.distribution_kwargs
@@ -180,7 +186,10 @@ class SACInferenceEngine:
                 else torch.tensor(dk["high"], dtype=torch.float32)
             )
         except Exception:
-            action_dim = actor_net.mlp[-2].out_features // 2  # derive from model
+            last_linear = next(
+                (m for m in reversed(list(actor_net.mlp)) if isinstance(m, nn.Linear)), None
+            )
+            action_dim = int(last_linear.out_features // 2) if last_linear is not None else 2
             self._lo = torch.full((action_dim,), -1.0)
             self._hi = torch.full((action_dim,), 1.0)
         self._range = self._hi - self._lo
@@ -209,12 +218,12 @@ class SACInferenceEngine:
 
         self._dummy_vec = torch.empty(1, max(self.obs_dim, 1))
 
-        self._build_backend(cnn, mlp, backend)
+        self._build_backend(cnn, mlp, param_extractor, backend)
 
         self._warmup_and_bench(warmup, benchmark_n)
 
-    def _build_backend(self, cnn, mlp, backend: str):
-        core = _ForwardCore(cnn, mlp, self.obs_dim)
+    def _build_backend(self, cnn, mlp, param_extractor, backend: str):
+        core = _ForwardCore(cnn, mlp, self.obs_dim, param_extractor=param_extractor)
         core.eval()
 
         if backend == "jit":
