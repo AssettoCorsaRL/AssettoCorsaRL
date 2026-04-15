@@ -15,6 +15,14 @@ from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
 from .noisy import NoisyLazyLinear
 
 
+def _module_device(module: nn.Module, fallback: torch.device | None = None) -> torch.device:
+    """Return the device for a module's parameters (or fallback if empty)."""
+    try:
+        return next(module.parameters()).device
+    except StopIteration:
+        return fallback if fallback is not None else torch.device("cpu")
+
+
 def _init_orthogonal(module, gain=1.0):
     """Apply orthogonal init to a Linear or Conv2d layer."""
     if isinstance(module, (nn.Linear, nn.Conv2d)):
@@ -105,6 +113,8 @@ class ActorNet(nn.Module):
 
     def forward_features(self, img_feat, vector=None):
         if vector is not None and self.obs_dim > 0:
+            if img_feat.ndim == 2 and vector.ndim == 1:
+                vector = vector.unsqueeze(0)
             if img_feat.ndim == 3 and vector.ndim == 2:
                 vector = vector.unsqueeze(1)
             x = torch.cat([img_feat, vector], dim=-1)
@@ -119,12 +129,29 @@ class ActorNet(nn.Module):
         return {"loc": loc, "scale": scale}
 
     def forward(self, pixels, vector=None):
+        target_device = _module_device(self.cnn, fallback=self._min_scale.device)
+        if isinstance(pixels, torch.Tensor) and pixels.device != target_device:
+            pixels = pixels.to(target_device, non_blocking=True)
+        if isinstance(vector, torch.Tensor) and vector.device != target_device:
+            vector = vector.to(target_device, non_blocking=True)
+
+        squeeze_batch = False
+        if pixels.ndim == 3:
+            pixels = pixels.unsqueeze(0)
+            squeeze_batch = True
+            if vector is not None and vector.ndim == 1:
+                vector = vector.unsqueeze(0)
+
         if pixels.ndim == 5:
             b, t, c, h, w = pixels.shape
             img_feat = self.cnn(pixels.view(b * t, c, h, w)).view(b, t, -1)
         else:
             img_feat = self.cnn(pixels)
-        return self.forward_features(img_feat, vector=vector)
+
+        out = self.forward_features(img_feat, vector=vector)
+        if squeeze_batch:
+            out = {k: v.squeeze(0) for k, v in out.items()}
+        return out
 
 
 class CriticNet(nn.Module):
@@ -150,6 +177,7 @@ class CriticNet(nn.Module):
         self.stateful_inference = False
         self._context_state = None
         self.action_dim = action_dim
+        self.register_buffer("_dummy_device", torch.empty(0, device=device))
 
         self.action_embed = nn.Sequential(
             nn.Linear(action_dim, 128, device=device),
@@ -180,6 +208,14 @@ class CriticNet(nn.Module):
         self._context_state = None
 
     def forward(self, pixels, action, vector=None, img_features=None):
+        target_device = _module_device(self.cnn, fallback=self._dummy_device.device)
+        if isinstance(pixels, torch.Tensor) and pixels.device != target_device:
+            pixels = pixels.to(target_device, non_blocking=True)
+        if isinstance(action, torch.Tensor) and action.device != target_device:
+            action = action.to(target_device, non_blocking=True)
+        if isinstance(vector, torch.Tensor) and vector.device != target_device:
+            vector = vector.to(target_device, non_blocking=True)
+
         if img_features is None:
             img_features = self.cnn(pixels)
 

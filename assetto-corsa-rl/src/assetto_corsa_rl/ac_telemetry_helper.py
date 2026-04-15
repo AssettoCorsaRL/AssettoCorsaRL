@@ -27,6 +27,7 @@ class Telemetry:
         auto_start_receiver: bool = False,
         capture_images: bool = True,
         image_capture_rate: float = 0.1,
+        open_recv_socket: bool = True,
     ):
         self.host = host
         self.send_port = send_port
@@ -34,12 +35,11 @@ class Telemetry:
         self.timeout = timeout
         self.capture_images = capture_images
         self.image_capture_rate = image_capture_rate
+        self.open_recv_socket = open_recv_socket
 
-        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-        self.recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.recv_socket.bind((self.host, self.recv_port))
-        self.recv_socket.settimeout(self.timeout)
+        # Initialize all attributes up front so cleanup is safe even if socket setup fails.
+        self.send_socket = None
+        self.recv_socket = None
 
         self._receiver_thread = None
         self._receiver_running = False
@@ -55,7 +55,14 @@ class Telemetry:
         self._ac_window_handle = None
         self._sct = None
 
-        if auto_start_receiver:
+        self.send_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        if self.open_recv_socket:
+            self.recv_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.recv_socket.bind((self.host, self.recv_port))
+            self.recv_socket.settimeout(self.timeout)
+
+        if auto_start_receiver and self.recv_socket is not None:
             self.start_receiver()
 
         if self.capture_images:
@@ -76,6 +83,9 @@ class Telemetry:
         self.send_command({"reset": True})
 
     def receive_once(self, timeout: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        if self.recv_socket is None:
+            return None
+
         if timeout is not None:
             old_timeout = self.recv_socket.gettimeout()
             self.recv_socket.settimeout(timeout)
@@ -99,6 +109,9 @@ class Telemetry:
                 self.recv_socket.settimeout(old_timeout)
 
     def start_receiver(self) -> None:
+        if self.recv_socket is None:
+            return
+
         if self._receiver_running:
             return
 
@@ -268,11 +281,13 @@ class Telemetry:
         self.stop_receiver()
         self.stop_image_capture()
         try:
-            self.send_socket.close()
+            if self.send_socket is not None:
+                self.send_socket.close()
         except:
             pass
         try:
-            self.recv_socket.close()
+            if self.recv_socket is not None:
+                self.recv_socket.close()
         except:
             pass
 
@@ -286,7 +301,10 @@ class Telemetry:
 
     def __del__(self):
         """Cleanup on deletion."""
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def send_reset(host: str = "127.0.0.1", port: int = 9877) -> None:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "assetto-corsa-rl"
-version = "0.1.7"
+version = "0.1.8"
 description = "Reinforcement Learning toolkit for Assetto Corsa and Car Racing environments"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,6 +42,8 @@ dependencies = [
     "Pillow>=10.0.0",
     "matplotlib>=3.7.0",
     "click>=8.1.0",
+    "simple-pid>=2.0.0",
+    "pid-controller>=0.2.0",
     "PyYAML>=6.0",
     "lightning>=2.0.0",
     "wandb>=0.15.0",

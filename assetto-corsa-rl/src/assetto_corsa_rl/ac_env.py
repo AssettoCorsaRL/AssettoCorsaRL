@@ -45,6 +45,7 @@ class AssettoCorsa(gym.Env):
         max_progress_per_step_m: float = 12.0,
         max_progress_speed_margin_m: float = 3.0,
         max_reward_dt_s: float = 0.1,
+        frame_skip: int = 4,
     ):
         super().__init__()
 
@@ -67,6 +68,7 @@ class AssettoCorsa(gym.Env):
         self.max_progress_per_step_m = float(max_progress_per_step_m)
         self.max_progress_speed_margin_m = float(max_progress_speed_margin_m)
         self.max_reward_dt_s = float(max_reward_dt_s)
+        self.frame_skip = max(1, int(frame_skip))
 
         self.racing_line = None
         self.racing_line_positions = None
@@ -642,10 +644,11 @@ class AssettoCorsa(gym.Env):
         velocity = np.array(data.get("car", {}).get("velocity", [0, 0, 0]), dtype=np.float32)
         speed = float(np.linalg.norm(velocity))
 
-        max_progress = max(
-            self.max_progress_per_step_m,
-            speed * dt + self.max_progress_speed_margin_m,
-        )
+        dynamic_progress_cap = max(0.0, speed * dt + self.max_progress_speed_margin_m)
+        if self.max_progress_per_step_m > 0.0:
+            max_progress = min(self.max_progress_per_step_m, dynamic_progress_cap)
+        else:
+            max_progress = dynamic_progress_cap
         meters_progress = float(np.clip(raw_meters_progress, 0.0, max_progress))
         progress_was_clipped = bool(meters_progress < raw_meters_progress)
 
@@ -788,50 +791,59 @@ class AssettoCorsa(gym.Env):
             throttle = 0.0
             brake = abs(accel)
 
-        self.controller.left_joystick_float(x_value_float=steering, y_value_float=0.0)
-        self.controller.right_trigger_float(value_float=throttle)
-        self.controller.left_trigger_float(value_float=brake)
-        self.controller.update()
-
         frame_time = 1.0 / 50.0  # 50 Hz frame rate (20ms per frame)
 
-        got_fresh_telemetry = self._wait_for_telemetry(timeout=frame_time)
+        total_reward = 0.0
+        terminated = False
+        truncated = False
+        reason = None
+        telemetry_missing_for = 0.0
+        repeats_completed = 0
         obs = self._get_observation()
-        data = self._last_obs
 
-        if not got_fresh_telemetry or data is None:
-            now = time.monotonic()
-            if self._telemetry_missing_start_time is None:
-                self._telemetry_missing_start_time = now
+        for _ in range(self.frame_skip):
+            self.controller.left_joystick_float(x_value_float=steering, y_value_float=0.0)
+            self.controller.right_trigger_float(value_float=throttle)
+            self.controller.left_trigger_float(value_float=brake)
+            self.controller.update()
 
-            # Prevent long telemetry gaps from inflating dt on the next reward step.
-            self._last_reward_time = now
+            got_fresh_telemetry = self._wait_for_telemetry(timeout=frame_time)
+            obs = self._get_observation()
+            data = self._last_obs
+            repeats_completed += 1
 
-            telemetry_missing_for = now - self._telemetry_missing_start_time
-            terminated = False
-            truncated = telemetry_missing_for >= self.timeout
-            reason = "telemetry_timeout" if truncated else None
+            if not got_fresh_telemetry or data is None:
+                now = time.monotonic()
+                if self._telemetry_missing_start_time is None:
+                    self._telemetry_missing_start_time = now
 
-            self._episode_step += 1
-            info = {
-                "episode_step": self._episode_step,
-                "steering": steering,
-                "throttle": throttle,
-                "brake": brake,
-                "termination_reason": reason,
-                "telemetry_missing_for_s": float(telemetry_missing_for),
-            }
-            return obs, 0.0, terminated, truncated, info
+                # Prevent long telemetry gaps from inflating dt on the next reward step.
+                self._last_reward_time = now
 
-        self._telemetry_missing_start_time = None
+                telemetry_missing_for = now - self._telemetry_missing_start_time
+                truncated = telemetry_missing_for >= self.timeout
+                reason = "telemetry_timeout" if truncated else None
+                if truncated:
+                    break
+                continue
 
-        reward = self._calculate_reward(obs, data)
-        terminated, truncated, reason = self._check_done(obs, data)
+            self._telemetry_missing_start_time = None
 
-        if reason == "low_speed":
-            reward -= 5.0
-        elif reason == "lap_complete":
-            reward += 20.0
+            reward = self._calculate_reward(obs, data)
+            sub_terminated, sub_truncated, sub_reason = self._check_done(obs, data)
+
+            if sub_reason == "low_speed":
+                reward -= 5.0
+            elif sub_reason == "lap_complete":
+                reward += 20.0
+
+            total_reward += float(reward)
+            terminated = sub_terminated
+            truncated = sub_truncated
+            reason = sub_reason
+
+            if terminated or truncated:
+                break
 
         self._episode_step += 1
 
@@ -840,7 +852,10 @@ class AssettoCorsa(gym.Env):
             "steering": steering,
             "throttle": throttle,
             "brake": brake,
+            "frame_skip": self.frame_skip,
+            "repeats_completed": repeats_completed,
             "termination_reason": reason,
+            "telemetry_missing_for_s": float(telemetry_missing_for),
             "raw_meters_progress": self._last_reward_debug["raw_meters_progress"],
             "clipped_meters_progress": self._last_reward_debug["clipped_meters_progress"],
             "progress_clip_limit_m": self._last_reward_debug["max_progress"],
@@ -850,7 +865,7 @@ class AssettoCorsa(gym.Env):
             "reward_dt_was_clipped": self._last_reward_debug["dt_was_clipped"],
         }
 
-        return obs, reward, terminated, truncated, info
+        return obs, total_reward, terminated, truncated, info
 
     def close(self):
         """Clean up resources."""
@@ -939,6 +954,7 @@ def create_transformed_env(
     recv_port: int = 9876,
     image_shape: Tuple[int, int] = (84, 84),
     frame_stack: int = 3,
+    frame_skip: int = 4,
     input_config: Optional[Dict[str, bool]] = None,
     **env_kwargs,
 ):
@@ -952,6 +968,7 @@ def create_transformed_env(
         recv_port: Port for receiving telemetry
         image_shape: Target image dimensions (H, W)
         frame_stack: Number of frames to stack
+        frame_skip: Number of simulator steps to repeat each chosen action
         input_config: Dict mapping input names to bool (True = include in observation)
         **env_kwargs: Additional arguments passed to AssettoCorsa
 
@@ -979,6 +996,7 @@ def create_transformed_env(
         racing_line_path=racing_line_path,
         include_image=True,
         observation_image_shape=(h, w),
+        frame_skip=frame_skip,
         input_config=input_config,
         **env_kwargs,
     )
