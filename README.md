@@ -39,24 +39,7 @@ A reinforcement learning agent (using the SAC algorithm) learns to drive a Formu
 
 ---
 
-<div id="user-content-toc">
-  <ul align="center" style="list-style: none;">
-    <summary>
-        <h2>⚙️ Configuration </h2>
-    </summary>
-  </ul>
-</div>
 
-**For Car-Racing:**
-
-- `configs/car-racing/env_config.yaml` — environment hyperparameters (observation size, frame stacking, num envs, etc.)
-- `configs/car-racing/model_config.yaml` — model and training hyperparameters (learning rates, replay buffer size, etc.)
-
-*Tip:* The racing line file path passed to the environment may be a local JSON file or a
-HTTP/HTTPS URL pointing at a hosted racing line; the code will download and parse
-the remote file automatically.
-
----
 <div id="user-content-toc">
   <ul align="center" style="list-style: none;">
     <summary>
